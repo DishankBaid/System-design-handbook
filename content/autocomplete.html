@@ -1,0 +1,372 @@
+<p class="lead">Search autocomplete, or typeahead, suggests completions while the user types: after "new y" it offers "new york weather" and "new york times". Each keystroke is a query that must come back in well under 100 ms or the suggestions trail behind the typing and become useless. The work splits cleanly in two: an offline pipeline that turns billions of logged searches into ranked suggestions, and an online path that answers prefix lookups from memory, with as many requests as possible never reaching a server at all.</p>
+
+<div class="callout note">
+<div class="callout-title">How to use this case study</div>
+<p>Sections follow the order of a real interview. Concepts used here have their own chapters: <a href="search.html">Search &amp; Inverted Indexes</a>, <a href="caching.html">Caching</a>, <a href="cdn.html">CDNs</a>, <a href="batch-stream.html">Batch vs Stream Processing</a>, <a href="sharding.html">Sharding</a>.</p>
+</div>
+
+<h2 id="requirements">1. Requirements</h2>
+<div class="defs">
+<div><h4>Functional</h4><p>Given a prefix, return the top 5 to 10 completions ranked mostly by popularity. Reflect trending searches within minutes (breaking news). Light personalisation from the user's own recent searches. Never suggest offensive, dangerous or personal-data completions.</p></div>
+<div><h4>Non-functional</h4><p>Under 100 ms from keystroke to rendered suggestions, so server time must be a few milliseconds at p99. Very high availability: if suggestions fail the search box must still work. Read-heavy at enormous scale; suggestions may be hours stale for the long tail.</p></div>
+<div><h4>Out of scope</h4><p>Spelling correction, multi-language tokenisation and the search results page itself. Mention spelling correction as a separate "did you mean" service.</p></div>
+</div>
+<p>The key observation: <strong>the answer for a prefix changes slowly, but it is requested constantly</strong>. "new y" has the same top suggestions for hours. So precompute the answer for every prefix, keep it in memory, and cache it everywhere between the server and the keyboard.</p>
+
+<h2 id="estimation">2. Estimation</h2>
+<p>Assume 500 million searches per day, about 20 characters typed per search, and a vocabulary of the 100 million most frequent queries over the last few weeks.</p>
+<div class="stats">
+<div><b>~35k/s</b><span>suggest requests, ~100k/s peak</span></div>
+<div><b>~6</b><span>requests per search after debouncing</span></div>
+<div><b>~65 GB</b><span>trie with cached top-k</span></div>
+<div><b>~25 GB/day</b><span>of query logs</span></div>
+</div>
+<div class="calc">Naive        500M searches × 20 keystrokes = 10B requests/day ≈ 116,000/s
+Debounced    ~6 requests per search → 3B/day  →  3B / 86,400 s  ≈ <span class="r">34,700/s</span>  (×3 for peak ≈ 100,000/s)
+Vocabulary   100M queries × ~20 chars = 2B characters
+Trie nodes   shared prefixes leave ~25% as distinct nodes      ≈ 500M nodes
+Memory       500M × ~130 B (children + top-10 ids)            ≈ <span class="r">65 GB</span>  → 4 shards of ~16 GB
+Replicas     ~25,000 req/s per server; 100,000 × 50% cache miss / 25,000 = 2 servers in total; load is not the limit, so run 3 per shard for failover and skew
+Logs         500M × ~50 B (query, time, locale, user hash)      ≈ <span class="r">25 GB/day</span></div>
+<p>Two conclusions. The whole index fits in the memory of a handful of machines, so the online path is pure in-memory lookups and the scaling problem is request volume, which caching attacks directly. And the expensive work, counting and ranking billions of queries, belongs in an offline pipeline that runs on its own schedule.</p>
+
+<h2 id="api">3. API</h2>
+<pre><code class="language-http">GET /v1/suggest?q=new%20y&amp;locale=en-US&amp;limit=8
+→ 200
+Cache-Control: public, max-age=300
+{ "prefix": "new y",
+  "suggestions": [
+    { "text": "new york weather", "kind": "popular" },
+    { "text": "new york times",   "kind": "popular" },
+    { "text": "new year 2027",    "kind": "trending" },
+    { "text": "new york knicks",  "kind": "history" }   // only when personalised
+  ] }</code></pre>
+<p>Normalise the prefix before anything else (lowercase, collapse whitespace, strip accents where the locale allows) so that "New Y", "new y" and "new  y" share one cache entry. The public part of the response is identical for every user with the same prefix and locale, which is what makes CDN and browser caching possible. Personal history is either merged in on the client from local storage or fetched with a separate, uncached call, so it never pollutes shared cache entries.</p>
+
+<h2 id="data-model">4. Data model</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Data</th><th>Store</th><th>Shape</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><th>Query logs</th><td>Kafka, then object storage</td><td>query, timestamp, locale, user hash, clicked</td><td>Raw input to everything else</td></tr>
+<tr><th>Query counts</th><td>Columnar tables</td><td><code>(locale, query) → weighted count</code></td><td>Aggregated daily with time decay</td></tr>
+<tr><th>Trie snapshots</th><td>Object storage</td><td>One immutable file per shard per build</td><td>Versioned; servers load and swap</td></tr>
+<tr><th>Trending overlay</th><td>In memory on suggest servers</td><td><code>prefix → [trending queries]</code></td><td>Small, rebuilt every minute from the stream</td></tr>
+<tr><th>Blocklist</th><td>Config store</td><td>terms and patterns</td><td>Applied at build time and again at serve time</td></tr>
+<tr><th>User history</th><td>Client local storage, or a KV store by user</td><td>last ~50 searches</td><td>Never in shared caches</td></tr>
+</tbody></table></div>
+
+<h2 id="high-level">5. High-level design</h2>
+
+<figure class="fig wide">
+<div class="fig-frame">
+<svg viewBox="0 0 760 360" role="img" aria-label="Architecture: the client debounces and caches, requests go through a CDN edge cache and a load balancer to the suggest service, which reads in-memory trie shards and a trending overlay; trie snapshots are built offline from query logs; personal history is merged separately">
+<rect class="n client" x="20" y="130" width="110" height="56" rx="8"/><text class="t b mid" x="75" y="153">Browser / app</text><text class="t xs mute mid" x="75" y="170">debounce, cache</text>
+<rect class="n cache" x="165" y="130" width="110" height="56" rx="8"/><text class="t b mid" x="220" y="153">CDN edge</text><text class="t xs mute mid" x="220" y="170">cache 5 min</text>
+<rect class="n ext" x="310" y="130" width="90" height="56" rx="8"/><text class="t b mid" x="355" y="153">Load</text><text class="t b mid" x="355" y="170">balancer</text>
+<rect class="n svc" x="440" y="130" width="130" height="56" rx="8"/><text class="t b mid" x="505" y="153">Suggest service</text><text class="t xs mute mid" x="505" y="170">merge, filter</text>
+<rect class="n cache" x="610" y="60" width="130" height="50" rx="8"/><text class="t b mid" x="675" y="82">Trie shards</text><text class="t xs mute mid" x="675" y="98">in memory, replicated</text>
+<rect class="n cache" x="610" y="133" width="130" height="50" rx="8"/><text class="t b mid" x="675" y="155">Trending overlay</text><text class="t xs mute mid" x="675" y="171">rebuilt every minute</text>
+<rect class="n db" x="610" y="270" width="130" height="50" rx="8"/><text class="t b mid" x="675" y="292">Trie snapshots</text><text class="t xs mute mid" x="675" y="308">built offline</text>
+<rect class="n queue" x="440" y="270" width="130" height="50" rx="8"/><text class="t b mid" x="505" y="292">Query logs</text><text class="t xs mute mid" x="505" y="308">Kafka → pipeline</text>
+<rect class="n db" x="165" y="270" width="140" height="50" rx="8"/><text class="t b mid" x="235" y="292">User history</text><text class="t xs mute mid" x="235" y="308">local or per-user KV</text>
+
+<path class="e" d="M130,158 H161"/>
+<path class="e" d="M275,158 H306"/>
+<path class="e" d="M400,158 H436"/>
+<path class="e" d="M570,150 C590,150 590,85 606,85"/>
+<path class="e" d="M570,158 H606"/>
+<path class="e dash" d="M570,295 H606"/>
+<path class="e dash" d="M740,295 C758,295 758,85 744,85"/>
+<path class="e dash" d="M505,186 V266"/>
+<path class="e dash" d="M75,186 C75,295 120,295 161,295"/>
+
+<path class="flow" d="M130,158 H161"/>
+<path class="flow" d="M275,158 H306"/>
+<path class="flow" d="M400,158 H436"/>
+<path class="flow" d="M570,150 C590,150 590,85 606,85"/>
+
+<text class="t xs mute mid" x="220" y="120">most requests stop here</text>
+<text class="t xs mute" x="513" y="230">log</text>
+<text class="t xs mute end" x="746" y="232">load + swap</text>
+<text class="t xs mute" x="88" y="250">personal</text>
+</svg>
+</div>
+<figcaption><b>Architecture.</b> The animated path is a cache miss: CDN, load balancer, suggest service and one in-memory trie lookup. Most keystrokes never get that far. Logs flow out to an offline pipeline whose only output is new trie snapshots.</figcaption>
+</figure>
+
+<ol class="steps">
+<li><strong>Type.</strong> The client waits until typing pauses briefly, normalises the prefix, and checks its own cache of recent prefix responses.</li>
+<li><strong>Edge.</strong> On a miss, the request goes to a CDN edge, which serves popular prefixes such as "new" or "how to" from cache for a few minutes.</li>
+<li><strong>Serve.</strong> On an edge miss, a suggest server routes the prefix to the trie shard that owns it, reads the precomputed top-k at the prefix's node, merges trending entries from the overlay, applies the blocklist, and responds in a couple of milliseconds.</li>
+<li><strong>Learn.</strong> Every completed search is logged. The offline pipeline aggregates logs into counts, builds new trie snapshots, and the servers swap them in. A streaming job updates the trending overlay every minute.</li>
+</ol>
+
+<h2 id="trie">6. Deep dive: a trie with top-k at every node</h2>
+<p>A <dfn>trie</dfn> (prefix tree) stores strings character by character, so all queries that start with "new" sit under one node. Finding that node takes as many steps as the prefix has characters. The naive next step, walking the whole subtree to find the most popular completions, is far too slow for a short prefix like "n" whose subtree holds millions of queries. The fix is to <strong>precompute and cache the top k completions at every node</strong> when the trie is built. A lookup then costs <code>O(len(prefix))</code> and returns a list that is already sorted.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 320" role="img" aria-label="A trie for six queries starting with n: root, n, ne, then netflix, new, nearest pharmacy and nest thermostat; new has children new york weather, new balance and news; the nodes ne and new store their top three completions with counts">
+<rect class="n svc" x="330" y="20" width="60" height="28" rx="6"/><text class="t xs mono mid" x="360" y="38">root</text>
+<rect class="n svc" x="330" y="70" width="60" height="28" rx="6"/><text class="t sm mono b mid" x="360" y="89">n</text>
+<rect class="n cache" x="330" y="120" width="60" height="28" rx="6"/><text class="t sm mono b mid" x="360" y="139">ne</text>
+<rect class="n db" x="40" y="190" width="110" height="28" rx="6"/><text class="t xs mono mid" x="95" y="208">netflix</text>
+<rect class="n cache" x="330" y="190" width="60" height="28" rx="6"/><text class="t sm mono b mid" x="360" y="209">new</text>
+<rect class="n db" x="440" y="190" width="120" height="28" rx="6"/><text class="t xs mono mid" x="500" y="208">nearest pharmacy</text>
+<rect class="n db" x="590" y="190" width="120" height="28" rx="6"/><text class="t xs mono mid" x="650" y="208">nest thermostat</text>
+<rect class="n db" x="150" y="270" width="130" height="28" rx="6"/><text class="t xs mono mid" x="215" y="288">new york weather</text>
+<rect class="n db" x="300" y="270" width="100" height="28" rx="6"/><text class="t xs mono mid" x="350" y="288">new balance</text>
+<rect class="n db" x="420" y="270" width="70" height="28" rx="6"/><text class="t xs mono mid" x="455" y="288">news</text>
+<path class="line" d="M360,48 V70 M360,98 V120 M360,148 V190"/>
+<path class="line" d="M330,140 C250,150 150,165 95,190"/>
+<path class="line" d="M390,140 C430,150 480,165 500,190"/>
+<path class="line" d="M390,134 C480,140 610,160 650,190"/>
+<path class="line" d="M345,218 C320,240 250,250 215,270"/>
+<path class="line" d="M360,218 L350,270"/>
+<path class="line" d="M375,218 C400,240 440,250 455,270"/>
+
+<rect class="n" x="40" y="22" width="230" height="74" rx="8"/>
+<text class="t sm b" x="54" y="42">top-3 cached at "ne"</text>
+<text class="t xs mono" x="54" y="60">netflix</text><text class="t xs mono mute end" x="256" y="60">120k</text>
+<text class="t xs mono" x="54" y="74">new york weather</text><text class="t xs mono mute end" x="256" y="74">90k</text>
+<text class="t xs mono" x="54" y="88">news</text><text class="t xs mono mute end" x="256" y="88">80k</text>
+<path class="line faint" d="M270,70 C300,80 310,120 326,130" style="stroke-dasharray:3 3"/>
+
+<rect class="n" x="450" y="22" width="250" height="74" rx="8"/>
+<text class="t sm b" x="464" y="42">top-3 cached at "new"</text>
+<text class="t xs mono" x="464" y="60">new york weather</text><text class="t xs mono mute end" x="686" y="60">90k</text>
+<text class="t xs mono" x="464" y="74">news</text><text class="t xs mono mute end" x="686" y="74">80k</text>
+<text class="t xs mono" x="464" y="88">new balance</text><text class="t xs mono mute end" x="686" y="88">60k</text>
+<path class="line faint" d="M450,90 C420,110 400,170 394,190" style="stroke-dasharray:3 3"/>
+</svg>
+</div>
+<figcaption><b>Precomputed answers.</b> Every node stores the best k completions in its subtree, so "ne" never has to look below itself. Leaves show full queries; a real trie has one node per character, compressed into multi-character edges where there is no branching.</figcaption>
+</figure>
+
+<pre><code class="language-python">import heapq
+
+K = 3                                   # suggestions kept per node (5-10 in production)
+BLOCKED = {"buy fake passport"}         # filtered at build time, never stored
+
+
+class Node:
+    __slots__ = ("children", "top")
+
+    def __init__(self):
+        self.children = {}
+        self.top = []                   # [(count, query)], best first
+
+
+class Trie:
+    def __init__(self):
+        self.root = Node()
+
+    def add(self, query, count):
+        """Insert or update a query; refresh the top-k list on every node of its path."""
+        if query in BLOCKED:
+            return
+        node, path = self.root, [self.root]
+        for ch in query:
+            node = node.children.setdefault(ch, Node())
+            path.append(node)
+        for n in path:
+            others = [entry for entry in n.top if entry[1] != query]
+            n.top = heapq.nlargest(K, others + [(count, query)])
+
+    def suggest(self, prefix):
+        node = self.root
+        for ch in prefix:               # O(len(prefix)), then the answer is precomputed
+            node = node.children.get(ch)
+            if node is None:
+                return []
+        return [q for _, q in node.top]
+
+
+weekly_counts = {                       # aggregated from query logs
+    "netflix": 120_000, "new york weather": 90_000, "news": 80_000,
+    "new balance": 60_000, "nearest pharmacy": 45_000, "nest thermostat": 30_000,
+    "how to tie a tie": 70_000, "how to screenshot": 65_000, "how tall is mount everest": 20_000,
+    "buy fake passport": 5_000,
+}
+trie = Trie()
+for q, c in weekly_counts.items():
+    trie.add(q, c)
+
+for prefix in ("ne", "new", "how t", "nes", "buy"):
+    print(f"{prefix!r:8} -&gt; {trie.suggest(prefix)}")
+# 'ne'     -&gt; ['netflix', 'new york weather', 'news']
+# 'new'    -&gt; ['new york weather', 'news', 'new balance']
+# 'how t'  -&gt; ['how to tie a tie', 'how to screenshot', 'how tall is mount everest']
+# 'nes'    -&gt; ['nest thermostat']
+# 'buy'    -&gt; []
+trie.add("news", 130_000)               # an election night pushes "news" up
+print(f"{'new'!r:8} -&gt; {trie.suggest('new')}")
+# 'new'    -&gt; ['news', 'new york weather', 'new balance']</code></pre>
+<ul>
+<li><strong>Memory.</strong> Storing k entries at every node multiplies memory, so nodes store small integer query ids, not strings, and the strings live once in a side table. Character-per-node tries also waste space on long unbranched chains; a <dfn>radix tree</dfn> merges them into single edges labelled with whole substrings.</li>
+<li><strong>Updates only go up.</strong> The incremental <code>add</code> above handles a query becoming more popular. It cannot handle one becoming less popular: a node that evicted an entry from its top-k has forgotten it and cannot bring it back. That is one reason the trie is rebuilt from counts on a schedule rather than mutated forever.</li>
+<li><strong>Alternatives.</strong> A flat key-value table from every prefix to its top-k list (500 million keys) is simpler to shard and to serve from a generic KV store, at the cost of more memory. Search engines such as Elasticsearch implement completion suggesters with finite-state transducers, which compress shared prefixes and suffixes far better than a plain trie.</li>
+</ul>
+
+<h2 id="pipeline">7. Deep dive: building suggestions from query logs</h2>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 260" role="img" aria-label="Two pipelines: the batch path aggregates logs daily with time decay, filters, builds trie shards and publishes snapshots that servers load; the streaming path detects trending queries over a one-hour window and updates a small overlay every minute">
+<text class="t xs b mute" x="20" y="28">batch: daily, complete</text>
+<rect class="n queue" x="20" y="40" width="110" height="50" rx="8"/><text class="t sm b mid" x="75" y="61">Query logs</text><text class="t xs mute mid" x="75" y="77">object store</text>
+<rect class="n svc" x="160" y="40" width="120" height="50" rx="8"/><text class="t sm b mid" x="220" y="61">Aggregate</text><text class="t xs mute mid" x="220" y="77">decayed counts</text>
+<rect class="n svc" x="310" y="40" width="110" height="50" rx="8"/><text class="t sm b mid" x="365" y="61">Filter</text><text class="t xs mute mid" x="365" y="77">blocklist, PII</text>
+<rect class="n svc" x="450" y="40" width="110" height="50" rx="8"/><text class="t sm b mid" x="505" y="61">Build</text><text class="t xs mute mid" x="505" y="77">trie per shard</text>
+<rect class="n db" x="590" y="40" width="115" height="50" rx="8"/><text class="t sm b mid" x="647" y="61">Snapshots</text><text class="t xs mute mid" x="647" y="77">validated, v312</text>
+<path class="e" d="M130,65 H156"/><path class="e" d="M280,65 H306"/><path class="e" d="M420,65 H446"/><path class="e" d="M560,65 H586"/>
+<text class="t xs b mute" x="20" y="148">stream: every minute, partial</text>
+<rect class="n queue" x="20" y="160" width="110" height="50" rx="8"/><text class="t sm b mid" x="75" y="181">Kafka</text><text class="t xs mute mid" x="75" y="197">live queries</text>
+<rect class="n svc" x="160" y="160" width="260" height="50" rx="8"/><text class="t sm b mid" x="290" y="181">Trending detector</text><text class="t xs mute mid" x="290" y="197">last hour vs same hour last week</text>
+<rect class="n cache" x="450" y="160" width="110" height="50" rx="8"/><text class="t sm b mid" x="505" y="181">Overlay</text><text class="t xs mute mid" x="505" y="197">prefix → top 3</text>
+<rect class="n svc" x="590" y="160" width="115" height="50" rx="8"/><text class="t sm b mid" x="647" y="181">Suggest</text><text class="t xs mute mid" x="647" y="197">servers merge</text>
+<path class="e" d="M130,185 H156"/><path class="e" d="M420,185 H446"/><path class="e" d="M560,185 H586"/>
+<path class="e dash" d="M647,90 V156"/>
+<text class="t xs mute" x="655" y="128">load</text>
+<text class="t xs mute" x="20" y="245">Batch gives complete, stable rankings. The stream adds the few queries that are new right now.</text>
+</svg>
+</div>
+<figcaption><b>Batch for the bulk, streaming for the news.</b> The batch path can take hours and covers every query; the streaming path is approximate and tiny but reacts in a minute. Servers merge the two at request time.</figcaption>
+</figure>
+
+<ul>
+<li><strong>Aggregate with decay.</strong> A daily batch job counts queries per locale over the last few weeks, weighting recent days more, for example a weight that halves every 7 days. "world cup" fades after the tournament without a hard cutoff. Only queries above a minimum count (say, searched by at least 50 distinct users) qualify, which also keeps one person's private search out of everyone's suggestions.</li>
+<li><strong>Filter.</strong> Remove queries matching the blocklist (slurs, violent and sexual terms, dangerous goods), queries that look like personal data (phone numbers, emails, street addresses), and completions about named people that pair them with harmful claims. Filtering at build time keeps them out of memory; a second check at serve time catches terms added to the blocklist since the last build.</li>
+<li><strong>Build and validate.</strong> Build one trie per shard, write it as an immutable snapshot, and run checks before publishing: size within a few percent of the last build, known canary prefixes ("weather", "facebook") still returning their expected top results, no blocked term present. A bad build is never published.</li>
+<li><strong>Trending.</strong> A stream job counts queries over a sliding one-hour window (a Count-Min sketch plus a small heavy-hitters heap keeps memory bounded) and flags those far above their usual rate for that hour. Only a few thousand trending queries exist at a time, so the overlay is tiny and rebuilt every minute. At serve time, the server merges overlay entries into the trie's top-k with a boost, and the overlay entries pass through the same blocklist.</li>
+</ul>
+<p>Why not update the trie in place from the stream? Updating top-k lists along every query's path at tens of thousands of searches per second means constant writes to shared, read-hot structures, and decreasing popularity cannot be handled incrementally anyway. Rebuild-and-swap keeps the serving path read-only, which is simpler and faster.</p>
+
+<h2 id="serving">8. Deep dive: serving, sharding and caching</h2>
+<h3 id="sharding">Sharding by prefix</h3>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 260" role="img" aria-label="Prefix ranges assigned to seven shards with uneven alphabetical spans chosen to balance traffic; the shard for prefixes starting with s has three replicas">
+<text class="t sm b" x="40" y="30">Shard map: first characters of the prefix → shard (illustrative traffic split)</text>
+<rect class="n svc" x="40" y="45" width="76.8" height="44" rx="4"/><text class="t xs mono mid" x="78.4" y="63">a-b</text><text class="t xs mute mid" x="78.4" y="79">shard 1</text>
+<rect class="n svc" x="116.8" y="45" width="102.4" height="44" rx="4"/><text class="t xs mono mid" x="168" y="63">c-e</text><text class="t xs mute mid" x="168" y="79">shard 2</text>
+<rect class="n svc" x="219.2" y="45" width="96" height="44" rx="4"/><text class="t xs mono mid" x="267.2" y="63">f-l</text><text class="t xs mute mid" x="267.2" y="79">shard 3</text>
+<rect class="n svc" x="315.2" y="45" width="89.6" height="44" rx="4"/><text class="t xs mono mid" x="360" y="63">m-o</text><text class="t xs mute mid" x="360" y="79">shard 4</text>
+<rect class="n svc" x="404.8" y="45" width="83.2" height="44" rx="4"/><text class="t xs mono mid" x="446.4" y="63">p-r</text><text class="t xs mute mid" x="446.4" y="79">shard 5</text>
+<rect class="n cache" x="488" y="45" width="76.8" height="44" rx="4"/><text class="t xs mono mid" x="526.4" y="63">s</text><text class="t xs mute mid" x="526.4" y="79">shard 6</text>
+<rect class="n svc" x="564.8" y="45" width="115.2" height="44" rx="4"/><text class="t xs mono mid" x="622.4" y="63">t-z, digits</text><text class="t xs mute mid" x="622.4" y="79">shard 7</text>
+<rect class="n cache" x="380" y="150" width="90" height="40" rx="7"/><text class="t sm mid" x="425" y="175">replica 1</text>
+<rect class="n cache" x="482" y="150" width="90" height="40" rx="7"/><text class="t sm mid" x="527" y="175">replica 2</text>
+<rect class="n cache" x="584" y="150" width="90" height="40" rx="7"/><text class="t sm mid" x="629" y="175">replica 3</text>
+<path class="e" d="M520,89 C510,115 440,120 430,146"/>
+<path class="e" d="M526,89 V146"/>
+<path class="e" d="M532,89 C545,115 620,120 629,146"/>
+<text class="t xs mute" x="40" y="160">"s" alone gets a shard: it starts more</text>
+<text class="t xs mute" x="40" y="176">queries than "x", "y" and "z" together.</text>
+<text class="t xs mute" x="40" y="230">Each shard holds the complete trie for its prefixes. Replicas scale reads and survive failures.</text>
+</svg>
+</div>
+<figcaption><b>Range sharding by prefix.</b> Boundaries are chosen from measured traffic, not the alphabet, and recomputed with each build. A prefix lives entirely on one shard, so a lookup is always a single-shard read.</figcaption>
+</figure>
+
+<p>Hashing the full prefix spreads load evenly and suits the flat prefix → top-k table, because every answer is precomputed offline. It cannot split a trie, though: "new", "new " and "new y" would land on different shards, and each shard would need every node on their path. Range sharding on the first one or two characters keeps every prefix's subtree together. The cost is skew, which is handled by cutting ranges by traffic and by giving hot shards more replicas. At 65 GB in total, each of 4 to 7 shards fits comfortably in RAM.</p>
+
+<h3 id="client-side">Fewer requests: debouncing and caching</h3>
+<p>The cheapest request is the one never sent. Step through someone typing "new york" with a pause after "new ".</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 260" role="img" aria-label="Keystrokes typing new york over one second: without debouncing every keystroke sends a request; with a 150 millisecond debounce only two requests are sent, after each pause; with local filtering of the cached list only one request is needed">
+<path class="line" d="M60,120 H680"/>
+<path class="line faint" d="M60,115 V125 M180,115 V125 M300,115 V125 M420,115 V125 M540,115 V125 M660,115 V125"/>
+<text class="t xs mono mute mid" x="60" y="140">0 ms</text><text class="t xs mono mute mid" x="180" y="140">200</text><text class="t xs mono mute mid" x="300" y="140">400</text><text class="t xs mono mute mid" x="420" y="140">600</text><text class="t xs mono mute mid" x="540" y="140">800</text><text class="t xs mono mute mid" x="660" y="140">1000</text>
+<text class="t xs b mute" x="60" y="38">keystrokes</text>
+<circle class="dot accent" cx="60" cy="120" r="4"/><circle class="dot accent" cx="108" cy="120" r="4"/><circle class="dot accent" cx="150" cy="120" r="4"/><circle class="dot accent" cx="198" cy="120" r="4"/>
+<circle class="dot accent" cx="420" cy="120" r="4"/><circle class="dot accent" cx="468" cy="120" r="4"/><circle class="dot accent" cx="510" cy="120" r="4"/><circle class="dot accent" cx="552" cy="120" r="4"/>
+<text class="t mono mid" x="60" y="104">n</text><text class="t mono mid" x="108" y="104">e</text><text class="t mono mid" x="150" y="104">w</text><text class="t xs mono mid" x="198" y="104">space</text>
+<text class="t mono mid" x="420" y="104">y</text><text class="t mono mid" x="468" y="104">o</text><text class="t mono mid" x="510" y="104">r</text><text class="t mono mid" x="552" y="104">k</text>
+<text class="t xs b mute" x="300" y="172">requests sent</text>
+<g data-show="1">
+<path class="e red" d="M60,150 V190"/><path class="e red" d="M108,150 V190"/><path class="e red" d="M150,150 V190"/><path class="e red" d="M198,150 V190"/>
+<path class="e red" d="M420,150 V190"/><path class="e red" d="M468,150 V190"/><path class="e red" d="M510,150 V190"/><path class="e red" d="M552,150 V190"/>
+<text class="t sm mid" x="360" y="235">No debounce: 8 requests. With 100 ms round trips, 6 answers arrive after the next keystroke.</text>
+</g>
+<g data-show="2">
+<path class="e green" d="M288,150 V190"/><text class="t xs mono mid" x="288" y="206">"new "</text>
+<path class="e green" d="M642,150 V190"/><text class="t xs mono mid" x="642" y="206">"new york"</text>
+<text class="t sm mid" x="360" y="235">150 ms debounce: send only when typing pauses. 2 requests.</text>
+</g>
+<g data-show="3">
+<path class="e green" d="M288,150 V190"/><text class="t xs mono mid" x="288" y="206">"new "</text>
+<text class="t xs mono accent mid" x="642" y="206">filter locally</text>
+<text class="t sm mid" x="360" y="235">The list for "new " already contains "new york weather": filter it, no request.</text>
+</g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Every keystroke</button><button type="button" data-step="2" aria-pressed="false">Debounced</button><button type="button" data-step="3" aria-pressed="false">Local filtering</button></div>
+</div>
+<figcaption><b>Debounce, then reuse.</b> A short debounce removes most requests without feeling slow, because suggestions for a prefix the user has already typed past are useless anyway. Local filtering works when the cached list for a shorter prefix still has enough matches.</figcaption>
+</figure>
+
+<ul>
+<li><strong>Debounce</strong> on the client: wait 100 to 150 ms after the last keystroke. Also cancel in-flight requests for prefixes that are no longer current, and ignore responses that arrive out of order, so a slow response for "ne" never overwrites suggestions for "new".</li>
+<li><strong>Browser cache.</strong> Responses carry <code>Cache-Control: max-age=300</code>, so backspacing from "new y" to "new" is instant and free. The client can also keep an in-memory map of the last few dozen prefixes.</li>
+<li><strong>CDN cache.</strong> Short, popular prefixes dominate traffic and are identical for every user in a locale, so an edge cache with a few minutes of TTL absorbs a large share of requests. The cache key is the normalised prefix plus locale, nothing else. The TTL bounds how stale trending suggestions can be.</li>
+<li><strong>Prefetch.</strong> When the search box gains focus, fetch suggestions for the empty prefix (trending and recent searches); some products also prefetch the next likely character's list.</li>
+</ul>
+
+<h3 id="personalisation">Personalisation and filtering at serve time</h3>
+<p>Personal suggestions are the user's own recent searches that match the prefix, ranked above popular ones. They are merged on the client from local history, or by a separate per-user call that bypasses the CDN, so shared caches only ever hold public answers. Some products also re-rank public suggestions by coarse signals such as location ("weather" completes to the user's city), which means adding that signal, at low resolution, to the cache key. The serve-time blocklist check runs on every merged list, including history and trending entries, and there is a fast path for operators to add a term and have it disappear from suggestions within minutes, without waiting for the next build.</p>
+
+<h2 id="scaling">9. Bottlenecks and how the design handles them</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Pressure</th><th>What breaks first</th><th>Response</th></tr></thead>
+<tbody>
+<tr><th>Request volume</th><td>Suggest server CPU and network</td><td>Debounce, browser and CDN caching, more replicas per shard</td></tr>
+<tr><th>Hot prefixes</th><td>One shard's replicas</td><td>CDN absorbs them; traffic-balanced ranges; extra replicas for hot shards</td></tr>
+<tr><th>Breaking news</th><td>Freshness of suggestions</td><td>Streaming trending overlay, short CDN TTL</td></tr>
+<tr><th>Bad build</th><td>Wrong or offensive suggestions everywhere</td><td>Validation gates, canary rollout of snapshots, instant rollback to the previous version</td></tr>
+<tr><th>Offensive term discovered</th><td>Trust</td><td>Serve-time blocklist with fast propagation, plus purge of affected CDN entries</td></tr>
+<tr><th>Server restart</th><td>Cold start loading 16 GB</td><td>Memory-mapped snapshot files; take traffic only after the load completes</td></tr>
+<tr><th>Suggest outage</th><td>Search box usability</td><td>Client degrades silently to no suggestions; search itself is unaffected</td></tr>
+</tbody></table></div>
+
+<h2 id="tradeoffs">10. Key trade-offs to state</h2>
+<ul>
+<li><strong>Precomputed top-k per node</strong>: answers in O(prefix length) with no subtree walk, in exchange for memory and an offline rebuild instead of live updates.</li>
+<li><strong>Batch plus streaming</strong>: stable rankings from complete data, with a small, fast overlay for trends; two pipelines to run.</li>
+<li><strong>Range sharding by prefix</strong>: every lookup hits one shard, in exchange for skewed ranges that must be rebalanced from measured traffic at each build.</li>
+<li><strong>Aggressive caching</strong>: most requests never reach a server, in exchange for suggestions up to a few minutes stale.</li>
+<li><strong>Public and personal answers kept apart</strong>: shared caches stay safe and effective, at the cost of a client-side merge.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>What the interviewer is checking</h4>
+<p>Whether you see that the online path must be precomputed and in memory, can describe a trie with cached top-k and its memory cost, separate the data pipeline from serving, and use the client and the CDN to cut traffic.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>How do you get the top 10 completions for "a" without scanning millions of queries?</li>
+<li>How often do you rebuild, and how does a breaking-news query appear within minutes?</li>
+<li>The trie does not fit on one machine. How do you split it?</li>
+<li>How do you stop an offensive suggestion from appearing, and how fast can you remove one?</li>
+<li>How would you add personalisation without ruining caching?</li>
+<li>What happens on the client if the user types faster than responses arrive?</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>Running <code>LIKE 'prefix%'</code> queries against a database on every keystroke.</li>
+<li>Walking the trie subtree at request time to rank completions.</li>
+<li>Updating counts in the serving trie on every search.</li>
+<li>Caching personalised responses at the CDN.</li>
+<li>No debouncing or request cancellation on the client.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://doi.org/10.1145/367390.367400" target="_blank" rel="noopener">Trie Memory</a><span>Edward Fredkin, Communications of the ACM, 1960. The paper that named the trie.</span></li>
+<li><a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/search-suggesters.html" target="_blank" rel="noopener">Elasticsearch: suggesters</a><span>The completion suggester, built on in-memory finite-state transducers for prefix lookups.</span></li>
+<li><a href="https://support.google.com/websearch/answer/7368877" target="_blank" rel="noopener">How Google autocomplete predictions work</a><span>Google Search Help. Where predictions come from, freshness, and the policies for removing harmful predictions.</span></li>
+<li><a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Cache-Control" target="_blank" rel="noopener">MDN: Cache-Control</a><span>The headers that let browsers and CDNs cache prefix responses.</span></li>
+</ul>

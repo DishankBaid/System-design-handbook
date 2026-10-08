@@ -1,0 +1,414 @@
+<p class="lead">A ride-sharing service like Uber or Lyft has to know where a million moving cars are, right now, and answer "which available driver can reach this rider fastest?" within a couple of seconds. Then it has to make sure that driver goes to exactly one rider, track the trip as it happens, and price it according to supply and demand in that neighbourhood at that minute. The core challenges are a firehose of location updates, fast geospatial queries, and a matching process that never double-books a driver.</p>
+
+<div class="callout note">
+<div class="callout-title">How to use this case study</div>
+<p>Sections follow the order of a real interview. Concepts used here have their own chapters: <a href="sharding.html">Sharding</a>, <a href="realtime.html">WebSockets</a>, <a href="event-streaming.html">Event Streaming</a>, <a href="transactions.html">Transactions</a>, <a href="consensus.html">Consensus</a>.</p>
+</div>
+
+<h2 id="requirements">1. Requirements</h2>
+<div class="defs">
+<div><h4>Functional</h4><p>Drivers go online and stream their location. Riders see nearby cars on a map, get a fare estimate, and request a ride. The system offers the trip to a suitable driver, who accepts or declines. Both sides see each other's live location and ETA. Trips move through pickup, ride and drop-off, then payment.</p></div>
+<div><h4>Non-functional</h4><p>A match within a few seconds of the request. Location on the map at most a few seconds old. A driver is never assigned to two trips, and a trip never gets two drivers. Highly available per city: an outage in one city must not affect others.</p></div>
+<div><h4>Out of scope</h4><p>Payments internals, driver onboarding, ratings, shared rides (pooling), food delivery. Mention pooling as a harder matching variant.</p></div>
+</div>
+<p>The key observation: <strong>the workload is local</strong>. A rider in Mumbai is only ever matched with drivers in Mumbai. The global system is really hundreds of independent city-sized systems that share code, which makes sharding by geography natural and keeps every hot query inside one shard.</p>
+
+<h2 id="estimation">2. Estimation</h2>
+<p>Assume 1.5 million drivers online at peak, each sending a location every 4 seconds; 20 million trips per day; and 2 million riders with the app open at peak, refreshing nearby cars every 5 seconds.</p>
+<div class="stats">
+<div><b>375k/s</b><span>driver location updates</span></div>
+<div><b>400k/s</b><span>"nearby cars" queries</span></div>
+<div><b>~700/s</b><span>trip requests at peak</span></div>
+<div><b>~300 MB</b><span>for the live driver index</span></div>
+</div>
+<div class="calc">Location updates   1.5M drivers / 4 s                          = <span class="r">375,000/s</span>
+Ingest bandwidth   375,000 × ~100 B (id, lat, lng, heading, speed, ts) ≈ 37.5 MB/s
+Nearby queries     2M open apps / 5 s                          = <span class="r">400,000/s</span>
+Trips              20M / 86,400 s ≈ 231/s average  (×3 for peak ≈ <span class="r">700/s</span>)
+Live index         1.5M drivers × ~200 B                       ≈ <span class="r">300 MB</span>: fits in one machine's RAM
+Busiest city       ~5% of drivers = 75,000 → 75,000 / 4 s     ≈ 18,750 updates/s on one shard
+Location history   375,000 × 100 B × 86,400 s                  ≈ 3.2 TB/day if every point is kept</div>
+<p>The index is tiny. What makes location hard is the <em>rate</em>: 375,000 writes per second that are each obsolete four seconds later. That rules out writing every update to a durable database and points to an in-memory index, sharded by city for isolation rather than for size. Trip requests, by contrast, are few, but each one needs strong consistency.</p>
+
+<h2 id="api">3. API</h2>
+<pre><code class="language-http">// Driver app, over a persistent connection
+→ { "type": "location", "lat": 37.7793, "lng": -122.4192, "heading": 270, "speed_kmh": 31, "ts": 1760004067 }
+← { "type": "offer", "trip_id": "t_5Kq2", "pickup": {...}, "eta_s": 180, "expires_in_s": 15 }
+→ { "type": "accept", "trip_id": "t_5Kq2" }        // or "decline"
+
+// Rider app
+GET  /v1/drivers/nearby?lat=37.7764&amp;lng=-122.4172          → [{ "lat": ..., "lng": ..., "heading": ... }, ...]
+POST /v1/quotes  { "pickup": {...}, "dropoff": {...}, "product": "uberx" }
+→ 201 { "quote_id": "q_81f", "fare": "$18.40", "surge": 1.4, "expires_at": "2026-10-09T10:46:07Z" }
+POST /v1/trips   { "quote_id": "q_81f" }   Idempotency-Key: 6f0c1d...
+→ 202 { "trip_id": "t_5Kq2", "state": "matching" }
+GET  /v1/trips/t_5Kq2                       → state, driver, live location, ETA (or via push)</code></pre>
+<p>Three details matter. The nearby endpoint returns positions without driver identities, so the map cannot be used to track individuals. The quote fixes the price for a few minutes, so the rider pays what they saw even if surge changes before they tap. And trip creation takes an <a href="idempotency.html">idempotency key</a>, because a rider on a bad connection will tap "Request" again and must not get two cars.</p>
+
+<h2 id="data-model">4. Data model</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Data</th><th>Store</th><th>Key</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><th>Live driver locations</th><td>In-memory index per city</td><td>H3 cell → driver ids; driver id → position</td><td>Rebuilt within seconds from the stream if lost</td></tr>
+<tr><th>Driver state</th><td>Strongly consistent store, sharded by city</td><td><code>driver_id</code></td><td><code>offline / available / offered / on_trip</code>, current <code>trip_id</code>, offer expiry</td></tr>
+<tr><th>Trips</th><td>Same store and shard as driver state</td><td><code>trip_id</code></td><td>Rider, driver, state, quote, timestamps, route summary</td></tr>
+<tr><th>Location stream</th><td>Kafka, keyed by city</td><td>city, driver id</td><td>Feeds the index, trip tracking, surge and analytics</td></tr>
+<tr><th>Trip route points</th><td>Object store / columnar store</td><td><code>trip_id</code></td><td>Only points during trips, for fares, receipts and disputes</td></tr>
+</tbody></table></div>
+<p>Driver state and trips live in the <strong>same city shard</strong> on purpose. Assigning a driver means changing a driver row and a trip row together, and keeping both on one shard turns that into a local transaction instead of a distributed one.</p>
+
+<h2 id="high-level">5. High-level design</h2>
+
+<figure class="fig wide">
+<div class="fig-frame">
+<svg viewBox="0 0 760 400" role="img" aria-label="Architecture: driver apps stream locations through location gateways into Kafka, which feeds the in-memory location index per city and a history store; rider requests go through the API to the dispatch service, which queries the index and the ETA service, records state in the trip store, and sends offers to drivers through the gateways; the pricing service computes surge per hexagon">
+<rect class="n client" x="20" y="50" width="100" height="50" rx="8"/><text class="t b mid" x="70" y="72">Driver app</text><text class="t xs mute mid" x="70" y="88">1.5M online</text>
+<rect class="n svc" x="150" y="50" width="140" height="50" rx="8"/><text class="t b mid" x="220" y="72">Location gateway</text><text class="t xs mute mid" x="220" y="88">persistent sockets</text>
+<rect class="n queue" x="320" y="50" width="110" height="50" rx="8"/><text class="t b mid" x="375" y="72">Kafka</text><text class="t xs mute mid" x="375" y="88">key = city</text>
+<rect class="n cache" x="470" y="47" width="140" height="56" rx="8"/><text class="t b mid" x="540" y="70">Location index</text><text class="t xs mute mid" x="540" y="87">in memory, per city</text>
+<rect class="n db" x="645" y="50" width="100" height="50" rx="8"/><text class="t b mid" x="695" y="72">History</text><text class="t xs mute mid" x="695" y="88">trip points</text>
+<rect class="n client" x="20" y="200" width="100" height="50" rx="8"/><text class="t b mid" x="70" y="222">Rider app</text><text class="t xs mute mid" x="70" y="238">request ride</text>
+<rect class="n ext" x="160" y="200" width="120" height="50" rx="8"/><text class="t b mid" x="220" y="222">API gateway</text><text class="t xs mute mid" x="220" y="238">auth, idempotency</text>
+<rect class="n svc" x="320" y="200" width="110" height="50" rx="8"/><text class="t b mid" x="375" y="222">Dispatch</text><text class="t xs mute mid" x="375" y="238">matching</text>
+<rect class="n svc" x="480" y="180" width="120" height="46" rx="8"/><text class="t b mid" x="540" y="200">ETA service</text><text class="t xs mute mid" x="540" y="215">road graph</text>
+<rect class="n svc" x="480" y="280" width="120" height="46" rx="8"/><text class="t b mid" x="540" y="300">Pricing</text><text class="t xs mute mid" x="540" y="315">surge per hex</text>
+<rect class="n db" x="320" y="330" width="110" height="50" rx="8"/><text class="t b mid" x="375" y="352">Trip store</text><text class="t xs mute mid" x="375" y="368">sharded by city</text>
+
+<path class="e" d="M120,75 H146"/>
+<path class="e" d="M290,75 H316"/>
+<path class="e" d="M430,75 H466"/>
+<path class="e dash" d="M610,75 H641"/>
+<path class="e" d="M120,225 H156"/>
+<path class="e" d="M280,225 H316"/>
+<path class="e both" d="M400,200 C400,150 520,150 520,107"/>
+<path class="e both" d="M430,212 C455,212 455,203 476,203"/>
+<path class="e both" d="M375,250 V326"/>
+<path class="e dash" d="M340,200 C300,160 240,140 225,104"/>
+<path class="e" d="M220,250 C220,303 400,303 476,303"/>
+<path class="e dash" d="M610,90 C700,90 700,303 604,303"/>
+
+<path class="flow" d="M120,75 H146"/>
+<path class="flow" d="M290,75 H316"/>
+<path class="flow" d="M430,75 H466"/>
+
+<text class="t xs mute mid" x="138" y="40">every 4 s</text>
+<text class="t xs mute" x="530" y="135">nearby available</text>
+<text class="t xs mute" x="290" y="132">offer</text>
+<text class="t xs mute" x="260" y="318">fare quote</text>
+<text class="t xs mute" x="678" y="200">supply</text>
+<text class="t xs mute" x="384" y="295">assign</text>
+</svg>
+</div>
+<figcaption><b>Architecture.</b> The animated path is the location firehose: 375,000 updates per second flow through stateless gateways and Kafka into an in-memory index, and nothing on that path touches a disk-backed database. Dispatch reads the index, and only the assignment itself is a strongly consistent write.</figcaption>
+</figure>
+
+<ol class="steps">
+<li><strong>Ingest.</strong> Each driver app keeps a connection to a location gateway and sends a position every 4 seconds. Gateways validate and publish to Kafka keyed by city, so each city's updates stay ordered on one partition.</li>
+<li><strong>Index.</strong> Location index workers consume their cities' partitions and update an in-memory map of hexagonal cells to available drivers. A driver's entry carries a timestamp and is dropped if no update arrives for 30 seconds.</li>
+<li><strong>Quote and request.</strong> The rider gets a quote (route distance and time from the ETA service, multiplied by the current surge for the pickup cell), then requests the trip. The trip row is created in state <code>matching</code>.</li>
+<li><strong>Match and offer.</strong> Dispatch finds nearby available drivers, ranks them by road ETA, locks the best one and sends an offer down the driver's connection. On accept, the trip is assigned; on decline or timeout, the next driver gets the offer.</li>
+<li><strong>Track.</strong> During the trip, the same location stream is routed to the rider's app and to the trip's route history, which later feeds the fare and receipt.</li>
+</ol>
+
+<h2 id="geo-index">6. Deep dive: geospatial indexing</h2>
+<p>"Drivers within 2 km of this point" cannot be answered by a B-tree on latitude and a B-tree on longitude: each index returns a huge strip of the city and the intersection is expensive. Every practical solution maps 2D space to cells with ids, so that "nearby" becomes "in this cell or one of its neighbours".</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 265" role="img" aria-label="Three spatial indexes. A geohash grid of rectangular cells where the nearest driver sits in the cell above the rider. A quadtree that subdivides more finely where drivers are dense. An H3 hexagon grid where the rider's cell has six equidistant neighbours">
+<text class="t b mid" x="119" y="30">Geohash grid</text>
+<text class="t b mid" x="360" y="30">Quadtree</text>
+<text class="t b mid" x="610" y="30">H3 hexagons</text>
+
+<rect class="line faint" x="20" y="50" width="66" height="60"/><text class="t xs mono mute" x="24" y="63">9q8yyj</text>
+<rect class="n svc" x="86" y="50" width="66" height="60"/><text class="t xs mono" x="90" y="63">9q8yym</text>
+<rect class="line faint" x="152" y="50" width="66" height="60"/><text class="t xs mono mute" x="156" y="63">9q8yyt</text>
+<rect class="line faint" x="20" y="110" width="66" height="60"/><text class="t xs mono mute" x="24" y="123">9q8yyh</text>
+<rect class="n cache" x="86" y="110" width="66" height="60"/><text class="t xs mono" x="90" y="123">9q8yyk</text>
+<rect class="line faint" x="152" y="110" width="66" height="60"/><text class="t xs mono mute" x="156" y="123">9q8yys</text>
+<rect class="line faint" x="20" y="170" width="66" height="60"/><text class="t xs mono mute" x="24" y="183">9q8yy5</text>
+<rect class="line faint" x="86" y="170" width="66" height="60"/><text class="t xs mono mute" x="90" y="183">9q8yy7</text>
+<rect class="line faint" x="152" y="170" width="66" height="60"/><text class="t xs mono mute" x="156" y="183">9q8yye</text>
+<circle class="dot accent" cx="134" cy="138" r="5"/>
+<circle class="dot db" cx="134" cy="98" r="5"/>
+<circle class="dot db" cx="142" cy="162" r="5"/>
+<text class="t xs mute mid" x="119" y="250">nearest driver is in the next cell</text>
+
+<rect class="line" x="260" y="50" width="200" height="180"/>
+<path class="line" d="M360,50 V230 M260,140 H460 M410,50 V140 M360,95 H460 M385,95 V140 M360,117.5 H410"/>
+<circle class="dot db" cx="368" cy="104" r="3.5"/><circle class="dot db" cx="377" cy="110" r="3.5"/><circle class="dot db" cx="393" cy="103" r="3.5"/><circle class="dot db" cx="401" cy="111" r="3.5"/>
+<circle class="dot db" cx="370" cy="127" r="3.5"/><circle class="dot db" cx="378" cy="134" r="3.5"/><circle class="dot db" cx="395" cy="125" r="3.5"/><circle class="dot db" cx="403" cy="133" r="3.5"/>
+<circle class="dot db" cx="425" cy="78" r="3.5"/><circle class="dot db" cx="443" cy="68" r="3.5"/><circle class="dot db" cx="432" cy="121" r="3.5"/><circle class="dot db" cx="300" cy="182" r="3.5"/><circle class="dot db" cx="421" cy="199" r="3.5"/>
+<text class="t xs mute mid" x="360" y="250">split cells holding too many drivers</text>
+
+<polygon class="n ghost" points="555.4,192.5 555.4,213.5 537.3,224.0 519.1,213.5 519.1,192.5 537.3,182.0"/>
+<polygon class="n ghost" points="555.4,129.5 555.4,150.5 537.3,161.0 519.1,150.5 519.1,129.5 537.3,119.0"/>
+<polygon class="n ghost" points="573.6,161.0 573.6,182.0 555.4,192.5 537.3,182.0 537.3,161.0 555.4,150.5"/>
+<polygon class="n ghost" points="591.8,192.5 591.8,213.5 573.6,224.0 555.4,213.5 555.4,192.5 573.6,182.0"/>
+<polygon class="n ghost" points="555.4,66.5 555.4,87.5 537.3,98.0 519.1,87.5 519.1,66.5 537.3,56.0"/>
+<polygon class="n ghost" points="573.6,98.0 573.6,119.0 555.4,129.5 537.3,119.0 537.3,98.0 555.4,87.5"/>
+<polygon class="n svc" points="591.8,129.5 591.8,150.5 573.6,161.0 555.4,150.5 555.4,129.5 573.6,119.0"/>
+<polygon class="n svc" points="610.0,161.0 610.0,182.0 591.8,192.5 573.6,182.0 573.6,161.0 591.8,150.5"/>
+<polygon class="n ghost" points="628.2,192.5 628.2,213.5 610.0,224.0 591.8,213.5 591.8,192.5 610.0,182.0"/>
+<polygon class="n ghost" points="591.8,66.5 591.8,87.5 573.6,98.0 555.4,87.5 555.4,66.5 573.6,56.0"/>
+<polygon class="n svc" points="610.0,98.0 610.0,119.0 591.8,129.5 573.6,119.0 573.6,98.0 591.8,87.5"/>
+<polygon class="n cache" points="628.2,129.5 628.2,150.5 610.0,161.0 591.8,150.5 591.8,129.5 610.0,119.0"/>
+<polygon class="n svc" points="646.4,161.0 646.4,182.0 628.2,192.5 610.0,182.0 610.0,161.0 628.2,150.5"/>
+<polygon class="n ghost" points="664.6,192.5 664.6,213.5 646.4,224.0 628.2,213.5 628.2,192.5 646.4,182.0"/>
+<polygon class="n ghost" points="628.2,66.5 628.2,87.5 610.0,98.0 591.8,87.5 591.8,66.5 610.0,56.0"/>
+<polygon class="n svc" points="646.4,98.0 646.4,119.0 628.2,129.5 610.0,119.0 610.0,98.0 628.2,87.5"/>
+<polygon class="n svc" points="664.6,129.5 664.6,150.5 646.4,161.0 628.2,150.5 628.2,129.5 646.4,119.0"/>
+<polygon class="n ghost" points="682.7,161.0 682.7,182.0 664.6,192.5 646.4,182.0 646.4,161.0 664.6,150.5"/>
+<polygon class="n ghost" points="700.9,192.5 700.9,213.5 682.7,224.0 664.6,213.5 664.6,192.5 682.7,182.0"/>
+<polygon class="n ghost" points="664.6,66.5 664.6,87.5 646.4,98.0 628.2,87.5 628.2,66.5 646.4,56.0"/>
+<polygon class="n ghost" points="682.7,98.0 682.7,119.0 664.6,129.5 646.4,119.0 646.4,98.0 664.6,87.5"/>
+<polygon class="n ghost" points="700.9,129.5 700.9,150.5 682.7,161.0 664.6,150.5 664.6,129.5 682.7,119.0"/>
+<polygon class="n ghost" points="700.9,66.5 700.9,87.5 682.7,98.0 664.6,87.5 664.6,66.5 682.7,56.0"/>
+<circle class="dot accent" cx="610" cy="140" r="5"/>
+<text class="t xs mute mid" x="610" y="250">6 neighbours, all the same distance</text>
+</svg>
+</div>
+<figcaption><b>Three ways to cut a city into cells.</b> Green dots are drivers, the purple dot is the rider. The geohash cells are the real neighbours of the rider's cell <code>9q8yyk</code> in San Francisco, and the nearest driver sits in <code>9q8yym</code>, which is why every query must include neighbouring cells. Quadtrees adapt to density. Hexagons give every neighbour the same centre-to-centre distance.</figcaption>
+</figure>
+
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Geohash</th><th>Quadtree</th><th>H3 hexagons</th><th>S2 cells</th></tr></thead>
+<tbody>
+<tr><th>Cell id</th><td>Base32 string; shared prefix means nearby</td><td>Path from the root</td><td>64-bit integer per cell</td><td>64-bit integer on a Hilbert curve</td></tr>
+<tr><th>Cell shape</th><td>Rectangles, distorted towards the poles</td><td>Squares of varying size</td><td>Hexagons (plus 12 pentagons)</td><td>Quadrilaterals on a cube projection</td></tr>
+<tr><th>Neighbours</th><td class="meh">8, at two different distances</td><td class="no">Irregular, found by tree walks</td><td class="yes">6, all equidistant</td><td class="meh">8, varying</td></tr>
+<tr><th>Adapts to density</th><td class="no">Fixed per precision</td><td class="yes">Yes, by splitting</td><td class="no">Fixed per resolution</td><td class="no">Fixed per level</td></tr>
+<tr><th>Updates</th><td class="yes">Recompute a string</td><td class="meh">Splits and merges as cars move</td><td class="yes">Recompute an integer</td><td class="yes">Recompute an integer</td></tr>
+<tr><th>Used by</th><td>Redis GEO, Elasticsearch</td><td>Classic in-memory indexes</td><td>Uber (open-sourced it)</td><td>Google Maps, Foursquare</td></tr>
+</tbody></table></div>
+<p>For moving drivers, fixed grids beat quadtrees: an update is "compute the new cell id, move the driver between two sets if it changed", with no rebalancing. Uber built <dfn>H3</dfn> for exactly this. At resolution 9 a hexagon averages about 0.1 km², roughly a city block or two; a query takes the rider's cell plus one or two rings of neighbours (<code>k-ring</code>), and hexagons make "rings" approximate circles far better than squares do. Resolution 7 cells (about 5 km²) are a natural unit for surge pricing.</p>
+<p>The same idea with geohash, runnable with the standard library. The rider's cell is <code>9q8yyk</code>; the nearest driver is in <code>9q8yym</code>, which a single-cell lookup would miss.</p>
+<pre><code class="language-python">import math
+from collections import defaultdict
+
+BASE32 = "0123456789bcdefghjkmnpqrstuvwxyz"
+
+
+def geohash(lat, lng, precision=6):
+    """Interleave longitude and latitude bisection bits, 5 bits per base32 char."""
+    lat_lo, lat_hi, lng_lo, lng_hi = -90.0, 90.0, -180.0, 180.0
+    bits, even, out = 0, True, []
+    for i in range(precision * 5):
+        if even:                                     # even bits refine longitude
+            mid = (lng_lo + lng_hi) / 2
+            bit = lng &gt;= mid
+            lng_lo, lng_hi = (mid, lng_hi) if bit else (lng_lo, mid)
+        else:                                        # odd bits refine latitude
+            mid = (lat_lo + lat_hi) / 2
+            bit = lat &gt;= mid
+            lat_lo, lat_hi = (mid, lat_hi) if bit else (lat_lo, mid)
+        bits = bits * 2 + bit
+        even = not even
+        if i % 5 == 4:
+            out.append(BASE32[bits])
+            bits = 0
+    return "".join(out)
+
+
+def km(a, b):
+    """Haversine distance between two (lat, lng) points."""
+    (la1, lo1), (la2, lo2) = [(math.radians(x), math.radians(y)) for x, y in (a, b)]
+    h = math.sin((la2 - la1) / 2) ** 2 + math.cos(la1) * math.cos(la2) * math.sin((lo2 - lo1) / 2) ** 2
+    return 6371 * 2 * math.asin(math.sqrt(h))
+
+
+class DriverIndex:
+    """Drivers bucketed by geohash-6 cell (~1.2 km x 0.6 km)."""
+    CELL_LAT, CELL_LNG = 180 / 2 ** 15, 360 / 2 ** 15     # 30 bits: 15 lat, 15 lng
+
+    def __init__(self):
+        self.cells = defaultdict(dict)    # cell -&gt; {driver_id: (lat, lng)}
+        self.where = {}                   # driver_id -&gt; cell
+
+    def update(self, driver, lat, lng):   # called every 4 s per driver
+        cell = geohash(lat, lng)
+        old = self.where.get(driver)
+        if old and old != cell:
+            del self.cells[old][driver]
+        self.cells[cell][driver] = (lat, lng)
+        self.where[driver] = cell
+
+    def nearby(self, lat, lng, radius_km=1.0, k=3):
+        # the rider's cell plus its 8 neighbours, so drivers just over a cell edge are found; one ring only guarantees ~0.6 km in every direction, so widen the ring for larger radii
+        cells = {geohash(lat + dy * self.CELL_LAT, lng + dx * self.CELL_LNG)
+                 for dy in (-1, 0, 1) for dx in (-1, 0, 1)}
+        found = [(km((lat, lng), pos), d) for c in cells for d, pos in self.cells[c].items()]
+        return sorted((round(dist, 2), d) for dist, d in found if dist &lt;= radius_km)[:k]
+
+
+idx = DriverIndex()
+idx.update("d_17", 37.7793, -122.4192)   # SF City Hall
+idx.update("d_42", 37.7810, -122.4110)
+idx.update("d_88", 37.7700, -122.4470)   # Haight, ~2.5 km away
+idx.update("d_51", 37.7755, -122.4120)
+rider = (37.7764, -122.4172)
+print(geohash(*rider), idx.where)
+# 9q8yyk {'d_17': '9q8yym', 'd_42': '9q8yym', 'd_88': '9q8yve', 'd_51': '9q8yyk'}
+print(idx.nearby(*rider))
+# [(0.37, 'd_17'), (0.47, 'd_51'), (0.75, 'd_42')]</code></pre>
+<p>Straight-line distance is only a filter. A driver 300 m away across a river or on the wrong side of a highway may be 10 minutes out. Dispatch takes the 10 to 20 closest candidates by distance and asks the ETA service for road-network times, then ranks by those.</p>
+
+<h2 id="matching">7. Deep dive: matching and dispatch</h2>
+<p>Matching is a loop: find candidates, offer the trip to the best one, wait, and move on if they decline or ignore it. The subtle part is that the same driver must not receive two offers at once, and must not end up assigned to two trips.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 430" role="img" aria-label="Dispatch sequence: the rider requests, dispatch queries nearby drivers and ETAs, locks driver A and sends an offer, A does not answer within 15 seconds, dispatch releases A and offers driver B, B accepts and the trip is assigned with a conditional write">
+<rect class="n client" x="10" y="16" width="100" height="36" rx="7"/><text class="t sm b mid" x="60" y="39">Rider</text>
+<rect class="n svc" x="160" y="16" width="100" height="36" rx="7"/><text class="t sm b mid" x="210" y="39">Dispatch</text>
+<rect class="n cache" x="310" y="16" width="100" height="36" rx="7"/><text class="t sm b mid" x="360" y="39">Index + ETA</text>
+<rect class="n client" x="460" y="16" width="100" height="36" rx="7"/><text class="t sm b mid" x="510" y="39">Driver A</text>
+<rect class="n client" x="610" y="16" width="100" height="36" rx="7"/><text class="t sm b mid" x="660" y="39">Driver B</text>
+<path class="line faint" d="M60,52 V395 M210,52 V395 M360,52 V395 M510,52 V395 M660,52 V395" style="stroke-dasharray:3 4"/>
+
+<path class="e" d="M60,85 H206"/><text class="t mono mid" x="135" y="78">POST /trips</text>
+<path class="e" d="M210,115 H356"/><text class="t mono mid" x="285" y="108">nearby(hex, k=2)</text>
+<path class="e dash" d="M360,145 H214"/><text class="t mono mid" x="285" y="138">A 3 min, B 4 min</text>
+<text class="t sm mid" x="360" y="420" data-show="1">Find: cells around the pickup, then road ETAs for the closest few.</text>
+
+<g data-show="2 3 4">
+<path class="e" d="M214,168 H250 V186 H214"/><text class="t sm" x="258" y="182">lock A</text>
+<path class="e" d="M210,210 H506"/><text class="t mono mid" x="285" y="203">offer, 15 s</text>
+<text class="t sm mid" x="360" y="420" data-show="2">Offer: A moves from available to offered, so no one else can offer A a trip.</text>
+</g>
+<g data-show="3 4">
+<text class="t sm red mid" x="435" y="242">15 s, no reply</text>
+<path class="e" d="M214,258 H250 V276 H214"/><text class="t sm" x="258" y="272">free A, lock B</text>
+<path class="e" d="M210,300 H656"/><text class="t mono mid" x="285" y="293">offer, 15 s</text>
+<text class="t sm mid" x="360" y="420" data-show="3">Timeout: A goes back to available; the next candidate gets the offer.</text>
+</g>
+<g data-show="4">
+<path class="e" d="M660,328 H214"/><text class="t mono mid" x="585" y="321">accept</text>
+<path class="e" d="M214,342 H250 V360 H214"/><text class="t sm" x="258" y="356">assign trip</text>
+<path class="e green" d="M210,382 H64"/><text class="t sm green mid" x="135" y="375">driver B, 4 min</text>
+<text class="t sm mid" x="360" y="420">Accept: one transaction moves B to on_trip and the trip to assigned.</text>
+</g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Find</button><button type="button" data-step="2" aria-pressed="false">Offer A</button><button type="button" data-step="3" aria-pressed="false">Timeout</button><button type="button" data-step="4" aria-pressed="false">B accepts</button></div>
+</div>
+<figcaption><b>Offer, wait, fall through.</b> Each driver is locked only while an offer is outstanding, so a slow or absent driver costs the rider 15 seconds, not the whole match. The lock and the assignment are both conditional writes.</figcaption>
+</figure>
+
+<h3 id="no-double-booking">No double booking</h3>
+<p>Two dispatch workers handling two nearby riders will often pick the same best driver at the same moment. The index is eventually consistent and cannot arbitrate; the driver's state row can. Every transition is a compare-and-set that succeeds only from the expected state:</p>
+<pre><code class="language-sql">-- Lock: only an available driver can receive an offer
+UPDATE drivers SET status = 'offered', trip_id = 't_5Kq2', offer_expires = now() + interval '15 seconds'
+ WHERE driver_id = 'd_17' AND status = 'available';          -- 0 rows → someone else got them; try the next
+
+-- Accept: only the offer that is still live, for this trip
+BEGIN;
+UPDATE drivers SET status = 'on_trip'
+ WHERE driver_id = 'd_17' AND trip_id = 't_5Kq2' AND status = 'offered' AND offer_expires &gt; now();
+                                                             -- 0 rows → ROLLBACK: offer expired
+UPDATE trips SET driver_id = 'd_17', state = 'driver_assigned'
+ WHERE trip_id = 't_5Kq2' AND state = 'matching';            -- 0 rows → ROLLBACK: rider cancelled
+COMMIT;                                                      -- only if both updated one row; same city shard</code></pre>
+<p>If the first update matches zero rows, the worker moves to the next candidate. A late "accept" after the offer expired matches zero rows, the transaction rolls back and the driver app shows "offer expired"; a rider who cancelled first makes the second update miss, which also rolls back. Because both rows live on the city's shard, this is a single-shard transaction; no two-phase commit is needed. A distributed lock service (an etcd or Redis lock per driver) can do the same job, but a conditional write on the row that is the source of truth is simpler and cannot drift from it. See <a href="distributed-transactions.html">Distributed Transactions</a> for what changes when the rows cannot share a shard.</p>
+
+<h3 id="batched-matching">Greedy versus batched matching</h3>
+<p>Offering each request its closest driver one by one is greedy, and greedy is often worse overall: give the driver 2 minutes from rider X to X, and rider Y, for whom that driver was the only one under 10 minutes, waits 10 minutes. Large platforms collect requests for a second or two, build a matrix of ETAs between waiting riders and available drivers in the area, and solve an assignment problem that minimises total pickup time. The added second of batching is repaid many times in shorter average waits.</p>
+
+<h3 id="trip-state">Trip state machine</h3>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 280" role="img" aria-label="Trip state machine: requested to matching to driver assigned to arriving to in trip to completed; matching can loop on declined or timed out offers and can end in no drivers; assigned and arriving can be cancelled">
+<rect class="n svc" x="20" y="40" width="120" height="46" rx="8"/><text class="t sm b mid" x="80" y="67">requested</text>
+<rect class="n svc" x="190" y="40" width="120" height="46" rx="8"/><text class="t sm b mid" x="250" y="67">matching</text>
+<rect class="n svc" x="360" y="40" width="120" height="46" rx="8"/><text class="t sm b mid" x="420" y="67">driver_assigned</text>
+<rect class="n svc" x="530" y="40" width="120" height="46" rx="8"/><text class="t sm b mid" x="590" y="67">arriving</text>
+<rect class="n svc" x="530" y="130" width="120" height="46" rx="8"/><text class="t sm b mid" x="590" y="157">in_trip</text>
+<rect class="n good" x="530" y="220" width="120" height="46" rx="8"/><text class="t sm b mid" x="590" y="247">completed</text>
+<rect class="n bad" x="190" y="130" width="120" height="46" rx="8"/><text class="t sm b mid" x="250" y="157">no_drivers</text>
+<rect class="n bad" x="360" y="130" width="120" height="46" rx="8"/><text class="t sm b mid" x="420" y="157">cancelled</text>
+<path class="e" d="M140,63 H186"/>
+<path class="e" d="M310,63 H356"/>
+<path class="e" d="M480,63 H526"/>
+<path class="e" d="M590,86 V126"/>
+<path class="e" d="M590,176 V216"/>
+<path class="e" d="M225,40 C225,8 285,8 285,36"/>
+<path class="e red" d="M250,86 V126"/>
+<path class="e red dash" d="M420,86 V126"/>
+<path class="e red dash" d="M530,78 C500,78 500,153 484,153"/>
+<text class="t xs mute" x="300" y="22">offer declined or timed out</text>
+<text class="t xs mute" x="600" y="110">pickup</text>
+<text class="t xs mute" x="600" y="200">drop-off, charge</text>
+<text class="t xs mute" x="150" y="112">2 min, none</text>
+<text class="t xs mute" x="20" y="200">Every arrow is a conditional write from the expected</text>
+<text class="t xs mute" x="20" y="215">state, so duplicate or late events are no-ops.</text>
+</svg>
+</div>
+<figcaption><b>Trip lifecycle.</b> States only move forward along these arrows. A rider cancelling at the same moment a driver taps "arrived" is resolved by whichever conditional write lands first; the other sees zero rows updated.</figcaption>
+</figure>
+
+<h2 id="eta-surge">8. Deep dive: ETA, surge and sharding</h2>
+<h3 id="eta">ETA</h3>
+<p>ETAs come from a routing engine over the road graph with live edge speeds. Raw Dijkstra over a city graph with millions of edges is too slow at thousands of queries per second, so routing engines precompute shortcuts (contraction hierarchies or similar) that answer point-to-point queries in milliseconds. Edge speeds are learned from the drivers' own location stream: the same 375,000 updates per second that feed the index also measure traffic on every road with cars on it. A machine-learned correction on top of the routing time, trained on actual pickup times, removes systematic errors such as time spent finding a parking spot at an airport.</p>
+
+<h3 id="surge">Surge pricing at a high level</h3>
+<p>Every minute or two, a stream job counts demand (requests and app opens) and supply (available drivers) per H3 resolution-7 cell, computes a multiplier from the ratio, smooths it across neighbouring cells and over time so prices do not flicker, and caps it. The multiplier is written to a small cache that the pricing service reads when building quotes. The quote carries the multiplier it was built with and an expiry, which is what the rider is charged. Surge does two jobs: it rations rides during a spike, and it pulls drivers from quieter areas towards busy ones, which the driver app shows as a heat map.</p>
+
+<h3 id="sharding">Sharding by city</h3>
+<ul>
+<li><strong>The unit is a city or region</strong>, not a hash of the driver id. Every query in matching is local, so a city shard holds the location index, driver state and active trips for that area. A Tokyo outage never touches São Paulo.</li>
+<li><strong>Boundaries.</strong> Airports and suburbs sit between cities. Assign every H3 cell to exactly one shard, and let dispatch query a neighbouring shard's index (read-only) when the pickup is near a border.</li>
+<li><strong>Uneven sizes.</strong> One huge city may need more than one index worker. Split it by H3 parent cells, the same way, with neighbour lookups across the split.</li>
+<li><strong>Failover.</strong> The location index is soft state: a replacement worker replays the last 30 seconds of the city's Kafka partition and is complete. Driver state and trips live in a replicated, strongly consistent store with automatic leader failover, because losing an assignment is not acceptable.</li>
+</ul>
+
+<h2 id="scaling">9. Bottlenecks and how the design handles them</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Pressure</th><th>What breaks first</th><th>Response</th></tr></thead>
+<tbody>
+<tr><th>Location update rate</th><td>Any per-update disk write</td><td>In-memory index fed by Kafka; persist only in-trip points, in batches</td></tr>
+<tr><th>Nearby-cars map traffic</th><td>Index read load</td><td>Read replicas of each city's index; return coarse, cached results per cell for a few seconds</td></tr>
+<tr><th>Big event ends (stadium)</th><td>Requests in a handful of cells</td><td>Batched matching, surge, queueing riders in order, staging areas for pickups</td></tr>
+<tr><th>Two workers pick one driver</th><td>Double booking</td><td>Compare-and-set on driver state; losers move to the next candidate</td></tr>
+<tr><th>Index worker dies</th><td>Matching in that city</td><td>Standby replays recent stream; index is soft state, back in seconds</td></tr>
+<tr><th>Phones in tunnels</th><td>Stale positions</td><td>Expire drivers after 30 s without updates; dead-reckon from heading and speed for the map</td></tr>
+</tbody></table></div>
+
+<h2 id="tradeoffs">10. Key trade-offs to state</h2>
+<ul>
+<li><strong>In-memory, lossy location index</strong>: handles 375,000 updates per second cheaply, in exchange for rebuilding from the stream after a failure.</li>
+<li><strong>Strong consistency only where it matters</strong>: assignment and trip state use conditional writes; locations, maps and surge are eventually consistent.</li>
+<li><strong>Fixed hex grid over quadtree</strong>: trivial updates for moving objects and uniform neighbours, in exchange for no adaptation to density, which ring size compensates for.</li>
+<li><strong>Sequential offers with timeouts</strong>: simple and fair to drivers, in exchange for up to 15 seconds lost per non-responding driver. Batched matching improves the global outcome at the cost of complexity.</li>
+<li><strong>Sharding by geography</strong>: local queries and fault isolation, in exchange for border handling and uneven shard sizes.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>What the interviewer is checking</h4>
+<p>Whether you size the location write rate and conclude it belongs in memory, can explain a geospatial index and its neighbour problem, and can guarantee that a driver is never double-booked with a concrete mechanism rather than "use a lock".</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>How do you find drivers within 2 km? Why not a SQL query on latitude and longitude?</li>
+<li>Two riders request at the same moment and the best driver is the same. What happens?</li>
+<li>The driver accepts just as the offer expires. Who wins?</li>
+<li>The index server for London crashes. How long until matching works again?</li>
+<li>How would you implement surge, and how do you avoid prices flickering?</li>
+<li>How would you match shared rides, where one car picks up several riders?</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>Writing every location update to a relational database.</li>
+<li>Searching a single geohash cell without neighbours.</li>
+<li>Ranking drivers by straight-line distance only.</li>
+<li>Preventing double booking with an in-memory flag on one dispatch server.</li>
+<li>One global shard for all cities.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://www.uber.com/blog/h3/" target="_blank" rel="noopener">H3: Uber's Hexagonal Hierarchical Spatial Index</a><span>Uber engineering, 2018. Why hexagons, the hierarchy, and how H3 is used for surge and dispatch.</span></li>
+<li><a href="https://h3geo.org/docs/core-library/restable/" target="_blank" rel="noopener">H3 documentation: cell statistics by resolution</a><span>Average area and edge length for each resolution, used to pick query ring sizes.</span></li>
+<li><a href="http://s2geometry.io/" target="_blank" rel="noopener">S2 Geometry</a><span>Google's library of hierarchical cells on a sphere, mapped to a Hilbert curve.</span></li>
+<li><a href="https://redis.io/docs/latest/commands/geosearch/" target="_blank" rel="noopener">Redis GEOSEARCH</a><span>A geohash-based radius and box search built into Redis, a practical starting point for a nearby-drivers index.</span></li>
+</ul>

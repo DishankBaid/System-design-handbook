@@ -1,0 +1,402 @@
+<p class="lead">A video platform like YouTube or Netflix accepts a multi-gigabyte upload over a shaky connection, turns it into a dozen versions for every screen and network, and then streams it to millions of viewers who expect playback to start in two seconds and never pause to buffer. Almost every byte goes out through caches near the viewer. The interesting parts are resumable uploads, a parallel transcoding pipeline, adaptive bitrate streaming, and a delivery network that can push hundreds of terabits per second.</p>
+
+<div class="callout note">
+<div class="callout-title">How to use this case study</div>
+<p>Sections follow the order of a real interview. Concepts used here have their own chapters: <a href="blob-storage.html">Blob &amp; Object Storage</a>, <a href="cdn.html">Content Delivery Networks</a>, <a href="message-queues.html">Message Queues</a>, <a href="batch-stream.html">Batch vs Stream Processing</a>.</p>
+</div>
+
+<h2 id="requirements">1. Requirements</h2>
+<div class="defs">
+<div><h4>Functional</h4><p>Upload videos up to 10 GB, resumable after a dropped connection. Process them into streamable formats with thumbnails. Watch on phones, browsers and TVs, with quality adapting to the network. Video pages with title, description and view count.</p></div>
+<div><h4>Non-functional</h4><p>Playback starts in under 2 seconds and rarely rebuffers. Uploads are never lost once acknowledged. A new upload is watchable within minutes. Global audience, very high availability for playback, and cost efficiency, because bandwidth is the largest bill.</p></div>
+<div><h4>Out of scope</h4><p>Recommendations, search, comments, live streaming, ads and DRM licence servers. Mention live streaming as a variant (same segments and manifests, but produced in real time).</p></div>
+</div>
+<p>The key observation: <strong>the system is two almost independent halves</strong>. Upload and processing is a batch pipeline that can take minutes and must never lose data. Playback is a read path that must be instant, and is served almost entirely by caches, so the job of the core system is mostly to prepare files and tell players where to find them.</p>
+
+<h2 id="estimation">2. Estimation</h2>
+<p>Use YouTube-scale published figures: about 500 hours of video uploaded per minute and around a billion hours watched per day. Assume uploads average an 8 Mbps 1080p source, views average 6 minutes, and the average delivered bitrate is 2.5 Mbps.</p>
+<div class="stats">
+<div><b>720k h/day</b><span>of new video uploaded</span></div>
+<div><b>~240 Gbps</b><span>upload ingest</span></div>
+<div><b>~2 EB/year</b><span>of transcoded renditions</span></div>
+<div><b>~104 Tbps</b><span>average playback egress</span></div>
+</div>
+<div class="calc">Uploads       500 h/min × 1,440 min                        = <span class="r">720,000 hours/day</span>
+Ingest        8 Mbps × 3,600 s / 8 = 3.6 GB per source hour
+              720,000 × 3.6 GB = 2.6 PB/day  →  / 86,400 s  ≈ 30 GB/s ≈ <span class="r">240 Gbps</span>
+Ladder        0.4 + 0.8 + 1.4 + 2.8 + 5.0 Mbps (240p..1080p) = 10.4 Mbps ≈ 4.7 GB per hour, one codec
+              + a second codec at ~70% of those bitrates     ≈ 8 GB per hour of video
+Storage       720,000 × 8 GB = 5.8 PB/day  × 365            ≈ <span class="r">2.1 EB/year</span> (before replication)
+Egress        1B h × 3,600 s × 2.5 Mbps = 9 × 10¹⁸ bits/day  = 1.1 EB/day ≈ <span class="r">104 Tbps</span> average
+Segments      1B h × 900 four-second segments per hour      = 9 × 10¹¹/day ≈ <span class="r">10.4M requests/s</span>
+Views         1B h / 0.1 h per view = 10B/day                ≈ 116,000 view events/s
+Transcoding   assume ~20 CPU-hours per source hour → 14.4M CPU-hours/day ≈ 600,000 cores busy</div>
+<p>Three conclusions. Egress at 100+ Tbps cannot come from a few data centres; it has to be served from caches inside or next to viewers' ISPs. Storage grows by exabytes per year, so long-tail videos must move to cheaper storage tiers. And transcoding is a large, parallel batch workload that should run on preemptible capacity behind a queue.</p>
+
+<h2 id="api">3. API</h2>
+<pre><code class="language-http">POST /v1/uploads
+{ "filename": "launch.mov", "size": 2147483648, "sha256": "9f2c..." }
+→ 201 { "upload_id": "up_7c1", "part_size": 8388608, "parts": 256 }
+
+PUT  /v1/uploads/up_7c1/parts/17          (8 MiB body; often a presigned object-store URL)
+→ 200 { "etag": "\"a41f...\"" }
+
+GET  /v1/uploads/up_7c1                   → { "received": [1, 2, ..., 9, 11] }   // resume point
+POST /v1/uploads/up_7c1/complete          → 202 { "video_id": "v_Qx81", "status": "processing" }
+
+GET  /v1/videos/v_Qx81
+→ 200 { "title": "...", "status": "ready", "duration_s": 754,
+        "manifest": "https://cdn.example.com/v_Qx81/master.m3u8?sig=...&amp;exp=1760040000",
+        "thumbnails": [...], "views": 18422 }
+
+POST /v1/videos/v_Qx81/watch-events  { "session": "s_19b", "position_s": 30, "rendition": "720p" }</code></pre>
+<p>The playback endpoints are not part of our API at all: the player fetches the manifest and segments from the CDN by URL. The metadata API only hands out a <strong>signed manifest URL</strong> with an expiry, and the same token is carried on every segment request (a signed cookie, a token in the path, or signatures rewritten into the segment URLs), so the CDN can reject hotlinking and expired links without calling back to us.</p>
+
+<h2 id="data-model">4. Data model</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Data</th><th>Store</th><th>Key / layout</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><th>Video metadata</th><td>Sharded MySQL (YouTube built Vitess for this)</td><td><code>video_id</code>; owner, title, status, duration, renditions</td><td>Small, relational, read-heavy; cached aggressively</td></tr>
+<tr><th>Upload sessions</th><td>KV store</td><td><code>upload_id</code>; parts received, etags, expiry</td><td>Expire abandoned uploads after 7 days</td></tr>
+<tr><th>Source files</th><td>Object store, cold class after processing</td><td><code>raw/v_Qx81/source.mov</code></td><td>Kept to re-encode later with better codecs</td></tr>
+<tr><th>Renditions</th><td>Object store (origin)</td><td><code>vod/v_Qx81/h264/720p/seg_00042.m4s</code></td><td>Immutable; cache forever at the edge</td></tr>
+<tr><th>Manifests</th><td>Object store</td><td><code>vod/v_Qx81/master.m3u8</code></td><td>Tiny text files listing renditions and segments</td></tr>
+<tr><th>View counts</th><td>Stream aggregator → counter store</td><td><code>video_id</code> → count</td><td>Approximate in real time, reconciled daily</td></tr>
+</tbody></table></div>
+<p>Video status is a small state machine: <code>uploading → processing → ready</code>, with <code>failed</code> and <code>blocked</code> as side exits. Every pipeline stage updates it, and the watch page shows "processing" until the first playable rendition exists.</p>
+
+<h2 id="high-level">5. High-level design</h2>
+
+<figure class="fig wide">
+<div class="fig-frame">
+<svg viewBox="0 0 760 410" role="img" aria-label="Architecture: the creator uploads chunks to the upload service, which stores the raw file and emits an event to Kafka; the transcoding orchestrator writes renditions and manifests to the origin store and updates metadata; viewers get a signed manifest URL from the metadata API and stream segments from CDN edges that fill from the origin on a miss; watch events go to a view counter">
+<rect class="n client" x="20" y="40" width="90" height="50" rx="8"/><text class="t b mid" x="65" y="62">Creator</text><text class="t xs mute mid" x="65" y="78">2 GB upload</text>
+<rect class="n svc" x="145" y="40" width="110" height="50" rx="8"/><text class="t b mid" x="200" y="62">Upload service</text><text class="t xs mute mid" x="200" y="78">resumable parts</text>
+<rect class="n db" x="290" y="40" width="110" height="50" rx="8"/><text class="t b mid" x="345" y="62">Raw store</text><text class="t xs mute mid" x="345" y="78">object storage</text>
+<rect class="n queue" x="435" y="40" width="100" height="50" rx="8"/><text class="t b mid" x="485" y="62">Kafka</text><text class="t xs mute mid" x="485" y="78">upload_done</text>
+<rect class="n svc" x="570" y="40" width="170" height="50" rx="8"/><text class="t b mid" x="655" y="62">Transcoding DAG</text><text class="t xs mute mid" x="655" y="78">orchestrator + workers</text>
+<rect class="n db" x="570" y="150" width="170" height="50" rx="8"/><text class="t b mid" x="655" y="172">Origin store</text><text class="t xs mute mid" x="655" y="188">segments + manifests</text>
+<rect class="n svc" x="290" y="150" width="110" height="50" rx="8"/><text class="t b mid" x="345" y="172">Metadata API</text><text class="t xs mute mid" x="345" y="188">signed URLs</text>
+<rect class="n db" x="290" y="246" width="110" height="46" rx="8"/><text class="t b mid" x="345" y="266">Metadata DB</text><text class="t xs mute mid" x="345" y="282">sharded MySQL</text>
+<rect class="n client" x="20" y="320" width="90" height="50" rx="8"/><text class="t b mid" x="65" y="342">Viewer</text><text class="t xs mute mid" x="65" y="358">player</text>
+<rect class="n cache" x="300" y="320" width="130" height="50" rx="8"/><text class="t b mid" x="365" y="342">CDN edge</text><text class="t xs mute mid" x="365" y="358">in the viewer's ISP</text>
+<rect class="n queue" x="600" y="320" width="140" height="50" rx="8"/><text class="t b mid" x="670" y="342">View counter</text><text class="t xs mute mid" x="670" y="358">Kafka + aggregator</text>
+
+<path class="e" d="M110,65 H141"/>
+<path class="e" d="M255,65 H286"/>
+<path class="e" d="M400,65 H431"/>
+<path class="e" d="M535,65 H566"/>
+<path class="e" d="M655,90 V146"/>
+<path class="e" d="M200,90 C200,130 250,175 286,175"/>
+<path class="e dash" d="M590,90 C590,130 450,165 404,165"/>
+<path class="e both" d="M345,200 V242"/>
+<path class="e" d="M110,335 C200,335 240,185 286,185"/>
+<path class="e" d="M110,350 H296"/>
+<path class="e dash" d="M430,335 C520,335 600,260 625,204"/>
+<path class="e dash" d="M65,370 V395 H670 V374"/>
+
+<path class="flow" d="M110,350 H296"/>
+
+<text class="t xs mute mid" x="125" y="32">parts</text>
+<text class="t xs mute" x="452" y="136">status: ready</text>
+<text class="t xs mute" x="150" y="250">manifest URL</text>
+<text class="t xs mute mid" x="200" y="342">segments</text>
+<text class="t xs mute" x="470" y="318">miss</text>
+<text class="t xs mute mid" x="360" y="389">watch events</text>
+</svg>
+</div>
+<figcaption><b>Architecture.</b> The upload pipeline (top) is asynchronous and can take minutes. The animated playback path (bottom) is a player talking to a cache in its own ISP; the origin only sees cache misses, and the metadata API only sees one request per view.</figcaption>
+</figure>
+
+<ol class="steps">
+<li><strong>Upload.</strong> The client splits the file into 8 MiB parts and uploads them, several in parallel, usually straight to the object store with presigned URLs. On <code>complete</code>, the upload service verifies the checksum, assembles the object and publishes <code>upload_done</code>.</li>
+<li><strong>Process.</strong> The orchestrator builds a DAG of tasks for the video (probe, split, encode every chunk in every rendition, package, thumbnails, captions, safety checks) and feeds them to a worker pool. Outputs go to the origin store; the status becomes <code>ready</code>.</li>
+<li><strong>Watch.</strong> The watch page calls the metadata API, which returns details and a signed manifest URL. The player fetches the manifest and then segments from the nearest CDN edge, switching renditions as bandwidth changes.</li>
+<li><strong>Count.</strong> The player sends periodic watch events. A stream job filters bots and duplicates and updates the view count.</li>
+</ol>
+
+<h2 id="upload">6. Deep dive: resumable chunked upload</h2>
+<p>A 2 GB upload over a phone connection takes many minutes, and the connection will drop. A single HTTP request would restart from zero every time. Instead the file is split into fixed-size parts that are uploaded and acknowledged independently.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 240" role="img" aria-label="A file split into parts: parts 1 to 9 and 11 are stored, parts 10 and 12 were lost when the connection dropped, 13 to 16 not yet sent; the client asks the server what it has and resends only the missing parts">
+<text class="t b" x="40" y="36">launch.mov, 8 MiB parts, 3 uploads in flight</text>
+<rect class="n good" x="40" y="56" width="36" height="36" rx="4"/><text class="t xs mono mid" x="58" y="78">1</text>
+<rect class="n good" x="80" y="56" width="36" height="36" rx="4"/><text class="t xs mono mid" x="98" y="78">2</text>
+<rect class="n good" x="120" y="56" width="36" height="36" rx="4"/><text class="t xs mono mid" x="138" y="78">3</text>
+<rect class="n good" x="160" y="56" width="36" height="36" rx="4"/><text class="t xs mono mid" x="178" y="78">4</text>
+<rect class="n good" x="200" y="56" width="36" height="36" rx="4"/><text class="t xs mono mid" x="218" y="78">5</text>
+<rect class="n good" x="240" y="56" width="36" height="36" rx="4"/><text class="t xs mono mid" x="258" y="78">6</text>
+<rect class="n good" x="280" y="56" width="36" height="36" rx="4"/><text class="t xs mono mid" x="298" y="78">7</text>
+<rect class="n good" x="320" y="56" width="36" height="36" rx="4"/><text class="t xs mono mid" x="338" y="78">8</text>
+<rect class="n good" x="360" y="56" width="36" height="36" rx="4"/><text class="t xs mono mid" x="378" y="78">9</text>
+<rect class="n bad" x="400" y="56" width="36" height="36" rx="4"/><text class="t xs mono mid" x="418" y="78">10</text>
+<rect class="n good" x="440" y="56" width="36" height="36" rx="4"/><text class="t xs mono mid" x="458" y="78">11</text>
+<rect class="n bad" x="480" y="56" width="36" height="36" rx="4"/><text class="t xs mono mid" x="498" y="78">12</text>
+<rect class="n ghost" x="520" y="56" width="36" height="36" rx="4"/><text class="t xs mono mute mid" x="538" y="78">13</text>
+<rect class="n ghost" x="560" y="56" width="36" height="36" rx="4"/><text class="t xs mono mute mid" x="578" y="78">14</text>
+<rect class="n ghost" x="600" y="56" width="36" height="36" rx="4"/><text class="t xs mono mute mid" x="618" y="78">15</text>
+<rect class="n ghost" x="640" y="56" width="36" height="36" rx="4"/><text class="t xs mono mute mid" x="658" y="78">16</text>
+<path class="e red" d="M458,130 V96"/><text class="t sm red mid" x="458" y="146">connection drops here</text>
+<text class="t mono" x="40" y="180">GET /v1/uploads/up_7c1   → received: 1-9, 11</text>
+<text class="t mono" x="40" y="202">resume: PUT parts 10, 12, 13, 14, 15, 16</text>
+<rect class="n good" x="40" y="218" width="12" height="12" rx="2"/><text class="t xs" x="58" y="228">stored, etag recorded</text>
+<rect class="n bad" x="200" y="218" width="12" height="12" rx="2"/><text class="t xs" x="218" y="228">in flight when the drop happened</text>
+<rect class="n ghost" x="410" y="218" width="12" height="12" rx="2"/><text class="t xs" x="428" y="228">not sent yet</text>
+</svg>
+</div>
+<figcaption><b>Resume from what the server has.</b> The client never trusts its own view of progress after a failure. It asks, and resends only missing parts; at most a few parts of work is lost, not the whole file.</figcaption>
+</figure>
+
+<ul>
+<li><strong>Part size.</strong> 8 MiB balances retry cost (a lost part wastes at most 8 MiB) against request overhead. S3 multipart uploads require parts of at least 5 MiB (except the last) and allow up to 10,000 parts, which caps a file at about 78 GiB with 8 MiB parts; pick the part size from the file size.</li>
+<li><strong>Integrity.</strong> Each part carries a checksum the store verifies, and the final assemble step checks the whole-file hash the client declared at the start. A corrupted part is rejected and resent, never silently stored.</li>
+<li><strong>Direct to storage.</strong> Upload servers hand out presigned part URLs and never proxy the bytes, so 240 Gbps of ingest lands on the object store's front end, which is built for it. The open <dfn>tus</dfn> protocol standardises the same resumable pattern over plain HTTP.</li>
+<li><strong>Cleanup.</strong> Abandoned uploads leave orphaned parts that are billed like any other storage. A lifecycle rule aborts incomplete multipart uploads after a few days.</li>
+</ul>
+
+<h2 id="transcoding">7. Deep dive: the transcoding pipeline</h2>
+<p>A source file is one codec at one resolution in a container no browser may support. Players need several resolutions and bitrates (the <dfn>bitrate ladder</dfn>), in codecs every device can decode, cut into short segments. Encoding a long video serially would take hours, so the work is split in two dimensions: by time chunk and by rendition.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 290" role="img" aria-label="Transcoding DAG: source to probe, split into chunks, a grid of parallel encode tasks per chunk and rendition, package into HLS and DASH, then publish; thumbnails, captions and a safety scan branch off the probe and join at publish">
+<rect class="n db" x="20" y="80" width="90" height="50" rx="8"/><text class="t b mid" x="65" y="102">Source</text><text class="t xs mute mid" x="65" y="118">raw store</text>
+<rect class="n svc" x="135" y="80" width="95" height="50" rx="8"/><text class="t b mid" x="182" y="102">Probe</text><text class="t xs mute mid" x="182" y="118">validate</text>
+<rect class="n svc" x="255" y="80" width="95" height="50" rx="8"/><text class="t b mid" x="302" y="102">Split</text><text class="t xs mute mid" x="302" y="118">12 s chunks</text>
+<rect class="zone" x="375" y="48" width="170" height="112" rx="8"/><text class="t xs b mid" x="460" y="64">parallel encode tasks</text>
+<text class="t xs mute" x="382" y="88">1080p</text><text class="t xs mute" x="382" y="114">720p</text><text class="t xs mute" x="382" y="140">480p</text>
+<rect class="n svc" x="415" y="74" width="28" height="20" rx="3"/><rect class="n svc" x="447" y="74" width="28" height="20" rx="3"/><rect class="n svc" x="479" y="74" width="28" height="20" rx="3"/><rect class="n svc" x="511" y="74" width="28" height="20" rx="3"/>
+<rect class="n svc" x="415" y="100" width="28" height="20" rx="3"/><rect class="n svc" x="447" y="100" width="28" height="20" rx="3"/><rect class="n svc" x="479" y="100" width="28" height="20" rx="3"/><rect class="n svc" x="511" y="100" width="28" height="20" rx="3"/>
+<rect class="n svc" x="415" y="126" width="28" height="20" rx="3"/><rect class="n svc" x="447" y="126" width="28" height="20" rx="3"/><rect class="n svc" x="479" y="126" width="28" height="20" rx="3"/><rect class="n svc" x="511" y="126" width="28" height="20" rx="3"/>
+<rect class="n svc" x="570" y="80" width="130" height="50" rx="8"/><text class="t b mid" x="635" y="102">Package</text><text class="t xs mute mid" x="635" y="118">HLS + DASH, CMAF</text>
+<rect class="n svc" x="135" y="200" width="110" height="46" rx="8"/><text class="t sm b mid" x="190" y="220">Thumbnails</text><text class="t xs mute mid" x="190" y="235">frames, sprites</text>
+<rect class="n svc" x="265" y="200" width="110" height="46" rx="8"/><text class="t sm b mid" x="320" y="220">Captions</text><text class="t xs mute mid" x="320" y="235">speech to text</text>
+<rect class="n svc" x="395" y="200" width="110" height="46" rx="8"/><text class="t sm b mid" x="450" y="220">Safety scan</text><text class="t xs mute mid" x="450" y="235">policy, copyright</text>
+<rect class="n good" x="570" y="200" width="130" height="46" rx="8"/><text class="t sm b mid" x="635" y="220">Publish</text><text class="t xs mute mid" x="635" y="235">status = ready</text>
+<path class="e" d="M110,105 H131"/>
+<path class="e" d="M230,105 H251"/>
+<path class="e" d="M350,105 H371"/>
+<path class="e" d="M545,105 H566"/>
+<path class="e" d="M635,130 V196"/>
+<path class="e" d="M182,130 V196"/>
+<path class="e" d="M200,130 C200,170 320,165 320,196"/>
+<path class="e" d="M215,130 C215,165 450,160 450,196"/>
+<path class="e" d="M505,223 H566"/>
+<path class="line" d="M190,246 V272 H635"/>
+<path class="line" d="M320,246 V272"/>
+<path class="e" d="M635,272 V250"/>
+</svg>
+</div>
+<figcaption><b>A DAG, not a script.</b> Each box is a task with inputs and outputs in object storage, so any task can be retried on any worker. The encode grid is chunks × renditions: a 12-minute video in 12-second chunks (a multiple of the 4-second segment, so every segment boundary is a keyframe) with 5 renditions and 2 codecs is 600 independent tasks.</figcaption>
+</figure>
+
+<ul>
+<li><strong>Split at keyframes.</strong> Chunks must start on a keyframe (a closed GOP), or the encoder of chunk 2 would need frames from chunk 1. Encode each chunk independently, then concatenate. Splitting a 12-minute video into 60 chunks turns a 40-minute serial encode into well under a minute of wall-clock time on enough workers.</li>
+<li><strong>The ladder.</strong> A typical H.264 ladder runs from 240p at 0.4 Mbps to 1080p at 5 Mbps, plus 1440p and 4K for sources that have them. Netflix showed that a fixed ladder wastes bits: a cartoon needs far less bitrate than a football match at the same quality, so they choose the ladder per title, and later per shot, from measured quality scores.</li>
+<li><strong>Codecs.</strong> H.264 plays everywhere. VP9, HEVC and AV1 save roughly 30 to 50% bandwidth at the same quality, but cost far more CPU to encode and are not universal. Encode H.264 for every video, and the expensive codecs only for videos that get enough views to repay the encoding cost. A video with 12 views does not need AV1.</li>
+<li><strong>Packaging.</strong> Segments are written once as fragmented MP4 (<dfn>CMAF</dfn>) and described by both an HLS playlist (Apple devices) and a DASH manifest (most others), so one copy of the media serves both protocols.</li>
+<li><strong>Scheduling.</strong> Tasks go through a queue to a worker pool that scales on queue depth and runs largely on preemptible machines; a preempted task is simply retried. Priority lanes let a creator with millions of subscribers jump ahead of a backlog of bulk uploads.</li>
+</ul>
+<p>Publish early: make the video watchable as soon as the low renditions are ready, and add higher ones as they finish. Viewers in the first minutes get 480p instead of a "processing" page.</p>
+
+<h2 id="abr">8. Deep dive: adaptive bitrate streaming</h2>
+<p>With <dfn>adaptive bitrate</dfn> (ABR) streaming, the server does nothing clever. It serves plain files over HTTP. The player downloads a manifest that lists the renditions, then fetches 2 to 6 second segments one at a time, and before each request decides which rendition to take based on measured throughput and how many seconds of video it has buffered.</p>
+<pre><code class="language-text">#EXTM3U                                           master.m3u8: one entry per rendition (3 of 5 shown)
+#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080,CODECS="avc1.640028,mp4a.40.2"
+h264/1080p/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1280x720,CODECS="avc1.64001f,mp4a.40.2"
+h264/720p/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=1400000,RESOLUTION=854x480,CODECS="avc1.64001e,mp4a.40.2"
+h264/480p/index.m3u8
+
+#EXTM3U                                           h264/720p/index.m3u8: the segments
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:4
+#EXT-X-MAP:URI="init.mp4"
+#EXTINF:4.000,
+seg_00001.m4s
+#EXTINF:4.000,
+seg_00002.m4s
+#EXT-X-ENDLIST</code></pre>
+<p>Because every rendition is cut at the same timestamps, the player can switch at any segment boundary without a glitch. The figure below is the exact output of the simple player logic after it: bandwidth is 9 Mbps for eight segments, then collapses to 1.2 Mbps.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 300" role="img" aria-label="Rendition chosen for each of twelve four-second segments: start at 480p, climb to 720p and 1080p while bandwidth is 9 Mbps, then after bandwidth drops to 1.2 Mbps a slow 1080p segment drains the buffer and the player falls to 240p and recovers to 360p">
+<rect class="zone" x="125" y="45" width="560" height="30" rx="4"/>
+<rect class="zone" x="125" y="80" width="560" height="30" rx="4"/>
+<rect class="zone" x="125" y="115" width="560" height="30" rx="4"/>
+<rect class="zone" x="125" y="150" width="560" height="30" rx="4"/>
+<rect class="zone" x="125" y="185" width="560" height="30" rx="4"/>
+<text class="t sm b" x="20" y="64">1080p</text><text class="t xs mono mute" x="68" y="64">5.0</text>
+<text class="t sm b" x="20" y="99">720p</text><text class="t xs mono mute" x="68" y="99">2.8</text>
+<text class="t sm b" x="20" y="134">480p</text><text class="t xs mono mute" x="68" y="134">1.4</text>
+<text class="t sm b" x="20" y="169">360p</text><text class="t xs mono mute" x="68" y="169">0.8</text>
+<text class="t sm b" x="20" y="204">240p</text><text class="t xs mono mute" x="68" y="204">0.4</text>
+<text class="t xs mute" x="20" y="34">rendition, Mbps</text>
+<text class="t sm b" x="20" y="240">buffer</text>
+<text class="t sm b" x="20" y="262">network</text>
+
+<g data-show="1 2 3">
+<rect class="n svc" x="130" y="117" width="40" height="26" rx="4"/><text class="t xs mono mid" x="150" y="134">1</text>
+<rect class="n svc" x="176" y="82" width="40" height="26" rx="4"/><text class="t xs mono mid" x="196" y="99">2</text>
+<rect class="n svc" x="222" y="82" width="40" height="26" rx="4"/><text class="t xs mono mid" x="242" y="99">3</text>
+<rect class="n svc" x="268" y="82" width="40" height="26" rx="4"/><text class="t xs mono mid" x="288" y="99">4</text>
+<text class="t xs mono mid" x="150" y="240">4.0</text><text class="t xs mono mid" x="196" y="240">6.8</text><text class="t xs mono mid" x="242" y="240">9.5</text><text class="t xs mono mid" x="288" y="240">12.3</text>
+<text class="t xs mono mute mid" x="150" y="262">9</text><text class="t xs mono mute mid" x="196" y="262">9</text><text class="t xs mono mute mid" x="242" y="262">9</text><text class="t xs mono mute mid" x="288" y="262">9</text>
+</g>
+<g data-show="2 3">
+<rect class="n svc" x="314" y="47" width="40" height="26" rx="4"/><text class="t xs mono mid" x="334" y="64">5</text>
+<rect class="n svc" x="360" y="47" width="40" height="26" rx="4"/><text class="t xs mono mid" x="380" y="64">6</text>
+<rect class="n svc" x="406" y="47" width="40" height="26" rx="4"/><text class="t xs mono mid" x="426" y="64">7</text>
+<rect class="n svc" x="452" y="47" width="40" height="26" rx="4"/><text class="t xs mono mid" x="472" y="64">8</text>
+<text class="t xs mono mid" x="334" y="240">14.0</text><text class="t xs mono mid" x="380" y="240">15.8</text><text class="t xs mono mid" x="426" y="240">17.6</text><text class="t xs mono mid" x="472" y="240">19.4</text>
+<text class="t xs mono mute mid" x="334" y="262">9</text><text class="t xs mono mute mid" x="380" y="262">9</text><text class="t xs mono mute mid" x="426" y="262">9</text><text class="t xs mono mute mid" x="472" y="262">9</text>
+</g>
+<g data-show="3">
+<rect class="n bad" x="498" y="47" width="40" height="26" rx="4"/><text class="t xs mono mid" x="518" y="64">9</text>
+<rect class="n cache" x="544" y="187" width="40" height="26" rx="4"/><text class="t xs mono mid" x="564" y="204">10</text>
+<rect class="n cache" x="590" y="187" width="40" height="26" rx="4"/><text class="t xs mono mid" x="610" y="204">11</text>
+<rect class="n cache" x="636" y="152" width="40" height="26" rx="4"/><text class="t xs mono mid" x="656" y="169">12</text>
+<text class="t xs mono red mid" x="518" y="240">6.7</text><text class="t xs mono mid" x="564" y="240">9.4</text><text class="t xs mono mid" x="610" y="240">12.0</text><text class="t xs mono mid" x="656" y="240">13.4</text>
+<text class="t xs mono red mid" x="518" y="262">1.2</text><text class="t xs mono red mid" x="564" y="262">1.2</text><text class="t xs mono red mid" x="610" y="262">1.2</text><text class="t xs mono red mid" x="656" y="262">1.2</text>
+</g>
+<text class="t sm mid" x="400" y="290" data-show="1">Startup: no measurement yet, so start at 480p, then step up carefully while the buffer is thin.</text>
+<text class="t sm mid" x="400" y="290" data-show="2">Buffer above 10 s: use 80% of the measured 9 Mbps, so 1080p fits.</text>
+<text class="t sm mid" x="400" y="290" data-show="3">Segment 9 was requested at 1080p and took 16.7 s. The player drops to 240p, then recovers.</text>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Startup</button><button type="button" data-step="2" aria-pressed="false">Climb</button><button type="button" data-step="3" aria-pressed="false">Bandwidth drops</button></div>
+</div>
+<figcaption><b>One player, twelve segments.</b> Each box is a 4-second segment in the rendition the player chose. Buffer is seconds of video ready to play; network is the throughput while fetching that segment, in Mbps. The buffer never hit zero, so the viewer saw quality change but no spinner.</figcaption>
+</figure>
+
+<pre><code class="language-python">LADDER = [(240, 0.4), (360, 0.8), (480, 1.4), (720, 2.8), (1080, 5.0)]   # (height, Mbps)
+SEG = 4.0          # seconds of video per segment
+MAX_BUFFER = 30.0  # stop fetching ahead beyond this
+
+
+def pick(estimate_mbps, buffer_s):
+    """Highest rendition that fits a safety share of measured throughput."""
+    if estimate_mbps is None:
+        return LADDER[2]                         # no measurement yet: start at 480p
+    share = 0.8 if buffer_s &gt;= 10 else 0.5       # thin buffer: be more careful
+    fitting = [r for r in LADDER if r[1] &lt;= share * estimate_mbps]
+    return fitting[-1] if fitting else LADDER[0]
+
+
+def play(network_mbps):
+    buffer, estimate = 0.0, None
+    for i, bw in enumerate(network_mbps, 1):
+        height, rate = pick(estimate, buffer)
+        download_s = rate * SEG / bw
+        buffer = max(0.0, buffer - download_s)   # playback drains while downloading
+        buffer = min(MAX_BUFFER, buffer + SEG)
+        estimate = bw                            # real players smooth this (EWMA)
+        print(f"seg {i:2}  {height:4}p  fetched in {download_s:4.1f} s  buffer {buffer:4.1f} s")
+
+
+play([9.0] * 8 + [1.2] * 4)                      # bandwidth collapses at segment 9
+# seg  1   480p  fetched in  0.6 s  buffer  4.0 s
+# seg  5  1080p  fetched in  2.2 s  buffer 14.0 s
+# seg  9  1080p  fetched in 16.7 s  buffer  6.7 s
+# seg 10   240p  fetched in  1.3 s  buffer  9.4 s
+# seg 12   360p  fetched in  2.7 s  buffer 13.4 s   (full output plotted above)</code></pre>
+<p>Real players are more refined. Throughput-based rules react fast but oscillate on noisy networks; buffer-based rules (Netflix's BBA, the BOLA algorithm used in dash.js) choose mostly from buffer level, which is stable and avoids rebuffering. Production players blend both, smooth the throughput estimate, and abandon a slow segment download mid-flight, which would have saved most of segment 9's 16.7 seconds here.</p>
+
+<h2 id="delivery">9. Deep dive: CDN delivery and edge caches</h2>
+<p>At 104 Tbps average, delivery is the system. Video is a near-perfect CDN workload: segments are immutable, so they can be cached forever with no invalidation, and popularity is extremely skewed, so a small fraction of the catalogue covers most watch time.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 320" role="img" aria-label="Delivery tiers: an origin object store fills internet exchange caches, which fill appliances inside ISPs; viewers stream from the appliance in their own ISP; a steering service in the cloud tells each player which appliance to use">
+<rect class="n db" x="20" y="95" width="100" height="56" rx="8"/><text class="t b mid" x="70" y="118">Origin</text><text class="t xs mute mid" x="70" y="135">object store</text>
+<rect class="n cache" x="180" y="45" width="120" height="46" rx="8"/><text class="t sm b mid" x="240" y="65">IX cache</text><text class="t xs mute mid" x="240" y="80">Frankfurt</text>
+<rect class="n cache" x="180" y="155" width="120" height="46" rx="8"/><text class="t sm b mid" x="240" y="175">IX cache</text><text class="t xs mute mid" x="240" y="190">Amsterdam</text>
+<rect class="n cache" x="370" y="20" width="130" height="46" rx="8"/><text class="t sm b mid" x="435" y="40">ISP appliance</text><text class="t xs mute mid" x="435" y="55">German ISP</text>
+<rect class="n cache" x="370" y="95" width="130" height="46" rx="8"/><text class="t sm b mid" x="435" y="115">ISP appliance</text><text class="t xs mute mid" x="435" y="130">regional cable</text>
+<rect class="n cache" x="370" y="170" width="130" height="46" rx="8"/><text class="t sm b mid" x="435" y="190">ISP appliance</text><text class="t xs mute mid" x="435" y="205">Dutch mobile</text>
+<rect class="n client" x="570" y="20" width="130" height="46" rx="8"/><text class="t sm b mid" x="635" y="47">viewers</text>
+<rect class="n client" x="570" y="95" width="130" height="46" rx="8"/><text class="t sm b mid" x="635" y="122">viewers</text>
+<rect class="n client" x="570" y="170" width="130" height="46" rx="8"/><text class="t sm b mid" x="635" y="197">viewers</text>
+<rect class="n svc" x="570" y="255" width="130" height="46" rx="8"/><text class="t sm b mid" x="635" y="275">Steering service</text><text class="t xs mute mid" x="635" y="290">in the cloud</text>
+<path class="e" d="M120,115 C150,115 150,68 176,68"/>
+<path class="e" d="M120,131 C150,131 150,178 176,178"/>
+<path class="e" d="M300,60 C335,60 335,43 366,43"/>
+<path class="e" d="M300,76 C335,76 335,118 366,118"/>
+<path class="e" d="M300,178 C335,178 335,193 366,193"/>
+<path class="e" d="M500,43 H566"/><path class="e" d="M500,118 H566"/><path class="e" d="M500,193 H566"/>
+<path class="flow" d="M500,43 H566"/><path class="flow" d="M500,118 H566"/><path class="flow" d="M500,193 H566"/>
+<path class="e dash" d="M635,255 V220"/>
+<text class="t xs mute end" x="626" y="242">ranked edge URLs</text>
+<text class="t xs mute mid" x="150" y="40">off-peak fill</text>
+<text class="t xs mute" x="20" y="250">Popular titles are pushed to appliances overnight.</text>
+<text class="t xs mute" x="20" y="266">The long tail is pulled through on a miss.</text>
+</svg>
+</div>
+<figcaption><b>Caches inside the ISP.</b> Each tier only sees the previous tier's misses. Traffic between viewer and appliance never crosses the ISP's upstream links, which is why ISPs host the boxes for free.</figcaption>
+</figure>
+
+<ul>
+<li><strong>Embedded edge appliances.</strong> Netflix's Open Connect and Google's Global Cache place storage-heavy servers inside ISP networks and at internet exchanges. The ISP saves transit costs; the platform gets a cache a few milliseconds from the viewer.</li>
+<li><strong>Proactive fill.</strong> Netflix's catalogue is curated and predictable, so it predicts tomorrow's popular titles and copies them to appliances during the off-peak hours when links are idle. YouTube's catalogue is far larger and more volatile, so it relies more on pull-through caching with popularity-aware admission (do not let a one-off view evict a hot video).</li>
+<li><strong>Steering.</strong> A control plane in the cloud picks which appliances a player should use, based on the viewer's network, appliance health and what each appliance holds, and returns a ranked list of URLs. The player fails over to the next URL on errors.</li>
+<li><strong>Cache keys.</strong> Strip the signature query parameters from the cache key, or every viewer's signed URL becomes a separate cache entry. The edge validates the signature, then looks up the object by its path alone. See <a href="cdn.html">CDNs</a>.</li>
+</ul>
+
+<h3 id="views">Counting views</h3>
+<p>116,000 view events per second is a classic streaming aggregation: players send watch events to a collector, which publishes them to Kafka partitioned by <code>video_id</code>. A stream job drops duplicates (same session), filters bot patterns, counts a view once playback passes a threshold such as 30 seconds, and adds per-video totals to a counter store every few seconds. Viral videos make one partition hot, so pre-aggregate in the collector before publishing. The public count is allowed to lag and is reconciled by a daily batch job over the raw events; that batch job is also where fraud filtering that needs more context runs.</p>
+
+<h2 id="scaling">10. Bottlenecks and how the design handles them</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Pressure</th><th>What breaks first</th><th>Response</th></tr></thead>
+<tbody>
+<tr><th>Viral new video</th><td>Origin and mid-tier cache misses for the same segments</td><td>Request coalescing at each tier (one fetch per segment, many waiters); proactive push of trending titles</td></tr>
+<tr><th>Upload spikes</th><td>Transcoding backlog, time to "ready"</td><td>Queue with priorities; autoscale preemptible workers; publish low renditions first</td></tr>
+<tr><th>Storage growth</th><td>Cost, at exabytes per year</td><td>Move cold renditions to infrequent-access or archive tiers; drop rarely watched high renditions and re-encode on demand from the source</td></tr>
+<tr><th>Egress</th><td>Transit cost and peak-hour links</td><td>ISP-embedded caches, efficient codecs for popular titles, per-title encoding ladders</td></tr>
+<tr><th>Region outage</th><td>Metadata API and steering</td><td>Multi-region control plane; edges keep serving cached segments even if the control plane is down</td></tr>
+<tr><th>Worker failure mid-encode</th><td>One task</td><td>Tasks are idempotent with outputs in object storage; the orchestrator retries elsewhere</td></tr>
+</tbody></table></div>
+
+<h2 id="tradeoffs">11. Key trade-offs to state</h2>
+<ul>
+<li><strong>Segmented HTTP streaming over a custom streaming server</strong>: any CDN can serve it and the server stays stateless, at the cost of a few seconds of latency, which only matters for live streaming.</li>
+<li><strong>Chunk-parallel encoding</strong>: minutes instead of hours to publish, at the cost of orchestration and slightly worse compression at chunk boundaries.</li>
+<li><strong>Codec choice by popularity</strong>: expensive codecs only where the bandwidth saving repays the encoding cost.</li>
+<li><strong>Short segments</strong>: 2 seconds adapt faster and start sooner; 6 seconds mean fewer requests and better compression. Four seconds is a common middle.</li>
+<li><strong>Push vs pull edge fill</strong>: push suits a predictable catalogue (Netflix), pull suits an unpredictable long tail (YouTube).</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>What the interviewer is checking</h4>
+<p>Whether you split the problem into an offline pipeline and an online read path, size the egress and conclude that CDNs carry the load, and can explain adaptive bitrate streaming mechanically rather than as a buzzword.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>The upload fails at 80%. What does the client do?</li>
+<li>How do you get a one-hour video watchable within a few minutes?</li>
+<li>How does the player decide when to switch quality, and what does a switch look like on the wire?</li>
+<li>How do you stop people hotlinking your segments from their own site?</li>
+<li>Storage is growing by petabytes a day. What do you delete or move?</li>
+<li>What changes for live streaming? (Segments produced in real time, a sliding-window playlist, shorter segments, lower latency targets.)</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>Streaming video bytes through application servers.</li>
+<li>Uploading a 10 GB file as one request with no resume.</li>
+<li>Transcoding the whole file serially on one machine.</li>
+<li>One rendition for all devices and networks.</li>
+<li>Invalidating CDN caches for immutable segments.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://www.rfc-editor.org/rfc/rfc8216" target="_blank" rel="noopener">RFC 8216: HTTP Live Streaming</a><span>The HLS specification: master and media playlists, segment rules and tags used above.</span></li>
+<li><a href="https://developer.apple.com/documentation/http-live-streaming/hls-authoring-specification-for-apple-devices" target="_blank" rel="noopener">HLS Authoring Specification for Apple Devices</a><span>Apple. Recommended bitrate ladders, segment durations, codecs and keyframe alignment for real players.</span></li>
+<li><a href="https://openconnect.netflix.com/en/" target="_blank" rel="noopener">Netflix Open Connect</a><span>Netflix's ISP-embedded caching appliances, including how they are filled during off-peak hours.</span></li>
+<li><a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html" target="_blank" rel="noopener">Amazon S3: uploading objects using multipart upload</a><span>Part size limits, part numbers, and aborting incomplete uploads.</span></li>
+<li><a href="https://dl.acm.org/doi/10.1145/2619239.2626296" target="_blank" rel="noopener">A Buffer-Based Approach to Rate Adaptation</a><span>Huang et al., SIGCOMM 2014. Netflix's experiment choosing bitrate from buffer level instead of throughput estimates.</span></li>
+</ul>

@@ -1,0 +1,360 @@
+<p class="lead">A notification system is the shared service every other team calls to reach users: "your order shipped" as a push notification, a login code by SMS, a receipt by email, a badge in the app. It has to send a billion messages a day through third-party providers that rate-limit, fail and occasionally lie, while respecting each user's preferences and quiet hours, never sending the same message twice, and making sure a one-time password is never stuck behind a marketing campaign.</p>
+
+<div class="callout note">
+<div class="callout-title">How to use this case study</div>
+<p>Sections follow the order of a real interview. Concepts used here have their own chapters: <a href="message-queues.html">Message Queues</a> (retries and dead letters), <a href="idempotency.html">Idempotency</a>, <a href="rate-limiting.html">Rate Limiting</a>, <a href="fault-tolerance.html">Timeouts, Retries &amp; Circuit Breakers</a>, <a href="event-streaming.html">Event Streaming</a>.</p>
+</div>
+
+<h2 id="requirements">1. Requirements</h2>
+<div class="defs">
+<div><h4>Functional</h4><p>Other services send notifications by type and user. Channels: mobile push (APNs, FCM), SMS, email, in-app inbox. Per-user preferences by category and channel, and quiet hours in the user's time zone. Templates with localisation. Scheduled sends and bulk campaigns. Delivery, open and click tracking.</p></div>
+<div><h4>Non-functional</h4><p>Critical messages (login codes, fraud alerts) delivered in seconds even during a campaign. No duplicates from the user's point of view. No silent loss: every notification ends delivered, suppressed by a rule, or in a dead-letter queue. Highly available, and resilient to any single provider failing.</p></div>
+<div><h4>Out of scope</h4><p>Building SMS or email delivery infrastructure (we use providers), the campaign segmentation UI, and the content of notifications. Mention them, then park them.</p></div>
+</div>
+<p>The key observation: <strong>this is a pipeline of decisions in front of unreliable external providers</strong>. Most of the engineering is deciding whether, when, where and how to send, and then retrying sends safely. The send itself is an HTTP call to someone else's API.</p>
+
+<h2 id="estimation">2. Estimation</h2>
+<p>Assume 1 billion notifications per day: 700 million push, 200 million email, 80 million in-app and 20 million SMS. Marketing campaigns add bursts such as 50 million pushes in one hour.</p>
+<div class="stats">
+<div><b>~11.6k/s</b><span>notifications on average</span></div>
+<div><b>~25k/s</b><span>during a 50M campaign hour</span></div>
+<div><b>~35k/s</b><span>tracking events</span></div>
+<div><b>~45 TB</b><span>notification log over 90 days</span></div>
+</div>
+<div class="calc">Average      1B / 86,400 s                                  ≈ <span class="r">11,600/s</span>
+Campaign     50M pushes / 3,600 s ≈ 13,900/s on top of the base ≈ <span class="r">25,500/s</span>
+SMS          20M / 86,400 s ≈ 231/s; the per-message cost makes SMS the channel to suppress first
+Events       ~3 per notification (sent, delivered, opened/clicked) = 3B/day ≈ <span class="r">35,000/s</span>
+Log          1B × ~500 B (ids, type, channel, status, timestamps) = 500 GB/day
+             × 90 days retention                            = <span class="r">45 TB</span>
+Devices      500M users × ~1.5 devices × ~200 B per token row ≈ 150 GB</div>
+<p>Throughput is moderate for our own services. The constraints that matter are external: each provider account has a contracted rate (for SMS often only hundreds or a few thousand messages per second), and a campaign can create far more work than that in minutes. Queues, priorities and per-provider throttles are therefore the core of the design, not an optimisation.</p>
+
+<h2 id="api">3. API</h2>
+<pre><code class="language-http">POST /v1/notifications
+Idempotency-Key: 3f8a2c71-order-9921-shipped
+{ "user_id": "u_481", "type": "order_shipped", "priority": "high",
+  "data": { "order_id": "9921", "carrier": "DHL", "eta": "2026-10-11" },
+  "dedup_key": "order:9921:shipped",            // collapse repeats for 24 h
+  "send_at": null }                              // or an ISO timestamp
+→ 202 { "notification_id": "n_7Hq1", "status": "accepted" }
+
+POST /v1/campaigns   { "segment_id": "seg_lapsed_30d", "type": "weekly_deals", "send_at": "...", "max_per_second": 20000 }
+GET  /v1/notifications/n_7Hq1  → { "push": "delivered", "email": "suppressed: preference", ... }
+PUT  /v1/users/u_481/preferences  { "promotions": { "email": false, "push": true }, "quiet_hours": { "start": "22:00", "end": "08:00", "tz": "Asia/Kolkata" } }
+POST /v1/devices     { "user_id": "u_481", "platform": "ios", "token": "a1b2...", "app_version": "8.4.0" }
+
+// Inbound
+POST /webhooks/email/ses        provider delivery, bounce and complaint events
+GET  /t/c/n_7Hq1?u=...          click redirect, records a click then 302s to the link</code></pre>
+<p>Callers send a <strong>type and data</strong>, never rendered text or a channel list. That keeps wording, localisation and channel choice in one place, so the product team can change "Your order is on its way" without redeploying the order service, and the preference rules always apply. The API returns 202 because acceptance is all it can promise: delivery is asynchronous.</p>
+
+<h2 id="data-model">4. Data model</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Table</th><th>Key</th><th>Columns</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><th>notifications</th><td><code>notification_id</code></td><td>user, type, priority, data, dedup_key, created_at</td><td>One row per request; partition by user for the status API</td></tr>
+<tr><th>deliveries</th><td><code>(notification_id, channel)</code></td><td>status, attempts, provider_msg_id, sent_at, delivered_at, error</td><td>The state machine per channel</td></tr>
+<tr><th>preferences</th><td><code>user_id</code></td><td>per category × channel on/off, quiet hours, time zone, locale</td><td>Read on every notification; cached</td></tr>
+<tr><th>devices</th><td><code>user_id</code></td><td>platform, token, app version, last_seen, invalid_at</td><td>Tokens are pruned when providers report them invalid</td></tr>
+<tr><th>templates</th><td><code>(type, channel, locale, version)</code></td><td>subject, body, required fields</td><td>Versioned so a bad edit can be rolled back</td></tr>
+<tr><th>counters</th><td>Redis <code>cap:u_481:promo:push:2026-10-09</code></td><td>count, TTL 2 days</td><td>Per-user frequency caps</td></tr>
+</tbody></table></div>
+<p>Notification categories carry policy. <code>security</code> (login codes, password changes) cannot be turned off and ignores quiet hours. <code>transactional</code> (orders, payments) can be moved between channels but not fully disabled. <code>social</code> and <code>promotions</code> are fully under the user's control and subject to frequency caps. Encoding this in the type registry, not in each caller, is what makes the system safe to call.</p>
+
+<h2 id="high-level">5. High-level design</h2>
+
+<figure class="fig wide">
+<div class="fig-frame">
+<svg viewBox="0 0 760 400" role="img" aria-label="Architecture: services and the campaign tool call the notification API, which writes to Kafka topics by priority; the planner reads preferences and templates, applies caps and quiet hours, defers some notifications to the scheduler, and routes the rest to per-channel worker pools for push, SMS, email and in-app; provider callbacks and opens flow as delivery events into a status and analytics store">
+<rect class="n client" x="20" y="60" width="110" height="50" rx="8"/><text class="t b mid" x="75" y="82">Services</text><text class="t xs mute mid" x="75" y="98">orders, auth</text>
+<rect class="n client" x="20" y="180" width="110" height="50" rx="8"/><text class="t b mid" x="75" y="202">Campaigns</text><text class="t xs mute mid" x="75" y="218">segments, bulk</text>
+<rect class="n svc" x="160" y="110" width="130" height="56" rx="8"/><text class="t b mid" x="225" y="133">Notification API</text><text class="t xs mute mid" x="225" y="150">validate, dedup</text>
+<rect class="n svc" x="165" y="230" width="120" height="46" rx="8"/><text class="t b mid" x="225" y="250">Scheduler</text><text class="t xs mute mid" x="225" y="266">send_at, deferrals</text>
+<rect class="n queue" x="320" y="110" width="100" height="56" rx="8"/><text class="t b mid" x="370" y="133">Kafka</text><text class="t xs mute mid" x="370" y="150">by priority</text>
+<rect class="n svc" x="455" y="110" width="120" height="56" rx="8"/><text class="t b mid" x="515" y="133">Planner</text><text class="t xs mute mid" x="515" y="150">prefs, caps, render</text>
+<rect class="n db" x="455" y="20" width="120" height="46" rx="8"/><text class="t b mid" x="515" y="40">Prefs, devices</text><text class="t xs mute mid" x="515" y="56">templates, cached</text>
+<rect class="n svc" x="610" y="40" width="140" height="44" rx="8"/><text class="t sm b mid" x="680" y="59">Push workers</text><text class="t xs mute mid" x="680" y="74">APNs, FCM</text>
+<rect class="n svc" x="610" y="100" width="140" height="44" rx="8"/><text class="t sm b mid" x="680" y="119">SMS workers</text><text class="t xs mute mid" x="680" y="134">SMS providers</text>
+<rect class="n svc" x="610" y="160" width="140" height="44" rx="8"/><text class="t sm b mid" x="680" y="179">Email workers</text><text class="t xs mute mid" x="680" y="194">SES, SendGrid</text>
+<rect class="n svc" x="610" y="220" width="140" height="44" rx="8"/><text class="t sm b mid" x="680" y="239">In-app workers</text><text class="t xs mute mid" x="680" y="254">inbox + socket</text>
+<rect class="n queue" x="455" y="330" width="120" height="46" rx="8"/><text class="t b mid" x="515" y="350">Delivery events</text><text class="t xs mute mid" x="515" y="366">webhooks, opens</text>
+<rect class="n db" x="290" y="330" width="130" height="46" rx="8"/><text class="t b mid" x="355" y="350">Status store</text><text class="t xs mute mid" x="355" y="366">+ analytics</text>
+
+<path class="e" d="M130,85 C148,85 148,130 156,130"/>
+<path class="e" d="M130,205 C148,205 148,150 156,150"/>
+<path class="e" d="M290,138 H316"/>
+<path class="e" d="M420,138 H451"/>
+<path class="e both" d="M515,110 V70"/>
+<path class="e" d="M575,124 C592,124 592,62 606,62"/>
+<path class="e" d="M575,132 C592,132 592,122 606,122"/>
+<path class="e" d="M575,144 C592,144 592,182 606,182"/>
+<path class="e" d="M575,152 C592,152 592,242 606,242"/>
+<path class="e dash" d="M500,166 C500,262 330,262 289,262"/>
+<path class="e" d="M285,240 C330,240 355,200 355,170"/>
+<path class="e dash" d="M680,264 C680,320 620,353 579,353"/>
+<path class="e" d="M455,353 H424"/>
+
+<path class="flow" d="M290,138 H316"/>
+<path class="flow" d="M420,138 H451"/>
+<path class="flow" d="M575,124 C592,124 592,62 606,62"/>
+
+<text class="t xs mute" x="410" y="282">quiet hours: defer</text>
+<text class="t xs mute" x="300" y="205">due</text>
+<text class="t xs mute end" x="668" y="296">provider callbacks</text>
+</svg>
+</div>
+<figcaption><b>Architecture.</b> The animated path is the common case: accept, enqueue by priority, plan, and hand to a channel's worker pool. Deferred notifications loop through the scheduler; results come back asynchronously as delivery events.</figcaption>
+</figure>
+
+<ol class="steps">
+<li><strong>Accept.</strong> The API authenticates the calling service, validates the type and data against the type registry, checks the idempotency key and dedup key in Redis (a claimed key that has no notification row yet is treated as free, so a crash cannot swallow a retry), writes the notification row and an outbox entry in one transaction, relays the outbox to the Kafka topic for its priority, and returns 202.</li>
+<li><strong>Plan.</strong> Planner workers consume from the priority topics (critical first), load the user's preferences and devices from cache, decide the channels, apply quiet hours and frequency caps, render the template per channel and locale, and write one delivery row per channel.</li>
+<li><strong>Send.</strong> Each channel has its own queue and worker pool, so a slow email provider never delays push. Workers throttle to each provider's contracted rate, call the provider, and record the outcome.</li>
+<li><strong>Track.</strong> Provider webhooks (delivered, bounced, complained), push receipts where available, tracked clicks and in-app reads become delivery events, which update status and feed analytics.</li>
+</ol>
+
+<h2 id="planning">6. Deep dive: preferences, quiet hours and templates</h2>
+<p>The planner is a sequence of filters. Step through three notifications for the same user in India, whose quiet hours are 22:00 to 08:00 and who has turned off promotional email.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 320" role="img" aria-label="Planner decisions for three notifications: a login code bypasses quiet hours and goes by SMS and push; a deals push at 23:30 local time is deferred to the scheduler until 08:00; a price-drop alert loses email to the user's preference and push to the daily cap, leaving only in-app">
+<rect class="n svc" x="20" y="50" width="120" height="44" rx="8"/><text class="t sm b mid" x="80" y="77">Event</text>
+<rect class="n svc" x="160" y="50" width="120" height="44" rx="8"/><text class="t sm b mid" x="220" y="77">Preferences</text>
+<rect class="n svc" x="300" y="50" width="120" height="44" rx="8"/><text class="t sm b mid" x="360" y="77">Quiet hours</text>
+<rect class="n svc" x="440" y="50" width="120" height="44" rx="8"/><text class="t sm b mid" x="500" y="77">Frequency caps</text>
+<rect class="n svc" x="580" y="50" width="120" height="44" rx="8"/><text class="t sm b mid" x="640" y="77">Render</text>
+<path class="e" d="M140,72 H156"/><path class="e" d="M280,72 H296"/><path class="e" d="M420,72 H436"/><path class="e" d="M560,72 H576"/>
+<text class="t sm b" x="20" y="222">Queued to</text>
+
+<g data-show="1">
+<text class="t xs mono mid" x="80" y="124">otp_code</text><text class="t xs mute mid" x="80" y="140">critical, security</text>
+<text class="t xs mid" x="220" y="124">security: cannot</text><text class="t xs mid" x="220" y="140">be turned off</text>
+<text class="t xs accent mid" x="360" y="124">bypassed for</text><text class="t xs accent mid" x="360" y="140">critical</text>
+<text class="t xs mid" x="500" y="124">OTP 2 of 5</text><text class="t xs mid" x="500" y="140">this hour: ok</text>
+<text class="t xs mid" x="640" y="124">SMS + push,</text><text class="t xs mid" x="640" y="140">locale en-IN</text>
+<rect class="n good" x="20" y="240" width="110" height="40" rx="7"/><text class="t sm b mid" x="75" y="264">Push</text>
+<rect class="n good" x="152" y="240" width="110" height="40" rx="7"/><text class="t sm b mid" x="207" y="264">SMS</text>
+<rect class="n ghost" x="284" y="240" width="110" height="40" rx="7"/><text class="t sm mute mid" x="339" y="264">Email</text>
+<rect class="n ghost" x="416" y="240" width="110" height="40" rx="7"/><text class="t sm mute mid" x="471" y="264">In-app</text>
+<rect class="n ghost" x="548" y="240" width="110" height="40" rx="7"/><text class="t sm mute mid" x="603" y="264">Scheduler</text>
+<text class="t sm mid" x="360" y="308">A login code at 02:00 still goes out, on the fastest channels.</text>
+</g>
+<g data-show="2">
+<text class="t xs mono mid" x="80" y="124">weekly_deals</text><text class="t xs mute mid" x="80" y="140">low, promotions</text>
+<text class="t xs mid" x="220" y="124">push on,</text><text class="t xs mid" x="220" y="140">email off</text>
+<text class="t xs red mid" x="360" y="124">23:30 local:</text><text class="t xs red mid" x="360" y="140">defer to 08:00</text>
+<text class="t xs mute mid" x="500" y="124">checked again</text><text class="t xs mute mid" x="500" y="140">at 08:00</text>
+<text class="t xs mute mid" x="640" y="124">at send time</text><text class="t xs mute mid" x="640" y="140">(prices may change)</text>
+<rect class="n ghost" x="20" y="240" width="110" height="40" rx="7"/><text class="t sm mute mid" x="75" y="264">Push</text>
+<rect class="n ghost" x="152" y="240" width="110" height="40" rx="7"/><text class="t sm mute mid" x="207" y="264">SMS</text>
+<rect class="n ghost" x="284" y="240" width="110" height="40" rx="7"/><text class="t sm mute mid" x="339" y="264">Email</text>
+<rect class="n ghost" x="416" y="240" width="110" height="40" rx="7"/><text class="t sm mute mid" x="471" y="264">In-app</text>
+<rect class="n cache" x="548" y="240" width="110" height="40" rx="7"/><text class="t sm b mid" x="603" y="264">Scheduler</text>
+<text class="t sm mid" x="360" y="308">Deferred, not dropped: the whole plan runs again at 08:00 local.</text>
+</g>
+<g data-show="3">
+<text class="t xs mono mid" x="80" y="124">price_drop</text><text class="t xs mute mid" x="80" y="140">normal, promotions</text>
+<text class="t xs red mid" x="220" y="124">email: off</text><text class="t xs mid" x="220" y="140">push, in-app: on</text>
+<text class="t xs mid" x="360" y="124">14:10 local:</text><text class="t xs mid" x="360" y="140">ok</text>
+<text class="t xs red mid" x="500" y="124">cap 3/day reached</text><text class="t xs red mid" x="500" y="140">today: drop push</text>
+<text class="t xs mid" x="640" y="124">in-app card,</text><text class="t xs mid" x="640" y="140">locale en-IN</text>
+<rect class="n ghost" x="20" y="240" width="110" height="40" rx="7"/><text class="t sm mute mid" x="75" y="264">Push</text>
+<rect class="n ghost" x="152" y="240" width="110" height="40" rx="7"/><text class="t sm mute mid" x="207" y="264">SMS</text>
+<rect class="n ghost" x="284" y="240" width="110" height="40" rx="7"/><text class="t sm mute mid" x="339" y="264">Email</text>
+<rect class="n good" x="416" y="240" width="110" height="40" rx="7"/><text class="t sm b mid" x="471" y="264">In-app</text>
+<rect class="n ghost" x="548" y="240" width="110" height="40" rx="7"/><text class="t sm mute mid" x="603" y="264">Scheduler</text>
+<text class="t sm mid" x="360" y="308">Each suppression is recorded with its reason, so "why didn't I get it?" has an answer.</text>
+</g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Login code</button><button type="button" data-step="2" aria-pressed="false">Deals at 23:30</button><button type="button" data-step="3" aria-pressed="false">Price drop</button></div>
+</div>
+<figcaption><b>The planner as a filter chain.</b> Every stage can remove channels, delay the whole notification, or pass it on. Category policy decides what a stage is allowed to do: nothing removes a security code.</figcaption>
+</figure>
+
+<ul>
+<li><strong>Preferences</strong> are read on every notification, so they sit in a cache in front of the database, with write-through on change. When a user turns a category off, the change must apply within seconds, including to notifications already queued, which is why the check happens in the planner, as late as possible, and not in the API.</li>
+<li><strong>Quiet hours</strong> are evaluated in the user's time zone, taken from the profile or the device. A deferred notification goes to the scheduler with a <code>not_before</code> time. Campaigns usually avoid quiet hours entirely by scheduling "08:00 local", which the scheduler fans out by time zone over the day.</li>
+<li><strong>Templates</strong> are versioned, per channel and locale, with a declared list of required fields. The renderer fails loudly on a missing field (a notification saying "Your order {order_id} shipped" is worse than none) and falls back to the default locale when a translation is missing. SMS templates are checked for length: one SMS holds 160 GSM-7 characters, or only 70 when the text needs Unicode (UCS-2); longer messages are split into segments of 153 or 67 characters, because each carries a concatenation header, and every segment is billed.</li>
+<li><strong>Channel choice</strong> is part of the type registry: an OTP prefers SMS and push, a receipt prefers email, a "someone liked your photo" prefers push and in-app. If the user has no push token, fall back to the next allowed channel.</li>
+</ul>
+
+<h2 id="reliability">7. Deep dive: retries, idempotency and dead letters</h2>
+<p>Providers fail in two different ways, and the worker must tell them apart. A <strong>transient</strong> failure (timeout, HTTP 429, 5xx) may succeed later. A <strong>permanent</strong> failure (APNs reporting the device token is unregistered, an invalid phone number, a hard email bounce) will never succeed, and retrying it only wastes money and provider goodwill. Permanent failures also carry information: an unregistered token should be deleted, a hard-bounced address should be suppressed for all future email.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 270" role="img" aria-label="Retry timeline with full jitter: six attempts at 0, 0.4, 3.4, 8.8, 23.1 and 25.9 seconds, each wait drawn at random below a ceiling that doubles from 2 to 32 seconds, after which the notification goes to the dead-letter queue">
+<path class="line" d="M150,70 H700"/>
+<path class="line faint" d="M150,65 V75 M240,65 V75 M330,65 V75 M420,65 V75 M510,65 V75 M600,65 V75 M690,65 V75"/>
+<text class="t xs mono mute mid" x="150" y="90">0 s</text><text class="t xs mono mute mid" x="240" y="90">5</text><text class="t xs mono mute mid" x="330" y="90">10</text><text class="t xs mono mute mid" x="420" y="90">15</text><text class="t xs mono mute mid" x="510" y="90">20</text><text class="t xs mono mute mid" x="600" y="90">25</text><text class="t xs mono mute mid" x="690" y="90">30</text>
+<text class="t sm b" x="20" y="74">attempts</text>
+<circle class="dot" cx="150" cy="70" r="5" style="fill:var(--d-red)"/><circle class="dot" cx="157.2" cy="70" r="5" style="fill:var(--d-red)"/><circle class="dot" cx="211.2" cy="70" r="5" style="fill:var(--d-red)"/><circle class="dot" cx="308.4" cy="70" r="5" style="fill:var(--d-red)"/><circle class="dot" cx="565.8" cy="70" r="5" style="fill:var(--d-red)"/><circle class="dot" cx="616.2" cy="70" r="5" style="fill:var(--d-red)"/>
+<text class="t xs mono end" x="146" y="52">1</text><text class="t xs mono" x="157" y="52">2</text><text class="t xs mono mid" x="211" y="52">3</text><text class="t xs mono mid" x="308" y="52">4</text><text class="t xs mono mid" x="566" y="52">5</text><text class="t xs mono mid" x="616" y="52">6</text>
+<text class="t xs red" x="632" y="52">→ DLQ</text>
+<text class="t xs mute" x="20" y="123">wait 1, up to 2 s</text>
+<rect class="n ghost" x="150" y="112" width="36" height="14" rx="3"/><rect class="fill-accent" x="155.2" y="112" width="4" height="14"/>
+<text class="t xs mute" x="20" y="148">wait 2, up to 4 s</text>
+<rect class="n ghost" x="157.2" y="137" width="72" height="14" rx="3"/><rect class="fill-accent" x="209.2" y="137" width="4" height="14"/>
+<text class="t xs mute" x="20" y="173">wait 3, up to 8 s</text>
+<rect class="n ghost" x="211.2" y="162" width="144" height="14" rx="3"/><rect class="fill-accent" x="306.4" y="162" width="4" height="14"/>
+<text class="t xs mute" x="20" y="198">wait 4, up to 16 s</text>
+<rect class="n ghost" x="308.4" y="187" width="288" height="14" rx="3"/><rect class="fill-accent" x="563.8" y="187" width="4" height="14"/>
+<text class="t xs mute" x="20" y="223">wait 5, up to 32 s</text>
+<rect class="n ghost" x="565.8" y="212" width="134" height="14" rx="3"/><rect class="fill-accent" x="614.2" y="212" width="4" height="14"/>
+<text class="t xs mute" x="20" y="256">Dashed bars: the allowed window (doubling ceiling). Marks: the random wait actually chosen.</text>
+</svg>
+</div>
+<figcaption><b>Exponential backoff with full jitter.</b> These are the actual waits drawn by the code below for a provider that keeps returning 503. The ceiling doubles, but each wait is random inside it, so thousands of failed sends do not retry in synchronised waves. The last window runs past the axis to 55 s.</figcaption>
+</figure>
+
+<pre><code class="language-python">import random
+
+BASE_S, CAP_S, MAX_ATTEMPTS = 2.0, 600.0, 6
+RETRYABLE = {"timeout", 429, 500, 502, 503}
+PERMANENT = {"Unregistered", "BadDeviceToken", 400}     # retrying can never succeed
+
+
+def backoff(attempt, rng):
+    """Full jitter: random wait in [0, min(cap, base * 2^attempt)]."""
+    return rng.uniform(0, min(CAP_S, BASE_S * 2 ** attempt))
+
+
+def deliver(notification_id, responses, rng):
+    t = 0.0
+    for attempt, result in enumerate(responses[:MAX_ATTEMPTS]):
+        if result == 200:
+            return f"{notification_id}: delivered on attempt {attempt + 1} at t={t:.1f}s"
+        if result in PERMANENT:
+            return f"{notification_id}: permanent error {result!r}, token removed, no retry"
+        if result not in RETRYABLE or attempt + 1 == MAX_ATTEMPTS:
+            break
+        t += backoff(attempt, rng)                      # wait, then try again
+    return f"{notification_id}: failed {attempt + 1} times by t={t:.1f}s, sent to dead-letter queue"
+
+
+rng = random.Random(42)
+print(deliver("n_1", [503, 503, "timeout", 200], rng))
+# n_1: delivered on attempt 4 at t=3.6s
+print(deliver("n_2", ["Unregistered"], rng))
+# n_2: permanent error 'Unregistered', token removed, no retry
+print(deliver("n_3", [503] * 10, rng))
+# n_3: failed 6 times by t=25.9s, sent to dead-letter queue</code></pre>
+<ul>
+<li><strong>Retries without blocking.</strong> A worker never sleeps on a failed message. It writes the message to a delay queue (a Kafka retry topic per delay tier, a scheduled-message feature in SQS or RabbitMQ, or a Redis sorted set scored by due time) and moves on. The retry comes back to the same channel queue when due.</li>
+<li><strong>Dead-letter queue.</strong> After the last attempt, or for an error the worker does not recognise, the message goes to a <dfn>dead-letter queue</dfn> with its full history. An alert fires on DLQ growth; an operator can inspect and replay once the cause is fixed. Nothing disappears silently.</li>
+<li><strong>Retry budgets per priority.</strong> An OTP is worthless after 5 minutes, so it gets fast retries and a short deadline, then fails over to another provider or channel. A weekly digest can retry for hours.</li>
+<li><strong>Circuit breakers per provider.</strong> When a provider's error rate spikes, stop sending to it for a short period and route critical traffic to a secondary provider. Large senders often hold accounts with two SMS providers for exactly this reason.</li>
+</ul>
+
+<h3 id="dedup">Idempotency and deduplication</h3>
+<p>The pipeline is at-least-once at every hop: the API can be retried by its caller, Kafka redelivers after a consumer crash, a worker can time out on a send that actually succeeded. Three layers stop that from becoming duplicate messages on the user's phone:</p>
+<ul>
+<li><strong>Request idempotency.</strong> The caller's <code>Idempotency-Key</code> is stored for 24 hours with the resulting <code>notification_id</code>; a retried request returns the same id without creating a second notification.</li>
+<li><strong>Semantic dedup.</strong> The <code>dedup_key</code> ("order:9921:shipped") collapses different requests that mean the same thing, for example two services both reporting the shipment. A <code>SET NX</code> with a TTL in Redis decides which one proceeds.</li>
+<li><strong>Delivery state machine.</strong> Before sending, a worker moves the delivery row from <code>queued</code> to <code>sending</code> with a conditional update, and only the worker that wins the update sends. Redelivered queue messages for a delivery already <code>sent</code> are dropped.</li>
+</ul>
+<p>The remaining gap is the send itself: if the provider accepted the message but the response was lost, a retry sends it again. Where providers accept an idempotency token, pass the delivery id. Where they do not, accept the rare duplicate for non-critical messages, and for OTPs make the duplicate harmless (the same code, valid once).</p>
+
+<h2 id="throughput">8. Deep dive: priorities and rate limits</h2>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 270" role="img" aria-label="SMS channel: critical, high and bulk queues feed SMS workers that drain critical first; workers take tokens from a provider bucket sized to the contracted rate before calling the provider; failures go to a delayed retry queue and finally a dead-letter queue">
+<rect class="n queue" x="20" y="40" width="150" height="40" rx="7"/><text class="t sm b mid" x="95" y="65">critical: OTP</text>
+<rect class="n queue" x="20" y="100" width="150" height="40" rx="7"/><text class="t sm b mid" x="95" y="125">high: transactional</text>
+<rect class="n queue" x="20" y="160" width="150" height="40" rx="7"/><text class="t sm b mid" x="95" y="185">bulk: campaigns</text>
+<rect class="n svc" x="220" y="90" width="130" height="60" rx="8"/><text class="t b mid" x="285" y="114">SMS workers</text><text class="t xs mute mid" x="285" y="132">critical first</text>
+<rect class="n cache" x="400" y="90" width="130" height="60" rx="8"/><text class="t b mid" x="465" y="114">Token bucket</text><text class="t xs mute mid" x="465" y="132">1,000 msg/s contract</text>
+<rect class="n ext" x="580" y="90" width="120" height="60" rx="8"/><text class="t b mid" x="640" y="114">SMS provider</text><text class="t xs mute mid" x="640" y="132">primary</text>
+<rect class="n queue" x="220" y="210" width="130" height="40" rx="7"/><text class="t sm b mid" x="285" y="235">Retry, delayed</text>
+<rect class="n bad" x="400" y="210" width="130" height="40" rx="7"/><text class="t sm b mid" x="465" y="235">Dead letters</text>
+<path class="e" d="M170,60 C195,60 195,105 216,105"/>
+<path class="e" d="M170,120 H216"/>
+<path class="e" d="M170,180 C195,180 195,135 216,135"/>
+<path class="e" d="M350,120 H396"/>
+<path class="e" d="M530,120 H576"/>
+<path class="flow" d="M170,120 H216"/><path class="flow" d="M350,120 H396"/><path class="flow" d="M530,120 H576"/>
+<path class="e dash red" d="M640,150 C640,190 330,180 300,206"/>
+<path class="e" d="M270,210 V154"/>
+<path class="e red" d="M350,230 H396"/>
+<text class="t xs red" x="540" y="196">429, 5xx, timeout</text>
+<text class="t xs mute end" x="262" y="186">when due</text>
+<text class="t xs mute" x="20" y="232">Campaign traffic only uses</text>
+<text class="t xs mute" x="20" y="246">capacity critical traffic leaves.</text>
+</svg>
+</div>
+<figcaption><b>Priority lanes and a provider throttle.</b> The token bucket sends exactly as fast as the contract allows, so the provider never answers with 429s under normal load. Critical messages are taken first from whatever capacity exists.</figcaption>
+</figure>
+
+<ul>
+<li><strong>Separate lanes per priority.</strong> Separate topics or queues for critical, high and bulk, consumed with strict priority (or heavy weights) by every channel's workers. A 50-million-message campaign fills the bulk lane; an OTP arriving behind it waits only for the worker to finish its current send. Separate worker pools per lane are even safer for the critical path.</li>
+<li><strong>Per-provider throttles.</strong> A shared <a href="rate-limiting.html">token bucket</a> per provider account (in Redis, or split across workers) matches the contracted rate. Sending faster only produces 429s that then have to be retried. Campaigns also carry their own <code>max_per_second</code> so they drain over an hour instead of a minute.</li>
+<li><strong>Per-user frequency caps.</strong> Counters such as "promotional pushes to u_481 today" with a TTL. Caps protect users from the sum of many well-meaning teams, and protect the company's sender reputation: users who are spammed disable notifications, and email providers route mail from senders with high complaint rates to spam.</li>
+<li><strong>Collapsing.</strong> Twenty "new comment" events in a minute become one push saying "20 new comments". APNs (apns-collapse-id) and FCM (collapse_key) let a newer notification replace an older one: FCM keeps only the latest undelivered message per key, and APNs also replaces a notification already displayed on the device.</li>
+</ul>
+
+<h2 id="tracking">9. Tracking delivery and engagement</h2>
+<p>Each channel reports outcomes differently, and none reports everything:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Channel</th><th>"Accepted"</th><th>"Delivered"</th><th>"Opened / clicked"</th></tr></thead>
+<tbody>
+<tr><th>Push</th><td>APNs / FCM accept the request</td><td class="meh">Not confirmed by APNs; the app can report receipt itself</td><td>App reports a tap with the notification id</td></tr>
+<tr><th>SMS</th><td>Provider returns a message id</td><td class="yes">Carrier delivery receipts via webhook (not all carriers)</td><td>Only through tracked links</td></tr>
+<tr><th>Email</th><td>Provider accepts the message</td><td class="yes">Delivery, bounce and complaint webhooks</td><td class="meh">Tracking pixel (inflated by privacy features that preload images); tracked links</td></tr>
+<tr><th>In-app</th><td>Written to the inbox</td><td class="yes">Client fetched it</td><td class="yes">Client marks it read</td></tr>
+</tbody></table></div>
+<p>All of these arrive as events, keyed by <code>notification_id</code> and channel, on a Kafka topic. A consumer updates the delivery row's status (only moving forward: <code>sent → delivered → opened</code>, never back), and a stream job aggregates per type, template version and campaign into an analytics store. That feedback closes the loop: template A/B tests, automatic suppression of addresses that bounce, and alerts when a provider's delivery rate drops in one country.</p>
+
+<h2 id="scaling">10. Bottlenecks and how the design handles them</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Pressure</th><th>What breaks first</th><th>Response</th></tr></thead>
+<tbody>
+<tr><th>Campaign of 50M</th><td>Queue depth, provider limits, critical latency</td><td>Bulk lane, campaign throttle, critical-first consumption, time-zone-spread scheduling</td></tr>
+<tr><th>Provider outage</th><td>One channel's sends</td><td>Circuit breaker, secondary provider for critical traffic, retries with jitter</td></tr>
+<tr><th>Preference lookups</th><td>Database read load at 25k/s</td><td>Cache with write-through; preferences are tiny and change rarely</td></tr>
+<tr><th>Duplicate sends</th><td>User trust</td><td>Idempotency keys, dedup keys, conditional delivery state transitions</td></tr>
+<tr><th>Stale device tokens</th><td>Wasted sends, provider penalties</td><td>Delete on permanent errors; expire tokens not refreshed by the app in months</td></tr>
+<tr><th>Scheduler hot spot at 08:00</th><td>Every deferred message due at once</td><td>Spread due times by a few minutes of jitter; scheduler partitions by time bucket</td></tr>
+</tbody></table></div>
+
+<h2 id="tradeoffs">11. Key trade-offs to state</h2>
+<ul>
+<li><strong>Types and data in, rendering inside</strong>: consistent policy and wording, in exchange for a central registry every team must use.</li>
+<li><strong>Per-channel queues</strong>: one slow provider cannot stall others, in exchange for more moving parts.</li>
+<li><strong>At-least-once with dedup</strong>: nothing is silently lost, at the cost of idempotency machinery and an occasional duplicate at the provider boundary.</li>
+<li><strong>Late preference checks</strong>: opt-outs apply even to queued messages, in exchange for a cache lookup on every send.</li>
+<li><strong>Throttling to contracts</strong>: predictable, provider-friendly sending, in exchange for campaigns that take an hour instead of minutes.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>What the interviewer is checking</h4>
+<p>Whether you design for unreliable third parties (retries that distinguish error types, DLQs, provider failover), protect critical messages from bulk traffic, and treat user preferences and duplicates as correctness requirements rather than nice-to-haves.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>A campaign is sending 50 million pushes. A user requests a login code. How long does it take?</li>
+<li>The SMS provider times out. Did the message send? What do you do?</li>
+<li>How do you make sure a user never gets the same "order shipped" message twice?</li>
+<li>A user in Tokyo has quiet hours from 22:00 to 08:00. Your campaign is scheduled for 15:00 UTC. What happens?</li>
+<li>How do you know a push notification was actually delivered?</li>
+<li>How would you add WhatsApp as a channel?</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>Sending synchronously inside the caller's request.</li>
+<li>One shared queue for OTPs and marketing.</li>
+<li>Retrying every error the same way, immediately and forever.</li>
+<li>Checking preferences only in the calling service.</li>
+<li>No answer for what happens to a message after the last retry.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/" target="_blank" rel="noopener">Exponential Backoff and Jitter</a><span>Marc Brooker, AWS Architecture Blog, 2015. Full jitter and why synchronised retries make outages worse.</span></li>
+<li><a href="https://developer.apple.com/documentation/usernotifications/sending-notification-requests-to-apns" target="_blank" rel="noopener">Sending notification requests to APNs</a><span>Apple. Request headers including priority and collapse ids, and the error responses that mean a token is no longer valid.</span></li>
+<li><a href="https://firebase.google.com/docs/cloud-messaging" target="_blank" rel="noopener">Firebase Cloud Messaging documentation</a><span>Google. Notification vs data messages, collapsible messages, message priority and time to live.</span></li>
+<li><a href="https://docs.aws.amazon.com/ses/latest/dg/monitor-sending-activity.html" target="_blank" rel="noopener">Amazon SES: monitoring sending activity</a><span>Delivery, bounce, complaint, open and click events and how they are published.</span></li>
+</ul>

@@ -1,0 +1,358 @@
+<p class="lead">A chat system like WhatsApp or Messenger delivers a message from Alice's phone to Bob's phone in a fraction of a second when both are online, holds it safely when Bob is offline, and shows Alice one tick, two ticks and then blue ticks as it is stored, delivered and read. The hard parts are keeping hundreds of millions of connections open, never losing or duplicating a message across flaky mobile networks, keeping order within a conversation, and syncing every one of a user's devices.</p>
+
+<div class="callout note">
+<div class="callout-title">How to use this case study</div>
+<p>Sections follow the order of a real interview. Concepts used here have their own chapters: <a href="realtime.html">Polling, SSE &amp; WebSockets</a>, <a href="idempotency.html">Idempotency</a>, <a href="event-streaming.html">Event Streaming</a>, <a href="blob-storage.html">Blob Storage</a>, <a href="sharding.html">Sharding</a>.</p>
+</div>
+
+<h2 id="requirements">1. Requirements</h2>
+<div class="defs">
+<div><h4>Functional</h4><p>1:1 and group chat (groups up to 1,000 members). Text and media. Sent, delivered and read receipts. Online status and "last seen". Messages reach users who were offline when they were sent. Several devices per user (phone, laptop, tablet), all in sync. Push notifications.</p></div>
+<div><h4>Non-functional</h4><p>Delivery under 300 ms p99 when both users are online. No lost messages, no visible duplicates. Messages in a conversation appear in the same order for every participant. End-to-end encrypted. Highly available: chat is used during emergencies.</p></div>
+<div><h4>Out of scope</h4><p>Voice and video calls, stories, payments, message search on the server (impossible under end-to-end encryption anyway). Mention them, then park them.</p></div>
+</div>
+<p>The key observation: <strong>a chat message is a small write that must be durably acknowledged before the sender sees one tick, and then pushed to an open connection</strong>. Unlike most read-heavy systems, chat is write-heavy and push-based. The server's job is to be a reliable, ordered mailbox plus a switchboard of live connections.</p>
+
+<h2 id="estimation">2. Estimation</h2>
+<p>Assume 500 million daily active users sending 40 messages each per day. A quarter of messages go to groups, with 30 members on average. At peak, 200 million users are connected at once.</p>
+<div class="stats">
+<div><b>~231k/s</b><span>messages sent, ~700k/s at peak</span></div>
+<div><b>~1.9M/s</b><span>per-recipient deliveries</span></div>
+<div><b>1,000</b><span>gateway servers for 200M connections</span></div>
+<div><b>~4 TB/day</b><span>message storage before replication</span></div>
+</div>
+<div class="calc">Messages     500M × 40 = 20B/day  →  20B / 86,400 s       ≈ <span class="r">231,000/s</span>  (×3 for peak ≈ 700,000/s)
+Deliveries   1:1    75% × 20B × 1 recipient                = 15B/day
+             group  25% × 20B × 29 recipients              = 145B/day
+             total  160B / 86,400 s                        ≈ <span class="r">1.9M deliveries/s</span>  (groups are 91% of them)
+Connections  200M concurrent / 200,000 per gateway        = <span class="r">1,000 gateways</span>
+Heartbeats   200M / one every 30 s                         ≈ 6.7M/s  (must end at the gateway)
+Storage      20B × ~200 B (ciphertext + metadata)         = <span class="r">4 TB/day</span>  ≈ 1.46 PB/year, ×3 replicas ≈ 4.4 PB
+Media        5% of messages × 200 KB average              = 1B × 200 KB ≈ <span class="r">200 TB/day</span>  (blob store + CDN)</div>
+<p>Three conclusions. Group fan-out, not message count, dominates delivery work, so groups need their own deep dive. Heartbeats at 6.7 million per second cannot each touch a database, so presence must be derived from connections held in gateway memory. And media is fifty times the text volume, so it never travels through the chat servers at all.</p>
+
+<h2 id="api">3. API</h2>
+<p>Clients keep one long-lived <a href="realtime.html">WebSocket</a> for everything real-time, and use plain HTTPS for bulk operations. Frames are shown as JSON; production clients use a compact binary encoding.</p>
+<pre><code class="language-http">// client → server over the WebSocket
+{ "type": "send", "client_msg_id": "c-7f1e9a", "conv_id": "a1b2", "body": "&lt;ciphertext&gt;" }
+{ "type": "delivered", "up_to_inbox_seq": 8815 }        // receipt watermark for this device
+{ "type": "read", "conv_id": "a1b2", "up_to_conv_seq": 4812 }
+{ "type": "ping" }                                       // heartbeat every 30 s
+
+// server → client
+{ "type": "ack", "client_msg_id": "c-7f1e9a", "msg_id": "m-90ab", "conv_seq": 4812 }
+{ "type": "msg", "inbox_seq": 8813, "conv_id": "a1b2", "conv_seq": 4812,
+  "sender": "u_alice", "body": "&lt;ciphertext&gt;", "sent_at": "2026-10-09T10:41:07Z" }
+{ "type": "receipt", "conv_id": "a1b2", "user": "u_bob", "read_up_to": 4812 }
+
+// HTTPS
+GET  /v1/sync?since_inbox_seq=8812&amp;limit=500   → entries 8813..8817 and the new cursor
+POST /v1/media                                  → presigned upload URL + media_id
+POST /v1/conversations  { "members": [...] }    → conv_id</code></pre>
+<p>Two fields carry most of the design. <code>client_msg_id</code> is generated on the phone and makes sends <a href="idempotency.html">idempotent</a>: if the phone retries after losing the ack, the server returns the original <code>msg_id</code> instead of storing a second copy. <code>inbox_seq</code> is a per-user sequence number that lets any device ask "what did I miss since 8812?"</p>
+
+<h2 id="data-model">4. Data model</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Table</th><th>Key</th><th>Columns</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><th>messages</th><td>partition <code>(conv_id, bucket)</code>, clustering <code>conv_seq</code> desc</td><td><code>msg_id</code>, <code>sender_id</code>, <code>body</code>, <code>media_ref</code>, <code>sent_at</code></td><td>The conversation history. Written once, read newest first</td></tr>
+<tr><th>inbox</th><td>partition <code>user_id</code>, clustering <code>inbox_seq</code></td><td><code>conv_id</code>, <code>conv_seq</code>, <code>kind</code></td><td>Per-user delivery log of pointers. Trimmed once all devices ack</td></tr>
+<tr><th>members</th><td><code>conv_id</code></td><td>user ids, roles, <code>joined_seq</code></td><td>Who receives a conversation's messages</td></tr>
+<tr><th>user_convs</th><td><code>user_id</code></td><td><code>conv_id</code>, <code>last_read_seq</code>, muted</td><td>Chat list and unread counts</td></tr>
+<tr><th>dedup</th><td><code>(sender_id, client_msg_id)</code></td><td><code>msg_id</code>, TTL 24 h</td><td>Turns retried sends into no-ops</td></tr>
+<tr><th>connections</th><td>Redis <code>conn:u_bob</code></td><td><code>{device_id: gateway_id}</code></td><td>Which gateway holds each live device</td></tr>
+</tbody></table></div>
+<p>Receipts are stored as <strong>watermarks</strong>, not per message: "Bob has read conversation a1b2 up to 4812". One small write covers every earlier message, so reading a backlog of 200 messages costs one receipt, not 200. The <code>bucket</code> in the message key (for example one per 10,000 sequence numbers) keeps a busy group's partition from growing without bound.</p>
+
+<h3 id="storage-choice">Why a wide-column store</h3>
+<p>The write rate is high (231,000 messages and up to 1.9 million inbox appends per second), records are immutable, and the dominant read is "the latest 50 messages of one conversation, in order". That is the shape wide-column stores such as Cassandra, ScyllaDB and HBase are built for: a partition per conversation, rows sorted by sequence number on disk, appends that go to a memtable and a commit log, and linear scaling by adding nodes. Facebook Messages ran on HBase; Discord stores trillions of messages in ScyllaDB with the same <code>(channel, bucket)</code> idea, where Discord's bucket is a fixed 10-day time window. A relational database could store the data, but sharding it by hand at this write rate gains nothing, since chat needs no joins and no multi-row transactions. See <a href="sql-vs-nosql.html">SQL vs NoSQL</a> and <a href="indexing.html">LSM trees</a>.</p>
+
+<h2 id="high-level">5. High-level design</h2>
+
+<figure class="fig wide">
+<div class="fig-frame">
+<svg viewBox="0 0 760 420" role="img" aria-label="Architecture: Alice and Bob connect through an L4 load balancer to WebSocket gateways; the chat service persists messages and inbox entries in Cassandra, looks up Bob's gateway in a Redis connection registry and pushes to it; group fan-out goes through Kafka; offline users get APNs or FCM push; media goes to a blob store behind a CDN">
+<rect class="n client" x="20" y="60" width="90" height="46" rx="8"/><text class="t b mid" x="65" y="82">Alice</text><text class="t xs mute mid" x="65" y="97">sender</text>
+<rect class="n client" x="20" y="250" width="90" height="46" rx="8"/><text class="t b mid" x="65" y="272">Bob</text><text class="t xs mute mid" x="65" y="287">recipient</text>
+<rect class="n ext" x="150" y="150" width="90" height="56" rx="8"/><text class="t b mid" x="195" y="174">L4 LB</text><text class="t xs mute mid" x="195" y="190">TCP, sticky</text>
+<rect class="n svc" x="285" y="60" width="120" height="46" rx="8"/><text class="t b mid" x="345" y="82">Gateway 17</text><text class="t xs mute mid" x="345" y="97">Alice's socket</text>
+<rect class="n svc" x="285" y="250" width="120" height="46" rx="8"/><text class="t b mid" x="345" y="272">Gateway 42</text><text class="t xs mute mid" x="345" y="287">Bob's socket</text>
+<rect class="n svc" x="455" y="150" width="120" height="56" rx="8"/><text class="t b mid" x="515" y="174">Chat service</text><text class="t xs mute mid" x="515" y="190">seq, dedup, route</text>
+<rect class="n db" x="625" y="40" width="120" height="56" rx="8"/><text class="t b mid" x="685" y="64">Cassandra</text><text class="t xs mute mid" x="685" y="80">messages, inbox</text>
+<rect class="n cache" x="625" y="150" width="120" height="56" rx="8"/><text class="t b mid" x="685" y="174">Connection</text><text class="t xs mute mid" x="685" y="190">registry, Redis</text>
+<rect class="n queue" x="625" y="250" width="120" height="46" rx="8"/><text class="t b mid" x="685" y="272">Kafka</text><text class="t xs mute mid" x="685" y="287">group fan-out</text>
+<rect class="n ext" x="455" y="340" width="120" height="50" rx="8"/><text class="t b mid" x="515" y="362">Push service</text><text class="t xs mute mid" x="515" y="378">APNs / FCM</text>
+<rect class="n db" x="625" y="340" width="120" height="50" rx="8"/><text class="t b mid" x="685" y="362">Blob store</text><text class="t xs mute mid" x="685" y="378">media, via CDN</text>
+
+<path class="e" d="M110,83 C140,83 150,150 172,150"/>
+<path class="e" d="M240,165 C262,165 262,83 281,83"/>
+<path class="e" d="M405,83 C435,83 430,170 451,170"/>
+<path class="e" d="M575,165 C600,165 600,68 621,68"/>
+<path class="e both" d="M575,178 H621"/>
+<path class="e" d="M545,206 C545,240 330,232 345,246"/>
+<path class="e" d="M285,273 H114"/>
+<path class="e dash" d="M575,198 C600,198 600,273 621,273"/>
+<path class="e dash" d="M515,206 V336"/>
+<path class="e dash" d="M65,60 V24 H753 V365 H749"/>
+
+<path class="flow" d="M110,83 C140,83 150,150 172,150"/>
+<path class="flow" d="M240,165 C262,165 262,83 281,83"/>
+<path class="flow" d="M405,83 C435,83 430,170 451,170"/>
+<path class="flow" d="M575,165 C600,165 600,68 621,68"/>
+<path class="flow" d="M545,206 C545,240 330,232 345,246"/>
+<path class="flow" d="M285,273 H114"/>
+
+<text class="t xs mute mid" x="200" y="290">push frame</text>
+<text class="t xs mute" x="430" y="124">send</text>
+<text class="t xs mute" x="604" y="120">persist</text>
+<text class="t xs mute" x="400" y="222">deliver</text>
+<text class="t xs mute" x="524" y="312">offline</text>
+<text class="t xs mute mid" x="400" y="16">media upload with a presigned URL, never through the chat path</text>
+</svg>
+</div>
+<figcaption><b>Architecture.</b> The animated path is a 1:1 message between two online users: gateway, chat service, one durable write, a registry lookup, and a push to the gateway holding Bob's socket. Groups detour through Kafka; offline users get a push notification and sync later; media bypasses the chat path entirely.</figcaption>
+</figure>
+
+<ol class="steps">
+<li><strong>Connect.</strong> The phone opens a TLS WebSocket through an L4 load balancer to any gateway. The gateway authenticates the token and writes <code>conn:u_bob = {phone: gw-42}</code> into the registry with a TTL refreshed while the socket lives.</li>
+<li><strong>Send.</strong> Alice's frame reaches gateway 17, which forwards it to the chat service. The chat service checks the dedup table, assigns the next <code>conv_seq</code>, writes the message and Bob's inbox entry, and only then acks Alice.</li>
+<li><strong>Route.</strong> The chat service looks up Bob's devices in the registry and sends the message to gateway 42 over an internal RPC; gateway 42 writes it into Bob's socket.</li>
+<li><strong>Fallback.</strong> If Bob has no live connection, the push service sends a notification through APNs or FCM. Nothing is lost either way: the inbox entry is already durable, and Bob's next sync collects it.</li>
+</ol>
+<p>Gateways are the only stateful tier, and their state is just sockets. They hold no messages: if gateway 42 dies, Bob's phone reconnects to another gateway within seconds and syncs from its last inbox cursor. That is what makes 1,000 of them manageable.</p>
+
+<h2 id="message-flow">6. Deep dive: message flow and receipts</h2>
+<p>Each tick is a promise backed by a specific durable event. Walk through them one at a time.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 425" role="img" aria-label="Sequence diagram of one message: sent tick after durable write, delivered tick after Bob's device acknowledges, read tick after Bob opens the chat, and the offline path with push and later sync">
+<rect class="n client" x="10" y="16" width="100" height="36" rx="7"/><text class="t sm b mid" x="60" y="39">Alice</text>
+<rect class="n svc" x="150" y="16" width="100" height="36" rx="7"/><text class="t sm b mid" x="200" y="39">Gateway 17</text>
+<rect class="n svc" x="310" y="16" width="100" height="36" rx="7"/><text class="t sm b mid" x="360" y="39">Chat svc</text>
+<rect class="n svc" x="470" y="16" width="100" height="36" rx="7"/><text class="t sm b mid" x="520" y="39">Gateway 42</text>
+<rect class="n client" x="610" y="16" width="100" height="36" rx="7"/><text class="t sm b mid" x="660" y="39">Bob</text>
+<path class="line faint" d="M60,52 V390 M200,52 V390 M360,52 V122 M360,152 V390 M520,52 V390 M660,52 V390" style="stroke-dasharray:3 4"/>
+
+<path class="e" d="M60,85 H196"/><text class="t mono mid" x="130" y="78">send c-7f1e9a</text>
+<path class="e" d="M200,110 H356"/><text class="t mono mid" x="280" y="103">send c-7f1e9a</text>
+<rect class="n db" x="315" y="122" width="90" height="30" rx="5"/><text class="t xs mid" x="360" y="141">write seq 4812</text>
+<path class="e dash" d="M360,170 H204"/><text class="t mono mid" x="280" y="163">ack 4812</text>
+<path class="e green" d="M200,195 H64"/><text class="t sm green mid" x="130" y="188">sent, 1 tick</text>
+
+<g data-show="1"><text class="t sm mid" x="360" y="415">One tick means durably stored. Alice's phone can drop its retry copy.</text></g>
+
+<g data-show="2 3">
+<path class="e" d="M360,230 H516"/><text class="t mono mid" x="440" y="223">deliver 4812</text>
+<path class="e" d="M520,255 H656"/><text class="t mono mid" x="590" y="248">msg 4812</text>
+</g>
+<g data-show="2">
+<path class="e dash" d="M660,285 H524"/><text class="t mono mid" x="590" y="278">delivered</text>
+<path class="e dash" d="M520,310 H364"/><text class="t mono mid" x="440" y="303">delivered ≤ 8813</text>
+<path class="e dash" d="M360,335 H204"/><text class="t mono mid" x="280" y="328">receipt</text>
+<path class="e green" d="M200,360 H64"/><text class="t sm green mid" x="130" y="353">delivered, 2 ticks</text>
+<text class="t sm mid" x="360" y="415">Two ticks means a device of Bob's acknowledged it, not that the server sent it.</text>
+</g>
+<g data-show="3">
+<path class="e dash" d="M660,285 H524"/><text class="t mono mid" x="590" y="278">read ≤ 4812</text>
+<path class="e dash" d="M520,310 H364"/><text class="t mono mid" x="440" y="303">read a1b2 ≤ 4812</text>
+<path class="e dash" d="M360,335 H204"/><text class="t mono mid" x="280" y="328">receipt</text>
+<path class="e accent" d="M200,360 H64"/><text class="t sm accent mid" x="130" y="353">read, blue ticks</text>
+<text class="t sm mid" x="360" y="415">Read is a watermark: one frame marks every earlier message read too.</text>
+</g>
+<g data-show="4">
+<text class="t sm red mid" x="440" y="228">registry: no device</text>
+<path class="e dash" d="M360,250 H656"/><text class="t sm mid" x="590" y="243">APNs push</text>
+<path class="e" d="M660,295 H524"/><text class="t mono mid" x="590" y="288">sync since 8812</text>
+<path class="e" d="M520,320 H364"/><text class="t mono mid" x="440" y="313">read inbox</text>
+<path class="e dash" d="M360,345 H516"/><text class="t mono mid" x="440" y="338">8813..8817</text>
+<path class="e dash" d="M520,370 H656"/><text class="t mono mid" x="590" y="363">5 entries</text>
+<text class="t sm mid" x="360" y="415">Offline: a push wakes the app, which pulls everything after its cursor.</text>
+</g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Sent</button><button type="button" data-step="2" aria-pressed="false">Delivered</button><button type="button" data-step="3" aria-pressed="false">Read</button><button type="button" data-step="4" aria-pressed="false">Bob offline</button></div>
+</div>
+<figcaption><b>Three ticks, three durable events.</b> The server acks only after the write, and delivered and read are reported by Bob's device, never assumed by the server.</figcaption>
+</figure>
+
+<h3 id="delivery-guarantees">At-least-once, deduplicated</h3>
+<p>Mobile networks drop packets, sockets die mid-frame and phones get killed in the background. Exactly-once delivery is not available, so the design is <strong>at-least-once with deduplication at both ends</strong>:</p>
+<ul>
+<li><strong>Sender side.</strong> Alice's app keeps the message in a local outbox and resends it with the same <code>client_msg_id</code> until it gets an ack. The chat service checks <code>(sender_id, client_msg_id)</code> first; a repeat returns the original <code>msg_id</code> and <code>conv_seq</code>, after re-applying the idempotent inbox and fan-out writes in case the first attempt crashed halfway (alternatively, write the message, inbox entry and dedup row in one logged batch, with the dedup row last).</li>
+<li><strong>Receiver side.</strong> The server may push a message twice (once live, once again in a sync after a reconnect). Bob's app keys messages by <code>msg_id</code> and ignores repeats.</li>
+<li><strong>Write before ack.</strong> The message, plus the recipient's inbox entry for a 1:1 chat or the fan-out event in Kafka for a group, is durably written before the sender's ack. If the chat service crashes in between, the sender retries and the dedup check makes the retry safe.</li>
+</ul>
+
+<h3 id="ordering">Ordering within a conversation</h3>
+<p>Two people in a group send at the same instant from different continents. Everyone must see the same order. Timestamps cannot decide it: phone clocks are wrong, and even server clocks differ by milliseconds, which is enough to reorder a fast exchange. Instead, every message gets a <code>conv_seq</code> from a single authority per conversation:</p>
+<ul>
+<li>Requests for a conversation are routed to one chat-service instance by <a href="consistent-hashing.html">consistent hashing</a> on <code>conv_id</code>. That instance holds the conversation's counter in memory and assigns 4811, 4812, 4813 in arrival order.</li>
+<li>The counter's value is persisted with each message. If the instance dies, the next owner reads the highest stored <code>conv_seq</code> and continues. A lease in the membership service stops two instances from owning one conversation at the same time.</li>
+<li>Clients sort by <code>conv_seq</code>, not by arrival. If 4813 arrives before 4812, the client shows a placeholder or waits briefly, and a gap that persists triggers a sync.</li>
+</ul>
+<p>Order is only promised <em>within</em> a conversation. Global ordering across conversations is never needed and would require a global sequencer, a bottleneck for no benefit.</p>
+
+<h2 id="offline-sync">7. Deep dive: offline delivery and multi-device sync</h2>
+<p>Each user has an <dfn>inbox</dfn>: an append-only log of everything that should reach their devices, numbered by a per-user <code>inbox_seq</code> (assigned by an atomic per-user counter, for example on the owner of the user's inbox partition, since 1:1 sends and group fan-out workers append concurrently). New messages, receipts and membership changes are all appended to it. Each device stores the highest <code>inbox_seq</code> it has processed, its <dfn>cursor</dfn>, and sync is one question: "give me everything after my cursor".</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 300" role="img" aria-label="Bob's inbox as a numbered log from 8810 to 8817; the phone has acknowledged up to 8812 and the laptop up to 8810; entries at or below the lowest cursor can be trimmed">
+<text class="t b" x="40" y="40">Bob's inbox: one log per user, numbered on append</text>
+<rect class="n ghost" x="40" y="70" width="78" height="54" rx="6"/><text class="t mono mute mid" x="79" y="92">8810</text><text class="t xs mute mid" x="79" y="110">msg a1b2</text>
+<rect class="n db" x="122" y="70" width="78" height="54" rx="6"/><text class="t mono mid" x="161" y="92">8811</text><text class="t xs mute mid" x="161" y="110">receipt</text>
+<rect class="n db" x="204" y="70" width="78" height="54" rx="6"/><text class="t mono mid" x="243" y="92">8812</text><text class="t xs mute mid" x="243" y="110">msg c9d0</text>
+<rect class="n cache" x="286" y="70" width="78" height="54" rx="6"/><text class="t mono mid" x="325" y="92">8813</text><text class="t xs mute mid" x="325" y="110">msg a1b2</text>
+<rect class="n cache" x="368" y="70" width="78" height="54" rx="6"/><text class="t mono mid" x="407" y="92">8814</text><text class="t xs mute mid" x="407" y="110">member +1</text>
+<rect class="n cache" x="450" y="70" width="78" height="54" rx="6"/><text class="t mono mid" x="489" y="92">8815</text><text class="t xs mute mid" x="489" y="110">msg g77</text>
+<rect class="n cache" x="532" y="70" width="78" height="54" rx="6"/><text class="t mono mid" x="571" y="92">8816</text><text class="t xs mute mid" x="571" y="110">msg g77</text>
+<rect class="n cache" x="614" y="70" width="78" height="54" rx="6"/><text class="t mono mid" x="653" y="92">8817</text><text class="t xs mute mid" x="653" y="110">receipt</text>
+
+<path class="e accent" d="M284,190 V128"/>
+<text class="t sm accent mid" x="284" y="208">phone cursor = 8812</text>
+<path class="e" d="M120,240 V128"/>
+<text class="t sm mid" x="120" y="258">laptop cursor = 8810</text>
+<path class="line" d="M288,150 H690"/>
+<path class="line" d="M288,144 V156 M690,144 V156"/>
+<text class="t xs mute mid" x="489" y="172">phone pulls 8813..8817 on its next sync</text>
+<text class="t xs mute" x="40" y="285">8810 is at or below every cursor, so it can be trimmed. The message itself stays in the conversation history.</text>
+</svg>
+</div>
+<figcaption><b>Per-user inbox and per-device cursors.</b> The inbox holds pointers, not message bodies. Each device advances its own cursor, and the log is trimmed up to the slowest device's cursor, with a cap such as 30 days for devices that never come back.</figcaption>
+</figure>
+
+<p>Why a per-user log rather than "query every conversation for new messages"? Bob may be in 300 conversations. Without an inbox, a reconnect means 300 queries to find the four that changed. With it, sync is one range read on one partition, ordered, paginated and resumable. The cursor also makes sync safe to interrupt: a phone that loses signal halfway through a 2,000-entry catch-up resumes from the last entry it processed.</p>
+<p>The inbox also solves multi-device. Each device has its own cursor, so the laptop that was closed all weekend catches up without affecting the phone. Read state syncs the same way: when Bob reads on his phone, a <code>read</code> receipt is appended to his own inbox, and the laptop clears its unread badge when it processes that entry.</p>
+<div class="callout warn">
+<div class="callout-title">Common mistake</div>
+<p>Using "messages since timestamp T" for sync. Two messages can share a millisecond, clocks differ between servers, and a message written slightly late can land behind the cursor and never be fetched. A server-assigned sequence number per log has none of these problems.</p>
+</div>
+
+<h3 id="presence">Presence and last seen</h3>
+<p>Presence is the feature most likely to be over-built. The client sends a heartbeat every 30 seconds; the gateway answers it locally and never forwards it. Only <em>transitions</em> leave the gateway: when a socket opens, or when it closes or misses heartbeats past a grace period.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 210" role="img" aria-label="Presence timeline: heartbeats at 0, 30 and 60 seconds, signal lost at 75 seconds, missed heartbeat at 90 seconds, marked offline at 100 seconds with last seen at 60 seconds">
+<path class="line" d="M60,150 H670"/>
+<path class="line faint" d="M60,145 V155 M210,145 V155 M360,145 V155 M510,145 V155 M660,145 V155"/>
+<text class="t xs mono mute mid" x="60" y="172">0 s</text><text class="t xs mono mute mid" x="210" y="172">30 s</text><text class="t xs mono mute mid" x="360" y="172">60 s</text><text class="t xs mono mute mid" x="510" y="172">90 s</text><text class="t xs mono mute mid" x="660" y="172">120 s</text>
+<rect class="n good" x="60" y="96" width="500" height="26" rx="5"/><text class="t sm b mid" x="250" y="114">online</text>
+<rect class="n ghost" x="560" y="96" width="110" height="26" rx="5"/><text class="t sm mid" x="615" y="114">offline</text>
+<circle class="dot accent" cx="60" cy="136" r="5"/><circle class="dot accent" cx="210" cy="136" r="5"/><circle class="dot accent" cx="360" cy="136" r="5"/>
+<circle class="n ghost" cx="510" cy="136" r="5"/>
+<text class="t xs accent mid" x="210" y="196">heartbeats answered by the gateway</text>
+<path class="e red" d="M435,50 V92"/><text class="t xs red mid" x="435" y="42">signal lost at 75 s</text>
+<path class="e" d="M560,62 V92"/><text class="t xs mid" x="590" y="42">offline at 100 s,</text><text class="t xs mid" x="590" y="55">last seen = 60 s</text>
+<text class="t xs mute mid" x="510" y="196">missed at 90 s</text>
+</svg>
+</div>
+<figcaption><b>Presence from connections.</b> A silent disconnect (a phone in a tunnel) is only detected by a missed heartbeat. The grace period avoids flapping "online, offline, online" on every brief signal drop.</figcaption>
+</figure>
+
+<p>Presence is published lazily. Nobody needs to know that one of their 400 contacts came online unless they are looking at that contact. Clients subscribe to presence only for the chat that is open on screen, and the presence service pushes changes to those subscribers alone. Broadcasting every transition to every contact would turn 200 million users into billions of useless updates per hour.</p>
+
+<h2 id="group-fanout">8. Deep dive: group messages and push</h2>
+<p>A message to a 30-member group is written once to the conversation, then fanned out to 29 inboxes and up to 29 live sockets. The estimate showed this is 91% of delivery work, so it runs asynchronously behind a log.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 320" role="img" aria-label="Group fan-out: the chat service writes the message once, publishes to a Kafka fan-out topic, and fan-out workers append to member inboxes, push to gateways for online members, and call the push service for offline members">
+<rect class="n client" x="20" y="130" width="90" height="50" rx="8"/><text class="t b mid" x="65" y="152">Carol</text><text class="t xs mute mid" x="65" y="168">to group g77</text>
+<rect class="n svc" x="145" y="130" width="110" height="50" rx="8"/><text class="t b mid" x="200" y="152">Chat service</text><text class="t xs mute mid" x="200" y="168">seq 1290</text>
+<rect class="n db" x="145" y="240" width="110" height="50" rx="8"/><text class="t b mid" x="200" y="262">Messages</text><text class="t xs mute mid" x="200" y="278">written once</text>
+<rect class="n queue" x="290" y="130" width="110" height="50" rx="8"/><text class="t b mid" x="345" y="152">Kafka</text><text class="t xs mute mid" x="345" y="168">key = conv_id</text>
+<rect class="n svc" x="435" y="130" width="110" height="50" rx="8"/><text class="t b mid" x="490" y="152">Fan-out</text><text class="t xs mute mid" x="490" y="168">workers</text>
+<rect class="n db" x="590" y="30" width="110" height="50" rx="8"/><text class="t b mid" x="645" y="52">29 inboxes</text><text class="t xs mute mid" x="645" y="68">one append each</text>
+<rect class="n svc" x="590" y="130" width="110" height="50" rx="8"/><text class="t b mid" x="645" y="152">Gateways</text><text class="t xs mute mid" x="645" y="168">21 online</text>
+<rect class="n ext" x="590" y="230" width="110" height="50" rx="8"/><text class="t b mid" x="645" y="252">Push service</text><text class="t xs mute mid" x="645" y="268">8 offline</text>
+<path class="e" d="M110,155 H141"/>
+<path class="e" d="M200,180 V236"/>
+<path class="e" d="M255,155 H286"/>
+<path class="e" d="M400,155 H431"/>
+<path class="e" d="M545,145 C568,145 565,55 586,55"/>
+<path class="e" d="M545,155 H586"/>
+<path class="e" d="M545,165 C568,165 565,255 586,255"/>
+<path class="flow" d="M255,155 H286"/><path class="flow" d="M400,155 H431"/><path class="flow" d="M545,155 H586"/>
+<text class="t xs mute" x="210" y="214">1 write</text>
+<text class="t xs mute mid" x="270" y="118">ack Carol</text>
+<text class="t xs mute mid" x="270" y="104">after write,</text>
+<text class="t sm mute" x="290" y="300">Fan-out lag is invisible: Carol already has her tick.</text>
+</svg>
+</div>
+<figcaption><b>Write once, fan out asynchronously.</b> Keying the topic by <code>conv_id</code> keeps one group's messages in order on one partition, so members receive them in <code>conv_seq</code> order.</figcaption>
+</figure>
+
+<ul>
+<li><strong>Small groups (most of them).</strong> Fan out on write as shown. The member list is cached in the worker; each member gets an inbox append and, if online, a push to their gateway. Workers batch registry lookups and inbox writes per group.</li>
+<li><strong>Large groups and channels.</strong> A 100,000-member broadcast channel cannot append 100,000 inbox entries per message. Switch to fan-out on read: members' inboxes get one "channel has new messages" marker (coalesced), and clients page the conversation's own log directly by <code>conv_seq</code>. This is the same trade-off as in the <a href="news-feed.html">news feed</a>.</li>
+<li><strong>Push notifications.</strong> The push service maps users to device tokens, batches requests to APNs and FCM, and collapses bursts: twenty messages in a busy group become one notification that says "20 new messages". It also respects mute settings and per-device token invalidation (APNs reports tokens that are no longer valid; delete them). See <a href="notification-system.html">Design a Notification System</a> for the full pipeline.</li>
+</ul>
+
+<h2 id="media-encryption">9. Media and end-to-end encryption</h2>
+<h3 id="media">Media</h3>
+<p>A 3 MB video should never pass through a gateway that is sized for 200-byte frames. The sender encrypts the file locally with a fresh random key, asks for a presigned upload URL, and uploads the ciphertext straight to the <a href="blob-storage.html">blob store</a>. The chat message then carries only the <code>media_id</code>, the decryption key, a hash for integrity and a tiny blurred thumbnail. Recipients download through the <a href="cdn.html">CDN</a>. Because the blob is encrypted, the CDN and the storage provider hold only noise, and a viral forward of the same video can reuse the uploaded blob instead of uploading it again.</p>
+
+<h3 id="e2e">End-to-end encryption at a high level</h3>
+<p>WhatsApp and Signal use the Signal protocol, and it shapes the server more than you might expect:</p>
+<ul>
+<li><strong>Key setup without both parties online.</strong> Each device uploads public identity and one-time "prekeys" to a key server. Alice fetches Bob's prekey bundle and derives a shared secret (X3DH) even if Bob's phone is off.</li>
+<li><strong>A new key per message.</strong> The Double Ratchet derives a fresh key for every message, so stealing today's key does not decrypt yesterday's messages (forward secrecy) and the session heals itself after a compromise.</li>
+<li><strong>Groups use sender keys.</strong> Each member distributes a sender key to the others once, then encrypts each group message once instead of once per member.</li>
+<li><strong>Every device is a recipient.</strong> Bob's phone and laptop have separate keys, so Alice's app encrypts each message once per device of each recipient. Fan-out partly moves to the client.</li>
+</ul>
+<p>The consequences for the server design: it stores and routes opaque ciphertext, so it cannot search messages, scan content or render notification previews (the phone decrypts the push payload itself). It still sees metadata (who talks to whom, and when), which is why some systems also minimise what they log.</p>
+
+<h2 id="scaling">10. Bottlenecks and how the design handles them</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Pressure</th><th>What breaks first</th><th>Response</th></tr></thead>
+<tbody>
+<tr><th>Gateway restart or crash</th><td>200,000 clients reconnect at once</td><td>Clients reconnect with jittered exponential backoff; drain gateways gracefully before deploys by asking clients to move</td></tr>
+<tr><th>Reconnect storm after an outage</th><td>Sync reads on the inbox store</td><td>Cursor-based sync is a cheap range read; rate-limit sync per user and page it</td></tr>
+<tr><th>Large groups</th><td>Fan-out workers, inbox write volume</td><td>Fan-out on read above a size threshold; coalesced markers</td></tr>
+<tr><th>Hot conversation</th><td>The chat-service owner of one <code>conv_id</code></td><td>Sequencing is in memory and cheap; buckets bound partition size but all current writes land in the newest bucket, so very large channels switch to fan-out on read and hot reads are coalesced and cached</td></tr>
+<tr><th>Registry store</th><td>Lookups at delivery rate</td><td>Redis sharded by user; gateways cache recent lookups; registry entries expire if a gateway dies</td></tr>
+<tr><th>Region failure</th><td>All connections in that region</td><td>Clients reconnect to another region; the inbox and message tables are replicated across regions, and sync covers the gap</td></tr>
+</tbody></table></div>
+
+<h2 id="tradeoffs">11. Key trade-offs to state</h2>
+<ul>
+<li><strong>At-least-once plus dedup over exactly-once</strong>: retries are always safe, at the cost of client-side and server-side dedup by id.</li>
+<li><strong>Per-conversation sequence over timestamps</strong>: consistent order for everyone, at the cost of routing each conversation to one sequencer.</li>
+<li><strong>Per-user inbox log</strong>: one cheap range read per sync and natural multi-device support, at the cost of extra writes on every message (the pointer appends).</li>
+<li><strong>Fan-out on write for small groups, on read for large ones</strong>: fast delivery where it matters, bounded write amplification where it would explode.</li>
+<li><strong>Watermark receipts</strong>: one write per catch-up instead of one per message, at the cost of not tracking delivery of individual messages in a backlog.</li>
+<li><strong>Stored history vs store-until-delivered</strong>: WhatsApp historically deleted messages from the server once delivered, which minimises storage and exposure; persistent history (Messenger, Slack) enables new-device restore and costs petabytes.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>What the interviewer is checking</h4>
+<p>Whether you separate connection handling from message logic, whether "delivered" and "read" are backed by real events, and whether your offline and multi-device story survives retries, reconnects and crashes without losing or duplicating messages.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>How does the server know which gateway holds Bob's socket? (Connection registry, refreshed by the gateway.)</li>
+<li>Alice's ack is lost and she resends. What prevents a duplicate? (<code>client_msg_id</code> dedup.)</li>
+<li>Two users send to a group at the same instant. Who comes first, and does everyone agree?</li>
+<li>Bob was offline for a week on his laptop. How does it catch up, and how much data does it pull?</li>
+<li>How would you support a 100,000-member channel?</li>
+<li>What changes with end-to-end encryption? (Ciphertext only, per-device keys, no server search, decrypt-in-app notifications.)</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>HTTP polling every second for new messages from 200 million clients.</li>
+<li>Ordering by client timestamps.</li>
+<li>Marking a message delivered when the server sends it, rather than when a device acknowledges it.</li>
+<li>Sending heartbeats or every presence change to a database.</li>
+<li>Routing media through the chat servers.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://www.rfc-editor.org/rfc/rfc6455" target="_blank" rel="noopener">RFC 6455: The WebSocket Protocol</a><span>Handshake, framing, and ping/pong control frames used for heartbeats.</span></li>
+<li><a href="https://discord.com/blog/how-discord-stores-trillions-of-messages" target="_blank" rel="noopener">How Discord Stores Trillions of Messages</a><span>Discord engineering, 2023. Channel-and-bucket partitioning, hot partitions, and the move from Cassandra to ScyllaDB.</span></li>
+<li><a href="https://discord.com/blog/how-discord-stores-billions-of-messages" target="_blank" rel="noopener">How Discord Stores Billions of Messages</a><span>Discord engineering, 2017. Why a wide-column store fits chat history, and the original data model.</span></li>
+<li><a href="https://signal.org/docs/specifications/x3dh/" target="_blank" rel="noopener">The X3DH Key Agreement Protocol</a><span>Marlinspike and Perrin, Signal. Asynchronous key setup with prekeys.</span></li>
+<li><a href="https://signal.org/docs/specifications/doubleratchet/" target="_blank" rel="noopener">The Double Ratchet Algorithm</a><span>Perrin and Marlinspike, Signal. Per-message keys, forward secrecy and self-healing sessions.</span></li>
+</ul>

@@ -1,0 +1,369 @@
+<p class="lead">A news feed is the home timeline of Twitter, Instagram or LinkedIn: open the app and see recent posts from the accounts you follow, ranked, in under 200 ms, with infinite scroll. Producing it means combining posts from hundreds of authors per reader, for hundreds of millions of readers, while some authors have 100 million followers. The central decision is when that combining happens: when a post is written, when a feed is read, or a mix of both.</p>
+
+<div class="callout note">
+<div class="callout-title">How to use this case study</div>
+<p>Sections follow the order of a real interview. Concepts used here have their own chapters: <a href="caching.html">Caching</a>, <a href="event-streaming.html">Event Streaming</a>, <a href="id-generation.html">Distributed ID Generation</a>, <a href="api-design.html">API Design</a> (pagination), <a href="cdn.html">CDNs</a>.</p>
+</div>
+
+<h2 id="requirements">1. Requirements</h2>
+<div class="defs">
+<div><h4>Functional</h4><p>Publish a post (text, images, video). Follow and unfollow. A home feed of posts from followed accounts, ranked by relevance, with infinite scroll. Like and comment, with visible counts. A profile page listing one author's posts.</p></div>
+<div><h4>Non-functional</h4><p>Feed loads in under 200 ms p99. A new post appears in followers' feeds within a few seconds (eventual consistency is fine). Feed reads are far more frequent than posts. Highly available: a stale feed is acceptable, an empty one is not.</p></div>
+<div><h4>Out of scope</h4><p>Search, direct messages, ads auction internals, content moderation pipelines. Mention them, then park them.</p></div>
+</div>
+<p>The key observation: <strong>reads outnumber writes by about 60 to 1, and the follower graph is extremely skewed</strong>. Most accounts have a few hundred followers; a few have tens of millions. A design that is optimal for the median author breaks for the celebrity, and vice versa.</p>
+
+<h2 id="estimation">2. Estimation</h2>
+<p>Assume 300 million daily active users who open the feed 10 times a day, 50 million new posts per day, and an average of 200 followers per author.</p>
+<div class="stats">
+<div><b>~35k/s</b><span>feed reads, ~100k/s at peak</span></div>
+<div><b>~580/s</b><span>new posts, ~1.7k/s at peak</span></div>
+<div><b>~116k/s</b><span>timeline writes from fan-out</span></div>
+<div><b>~3.8 TB</b><span>of cached timelines</span></div>
+</div>
+<div class="calc">Feed reads    300M × 10 = 3B/day  →  3B / 86,400 s       ≈ <span class="r">34,700/s</span>  (×3 for peak ≈ 100,000/s)
+Posts         50M / 86,400 s                             ≈ <span class="r">580/s</span>     (×3 for peak ≈ 1,700/s)
+Fan-out       50M posts × 200 followers = 10B writes/day ≈ <span class="r">116,000/s</span> timeline inserts
+Celebrity     one post × 100M followers = 100M writes; at 1M writes/s of cluster capacity ≈ <span class="r">100 s</span> for one post
+Timelines     300M users × 800 entries × 16 B (post id + author id) ≈ <span class="r">3.84 TB</span>  (~8 TB with Redis overhead)
+Posts         50M × ~1 KB text and metadata              = 50 GB/day  ≈ 18 TB/year
+Media         20% of posts × ~500 KB (all sizes)        = 10M × 500 KB = <span class="r">5 TB/day</span>
+Likes         300M × 20 likes/day = 6B/day               ≈ 69,000/s, very uneven across posts</div>
+<p>Fan-out on write turns 580 posts per second into 116,000 timeline writes per second. That is affordable for normal authors and catastrophic for one celebrity post, which alone would take the entire write capacity for over a minute and a half. The estimate makes the case for a hybrid before any diagram does.</p>
+
+<h2 id="api">3. API</h2>
+<pre><code class="language-http">POST /v1/posts
+{ "text": "Launch day!", "media_ids": ["md_51c2"] }
+→ 201 { "post_id": "1840192837465001985", "created_at": "2026-10-09T10:41:07Z" }
+
+GET /v1/feed?limit=20
+GET /v1/feed?limit=20&amp;cursor=eyJzIjoiZjo5YTEiLCJvIjoyMH0
+→ 200 { "items": [ { "post_id": "...", "author": {...}, "text": "...",
+                     "media": [...], "like_count": 18422, "liked_by_me": false }, ... ],
+        "next_cursor": "eyJzIjoiZjo5YTEiLCJvIjo0MH0" }
+
+POST   /v1/posts/{id}/likes          → 204   (idempotent: liking twice is one like)
+DELETE /v1/posts/{id}/likes          → 204
+POST   /v1/follows  { "author_id": "u_carol" }
+GET    /v1/users/{id}/posts?cursor=...</code></pre>
+<p>The cursor is opaque on purpose. For a chronological feed it encodes the last post id returned ("older than 1840192837465001985"), which works because <a href="id-generation.html">Snowflake-style ids</a> sort by time. For a ranked feed it encodes a reference to a server-side ranked list plus an offset, so page 2 continues the same ranking instead of re-ranking and showing duplicates or skipping posts. Offset pagination (<code>?page=3</code>) is wrong in both cases: new posts arriving at the top shift every page down.</p>
+
+<h2 id="data-model">4. Data model</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Store</th><th>Key</th><th>Value</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><th>posts</th><td><code>post_id</code></td><td>author, text, media refs, created_at</td><td>Sharded by <code>post_id</code>; immutable except edits and deletes</td></tr>
+<tr><th>user_posts</th><td><code>author_id</code>, clustered by <code>post_id</code> desc</td><td>post ids</td><td>Profile pages, and the "pull" source for celebrities</td></tr>
+<tr><th>followers / following</th><td><code>user_id</code></td><td>user ids</td><td>Two directions of the same edge, both needed; a graph store or sharded KV</td></tr>
+<tr><th>timeline cache</th><td>Redis list <code>tl:u_bob</code></td><td>up to 800 post ids</td><td>Pushed by fan-out; rebuilt from sources if missing</td></tr>
+<tr><th>likes</th><td><code>(post_id, user_id)</code></td><td>created_at</td><td>The source of truth for "liked by me"; makes likes idempotent</td></tr>
+<tr><th>counters</th><td><code>post_id</code></td><td>like_count, reply_count, repost_count</td><td>Derived, approximate in the short term, see the deep dive</td></tr>
+</tbody></table></div>
+<p>The timeline holds only ids. Post bodies live once in the post store and a post cache, and are <dfn>hydrated</dfn> (ids turned into full objects with author, media and counts) at read time. Storing full posts in every follower's timeline would multiply 50 GB of daily posts by 200 and make every edit and delete a 200-way rewrite.</p>
+
+<h2 id="high-level">5. High-level design</h2>
+
+<figure class="fig wide">
+<div class="fig-frame">
+<svg viewBox="0 0 760 420" role="img" aria-label="Architecture: posts go through the post service to the post store and a Kafka topic; fan-out workers read followers from the social graph and push post ids into a Redis timeline cache; the feed service reads the timeline cache, hydrates posts from the post cache and calls the ranking service">
+<rect class="n client" x="20" y="180" width="90" height="50" rx="8"/><text class="t b mid" x="65" y="203">Client</text><text class="t xs mute mid" x="65" y="219">app / web</text>
+<rect class="n ext" x="140" y="180" width="90" height="50" rx="8"/><text class="t b mid" x="185" y="203">Load</text><text class="t b mid" x="185" y="219">balancer</text>
+<rect class="n svc" x="270" y="60" width="120" height="50" rx="8"/><text class="t b mid" x="330" y="82">Post service</text><text class="t xs mute mid" x="330" y="98">~1.7k/s peak</text>
+<rect class="n svc" x="270" y="280" width="120" height="50" rx="8"/><text class="t b mid" x="330" y="302">Feed service</text><text class="t xs mute mid" x="330" y="318">~100k/s peak</text>
+<rect class="n svc" x="270" y="362" width="120" height="44" rx="8"/><text class="t b mid" x="330" y="381">Ranking</text><text class="t xs mute mid" x="330" y="396">ML scoring</text>
+<rect class="n db" x="440" y="20" width="120" height="50" rx="8"/><text class="t b mid" x="500" y="42">Post store</text><text class="t xs mute mid" x="500" y="58">sharded by post_id</text>
+<rect class="n queue" x="440" y="110" width="120" height="50" rx="8"/><text class="t b mid" x="500" y="132">Kafka</text><text class="t xs mute mid" x="500" y="148">post_created</text>
+<rect class="n db" x="610" y="20" width="130" height="50" rx="8"/><text class="t b mid" x="675" y="42">Social graph</text><text class="t xs mute mid" x="675" y="58">follower lists</text>
+<rect class="n svc" x="610" y="110" width="130" height="50" rx="8"/><text class="t b mid" x="675" y="132">Fan-out workers</text><text class="t xs mute mid" x="675" y="148">~116k writes/s</text>
+<rect class="n cache" x="610" y="230" width="130" height="56" rx="8"/><text class="t b mid" x="675" y="253">Timeline cache</text><text class="t xs mute mid" x="675" y="270">Redis, 800 ids/user</text>
+<rect class="n cache" x="440" y="320" width="120" height="50" rx="8"/><text class="t b mid" x="500" y="342">Post cache</text><text class="t xs mute mid" x="500" y="358">hydrate by id</text>
+
+<path class="e" d="M110,205 H136"/>
+<path class="e" d="M230,195 C250,195 250,85 266,85"/>
+<path class="e" d="M230,215 C250,215 250,305 266,305"/>
+<path class="e" d="M390,75 C415,75 415,45 436,45"/>
+<path class="e" d="M390,90 C415,90 415,135 436,135"/>
+<path class="e" d="M560,135 H606"/>
+<path class="e" d="M675,110 V74"/>
+<path class="e" d="M675,160 V226"/>
+<path class="e" d="M390,295 C500,295 520,258 606,258"/>
+<path class="e" d="M390,315 C415,315 415,345 436,345"/>
+<path class="e both" d="M330,330 V358"/>
+
+<path class="flow" d="M110,205 H136"/>
+<path class="flow" d="M230,215 C250,215 250,305 266,305"/>
+<path class="flow" d="M390,295 C500,295 520,258 606,258"/>
+<path class="flow" d="M390,315 C415,315 415,345 436,345"/>
+
+<text class="t xs mute end" x="244" y="140">write</text>
+<text class="t xs mute end" x="244" y="270">read</text>
+<text class="t xs mute end" x="668" y="196">push post ids</text>
+<text class="t xs mute" x="684" y="94">read</text>
+<text class="t xs mute" x="470" y="248">ids + celeb pulls</text>
+</svg>
+</div>
+<figcaption><b>Architecture.</b> The animated read path touches only caches: one timeline read, a few celebrity list reads, a batched post-cache lookup and the ranker. Writes reach followers asynchronously through Kafka and the fan-out workers.</figcaption>
+</figure>
+
+<ol class="steps">
+<li><strong>Publish.</strong> The post service assigns a Snowflake id, writes the post to the post store and to the author's <code>user_posts</code> list, publishes <code>post_created</code> to Kafka, and returns. The author sees the post immediately from their own write.</li>
+<li><strong>Fan out.</strong> Workers consume the event, page through the author's followers, and <code>LPUSH</code> plus <code>LTRIM</code> the post id onto each follower's timeline list, in pipelined batches of a few thousand. Authors above the celebrity threshold are skipped.</li>
+<li><strong>Read.</strong> The feed service reads the viewer's timeline list, merges in recent posts from the celebrities they follow, hydrates the ids from the post cache with one multi-get, and sends roughly 1,500 candidates to ranking.</li>
+<li><strong>Rank and page.</strong> The ranker scores candidates, filters and mixes them, and returns the first page of 20. The rest of the ranked list is cached for a few minutes under the cursor for later pages.</li>
+</ol>
+
+<h2 id="fanout">6. Deep dive: fan-out on write, on read, or both</h2>
+<p>This is the question the interview hinges on. Step through the three strategies with the same cast: Alice, a normal user with 300 followers, and a celebrity with 50 million. Bob follows both.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 340" role="img" aria-label="Fan-out strategies. Push: every post is written into every follower's timeline, and a celebrity post costs 50 million writes. Pull: posts are written once and each read merges hundreds of authors' lists. Hybrid: normal authors are pushed, celebrities are pulled and merged at read time">
+<rect class="n client" x="20" y="60" width="110" height="46" rx="8"/><text class="t b mid" x="75" y="81">Alice</text><text class="t xs mute mid" x="75" y="97">300 followers</text>
+<rect class="n client" x="20" y="240" width="110" height="46" rx="8"/><text class="t b mid" x="75" y="261">Celebrity</text><text class="t xs mute mid" x="75" y="277">50M followers</text>
+<rect class="n db" x="300" y="20" width="150" height="36" rx="6"/><text class="t sm mid" x="375" y="42">Alice's posts</text>
+<rect class="n cache" x="300" y="95" width="150" height="36" rx="6"/><text class="t sm mid" x="375" y="117">Bob's timeline</text>
+<rect class="n cache" x="300" y="140" width="150" height="36" rx="6"/><text class="t sm mid" x="375" y="162">Carol's timeline</text>
+<rect class="n ghost" x="300" y="185" width="150" height="36" rx="6"/><text class="t sm mute mid" x="375" y="207">+ other timelines</text>
+<rect class="n db" x="300" y="250" width="150" height="36" rx="6"/><text class="t sm mid" x="375" y="272">Celebrity's posts</text>
+<rect class="n svc" x="580" y="130" width="120" height="46" rx="8"/><text class="t b mid" x="640" y="151">Bob opens</text><text class="t xs mute mid" x="640" y="167">the feed</text>
+
+<path class="e" d="M130,72 C210,72 220,38 296,38"/>
+<path class="e" d="M130,266 C210,266 220,268 296,268"/>
+
+<g data-show="1 3">
+<path class="e accent" d="M130,80 C210,80 220,113 296,113"/>
+<path class="e accent" d="M130,86 C210,86 220,158 296,158"/>
+<path class="e accent" d="M130,92 C210,92 220,203 296,203"/>
+<path class="e" d="M450,113 C520,113 510,148 576,148"/>
+</g>
+<g data-show="1">
+<path class="e red" d="M130,252 C210,252 220,120 296,120"/>
+<path class="e red" d="M130,256 C210,256 220,164 296,164"/>
+<path class="e red" d="M130,260 C210,260 220,209 296,209"/>
+<text class="t sm red" x="20" y="200">50M writes per post</text>
+<text class="t sm mid" x="360" y="325">Push: reads are one list lookup, but writes scale with follower count.</text>
+</g>
+<g data-show="2">
+<path class="e red" d="M450,38 C530,38 520,140 576,140"/>
+<path class="e red" d="M450,268 C530,268 520,165 576,165"/>
+<text class="t sm red" x="580" y="205">merge ~200 author</text>
+<text class="t sm red" x="580" y="220">lists on every read</text>
+<text class="t sm mid" x="360" y="325">Pull: writes are one append, but every feed open queries every followee.</text>
+</g>
+<g data-show="3">
+<path class="e accent" d="M450,268 C530,268 520,165 576,165"/>
+<text class="t sm accent" x="580" y="205">+ a few celebrity</text>
+<text class="t sm accent" x="580" y="220">lists, merged</text>
+<text class="t sm mid" x="360" y="325">Hybrid: push for the many, pull for the few. Both sides stay bounded.</text>
+</g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Fan-out on write</button><button type="button" data-step="2" aria-pressed="false">Fan-out on read</button><button type="button" data-step="3" aria-pressed="false">Hybrid</button></div>
+</div>
+<figcaption><b>Three fan-out strategies.</b> Every author writes their own list once in all three. The strategies differ in who pays for combining: the writer (push), the reader (pull), or the writer for normal authors and the reader for celebrities (hybrid).</figcaption>
+</figure>
+
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Fan-out on write (push)</th><th>Fan-out on read (pull)</th><th>Hybrid</th></tr></thead>
+<tbody>
+<tr><th>Cost of a post</th><td class="no">One write per follower</td><td class="yes">One write</td><td class="yes">Bounded by the celebrity threshold</td></tr>
+<tr><th>Cost of a feed read</th><td class="yes">One list read</td><td class="no">One query per followee, then a merge</td><td class="yes">One list read plus a few celebrity lists</td></tr>
+<tr><th>Freshness</th><td class="meh">Seconds of fan-out lag</td><td class="yes">Always current</td><td class="meh">Seconds for normal authors, current for celebrities</td></tr>
+<tr><th>Wasted work</th><td class="no">Pushes to inactive users who never read</td><td class="yes">None</td><td class="meh">Small</td></tr>
+<tr><th>Unfollow / delete</th><td class="meh">Must clean timelines or filter at read</td><td class="yes">Automatic</td><td class="meh">Filter at read</td></tr>
+</tbody></table></div>
+<p>The hybrid is what Twitter described running for years: a Redis timeline per active user filled by fan-out, with high-follower accounts merged in at read time. Two refinements make it efficient:</p>
+<ul>
+<li><strong>Skip inactive users.</strong> Only push to followers who have opened the app in the last 30 days. A returning user's timeline is rebuilt on first read by pulling from their followees, which is slow once and fast afterwards. This often removes more than half of all fan-out writes.</li>
+<li><strong>A threshold, not a label.</strong> "Celebrity" means "more followers than the cutoff", for example 10,000. Tune it from the measured cost of a pushed write versus a read-time merge. The reader rarely follows more than a handful of accounts above the threshold, so the read side stays cheap.</li>
+</ul>
+<h3 id="timeline-cache">Inside the timeline cache</h3>
+<p>Each active user's timeline is a Redis list of post ids (with the author id packed alongside, so read-time filters for blocks and mutes need no extra lookup). Fan-out appends with <code>LPUSH tl:u_bob 1840192837465001985</code> followed by <code>LTRIM tl:u_bob 0 799</code>, pipelined so one round trip carries thousands of follower updates. Reads are <code>LRANGE tl:u_bob 0 199</code>. The cap of 800 bounds memory; almost nobody scrolls past a few hundred posts, and anyone who does falls through to a slower pull from the sources.</p>
+<p>The cache is the only copy of the pushed timeline, but it is not the source of truth: the follow graph and the authors' post lists are. That makes losing a Redis node an availability event rather than a data-loss event. A missing timeline is rebuilt on read by pulling the latest posts of everyone the user follows (the fan-out-on-read path), written back to the cache, and served. Keep three replicas of each shard so that rebuilds are rare, and rate-limit rebuilds so a lost shard does not send millions of simultaneous pulls to the post store.</p>
+<p>The read-time merge is a k-way merge of lists that are each sorted newest first, with the cursor applied to every source:</p>
+<pre><code class="language-python">import heapq
+from collections import defaultdict
+from itertools import islice
+
+CELEBRITY = 10_000      # followers above this: no fan-out on write
+TIMELINE_CAP = 800      # entries kept per cached timeline
+
+followers = defaultdict(set)
+following = defaultdict(set)
+posts_by = defaultdict(list)    # author -&gt; own post ids, newest first
+timeline = defaultdict(list)    # user -&gt; pushed post ids, newest first
+
+
+def follow(user, author):
+    followers[author].add(user)
+    following[user].add(author)
+
+
+def publish(author, post_id):
+    """post_id is a Snowflake-style id, so larger means newer."""
+    posts_by[author].insert(0, post_id)
+    if len(followers[author]) &gt; CELEBRITY:
+        return 0                                   # pulled at read time instead
+    for f in followers[author]:                    # fan-out on write
+        tl = timeline[f]
+        tl.insert(0, post_id)
+        del tl[TIMELINE_CAP:]
+    return len(followers[author])
+
+
+def home_feed(user, max_id=None, limit=4):
+    """Merge the pushed timeline with celebrities' own lists. Cursor = last id returned."""
+    celebs = [a for a in following[user] if len(followers[a]) &gt; CELEBRITY]
+    sources = [timeline[user]] + [posts_by[c] for c in celebs]
+    below = ([p for p in s if max_id is None or p &lt; max_id] for s in sources)
+    page = list(islice(heapq.merge(*below, reverse=True), limit))
+    return page, (page[-1] if page else None)
+
+
+for i in range(12_000):                     # a celebrity with 12,000 followers
+    follow(f"fan{i}", "celeb")
+follow("bob", "alice")
+follow("bob", "carol")
+follow("bob", "celeb")
+
+print(publish("alice", 7001), publish("celeb", 7002), publish("carol", 7003),
+      publish("celeb", 7004), publish("alice", 7005), publish("carol", 7006))
+# 1 0 1 0 1 1          (celebrity posts cost no fan-out writes)
+page, cursor = home_feed("bob")
+print(page, "next cursor:", cursor)
+# [7006, 7005, 7004, 7003] next cursor: 7003
+print(home_feed("bob", max_id=cursor))
+# ([7002, 7001], 7001)  (celebrity posts 7004 and 7002 are merged in at read time)</code></pre>
+
+<h2 id="ranking">7. Deep dive: the ranking pipeline</h2>
+<p>A chronological feed is a merge and a cut. A ranked feed is a funnel that narrows a large candidate set with progressively more expensive models, so that the costly model only scores what survives the cheap ones.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 250" role="img" aria-label="Ranking funnel: 1,500 candidates are hydrated, a light ranker keeps 500, a heavy ranker scores them, filters and mixing leave about 420, and the first page shows 20">
+<text class="t sm b mid" x="70" y="22">Candidates</text>
+<text class="t sm b mid" x="190" y="22">Hydrate</text>
+<text class="t sm b mid" x="310" y="22">Light rank</text>
+<text class="t sm b mid" x="430" y="22">Heavy rank</text>
+<text class="t sm b mid" x="550" y="22">Filter, mix</text>
+<text class="t sm b mid" x="670" y="22">Page</text>
+<rect class="n cache" x="20" y="40" width="100" height="140" rx="8"/><text class="t mono b mid" x="70" y="114">1,500</text>
+<rect class="n svc" x="140" y="40" width="100" height="140" rx="8"/><text class="t mono b mid" x="190" y="114">1,500</text>
+<rect class="n svc" x="260" y="65" width="100" height="90" rx="8"/><text class="t mono b mid" x="310" y="114">500</text>
+<rect class="n svc" x="380" y="65" width="100" height="90" rx="8"/><text class="t mono b mid" x="430" y="114">500</text>
+<rect class="n svc" x="500" y="70" width="100" height="80" rx="8"/><text class="t mono b mid" x="550" y="114">~420</text>
+<rect class="n good" x="620" y="95" width="80" height="30" rx="6"/><text class="t mono b mid" x="660" y="114">20</text>
+<path class="e" d="M120,110 H136"/><path class="e" d="M240,110 H256"/><path class="e" d="M360,110 H376"/><path class="e" d="M480,110 H496"/><path class="e" d="M600,110 H616"/>
+<text class="t xs mute mid" x="70" y="204">timeline, celebs,</text><text class="t xs mute mid" x="70" y="218">out-of-network</text>
+<text class="t xs mute mid" x="190" y="204">author, post and</text><text class="t xs mute mid" x="190" y="218">viewer features</text>
+<text class="t xs mute mid" x="310" y="204">cheap model,</text><text class="t xs mute mid" x="310" y="218">keep the top third</text>
+<text class="t xs mute mid" x="430" y="204">neural net predicts</text><text class="t xs mute mid" x="430" y="218">like, reply, hide</text>
+<text class="t xs mute mid" x="550" y="204">blocks, seen,</text><text class="t xs mute mid" x="550" y="218">diversity, ads</text>
+<text class="t xs mute mid" x="660" y="204">rest cached</text><text class="t xs mute mid" x="660" y="218">for page 2+</text>
+</svg>
+</div>
+<figcaption><b>The ranking funnel.</b> Box heights follow the candidate counts. Each stage is more expensive per item than the one before, so the pipeline spends its budget where the decision is close.</figcaption>
+</figure>
+
+<ul>
+<li><strong>Candidate generation.</strong> Sources are the pushed timeline, celebrity pulls, and out-of-network recommendations (posts liked by people you follow, popular posts in your interests from an embedding nearest-neighbour index). Twitter's 2023 write-up describes fetching about 1,500 candidates per request this way.</li>
+<li><strong>Hydration and features.</strong> Batch-fetch post bodies, author data and precomputed features (author affinity, post age, engagement so far, media type). Features come from a feature store kept fresh by stream processing, never computed from raw logs at request time.</li>
+<li><strong>Light then heavy ranking.</strong> A cheap model (logistic regression or a small tree ensemble) prunes; a neural network predicts the probability of each engagement type, and a weighted sum of those probabilities is the score. Ranking runs in about 50 to 100 ms of the 200 ms budget, so it is the stage you cut first under load.</li>
+<li><strong>Filtering and mixing.</strong> Remove blocked and muted authors, already-seen posts and deleted posts. Enforce diversity (no more than two consecutive posts from one author), insert ads at fixed slots, and apply policy labels.</li>
+</ul>
+<div class="callout warn">
+<div class="callout-title">Degrade, do not fail</div>
+<p>If the ranking service times out, return the merged candidates in reverse-chronological order. A plain feed in 150 ms is a much better outcome than a perfect feed in 3 seconds or an error page. Design the fallback in from the start and alert when it is being served.</p>
+</div>
+
+<h2 id="pagination">8. Deep dive: pagination, counters and media</h2>
+<h3 id="cursors">Cursor pagination</h3>
+<p>For the chronological part of the feed, the cursor is <code>max_id</code>: "give me posts older than 1840192837465001985". New posts arriving at the top cannot shift the window, and every source (timeline list, celebrity lists) can apply the same bound. For the ranked feed, page 1 computes the full ranked list of a few hundred ids and stores it under a short-lived session key such as <code>rank:u_bob:9a1</code> with a 10-minute TTL; the cursor carries that key and an offset. Pages 2 to 20 are then just slices of a cached list: no re-ranking, no duplicates, and a fraction of the cost of the first page. A pull-to-refresh starts a new session, and posts newer than the session's first item are shown as "12 new posts" at the top.</p>
+
+<h3 id="counters">Counters for likes</h3>
+<p>Like counts are written far more than posts and are extremely skewed: a post from a celebrity can collect 40,000 likes per second in its first minutes. A single counter row or key becomes a write hotspot. Two complementary fixes:</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 740 260" role="img" aria-label="Sharded counter: 40,000 likes per second on one post are spread randomly over eight counter shards of about 5,000 per second each; a reader sums the eight shards and caches the total for a few seconds">
+<rect class="n client" x="20" y="95" width="110" height="56" rx="8"/><text class="t b mid" x="75" y="118">Likes</text><text class="t xs mute mid" x="75" y="135">40k/s on post 9876</text>
+<rect class="n svc" x="165" y="95" width="120" height="56" rx="8"/><text class="t b mid" x="225" y="118">Like service</text><text class="t xs mono mute mid" x="225" y="135">shard = rand(8)</text>
+<rect class="n cache" x="320" y="60" width="60" height="44" rx="6"/><text class="t xs mono mid" x="350" y="79">s0</text><text class="t xs mono mute mid" x="350" y="94">5,012</text>
+<rect class="n cache" x="392" y="60" width="60" height="44" rx="6"/><text class="t xs mono mid" x="422" y="79">s1</text><text class="t xs mono mute mid" x="422" y="94">4,987</text>
+<rect class="n cache" x="464" y="60" width="60" height="44" rx="6"/><text class="t xs mono mid" x="494" y="79">s2</text><text class="t xs mono mute mid" x="494" y="94">5,031</text>
+<rect class="n cache" x="536" y="60" width="60" height="44" rx="6"/><text class="t xs mono mid" x="566" y="79">s3</text><text class="t xs mono mute mid" x="566" y="94">4,958</text>
+<rect class="n cache" x="320" y="142" width="60" height="44" rx="6"/><text class="t xs mono mid" x="350" y="161">s4</text><text class="t xs mono mute mid" x="350" y="176">5,004</text>
+<rect class="n cache" x="392" y="142" width="60" height="44" rx="6"/><text class="t xs mono mid" x="422" y="161">s5</text><text class="t xs mono mute mid" x="422" y="176">5,019</text>
+<rect class="n cache" x="464" y="142" width="60" height="44" rx="6"/><text class="t xs mono mid" x="494" y="161">s6</text><text class="t xs mono mute mid" x="494" y="176">4,976</text>
+<rect class="n cache" x="536" y="142" width="60" height="44" rx="6"/><text class="t xs mono mid" x="566" y="161">s7</text><text class="t xs mono mute mid" x="566" y="176">5,013</text>
+<rect class="n svc" x="630" y="95" width="95" height="56" rx="8"/><text class="t sm b mid" x="677" y="118">Reader</text><text class="t xs mute mid" x="677" y="135">sum, cache 5 s</text>
+<path class="e" d="M130,123 H161"/>
+<path class="e" d="M285,115 C300,115 300,82 316,82"/>
+<path class="e" d="M285,131 C300,131 300,164 316,164"/>
+<path class="e" d="M596,82 C612,82 612,115 626,115"/>
+<path class="e" d="M596,164 C612,164 612,131 626,131"/>
+<text class="t xs mute mid" x="458" y="40">keys post:9876:likes:0 .. :7</text>
+<text class="t sm mid" x="370" y="230">Each shard takes ~5k writes/s instead of 40k. The total 40,000 is read as a sum of 8 keys.</text>
+</svg>
+</div>
+<figcaption><b>Sharded counter.</b> Spreading one logical counter over N keys divides the write load by N, and the shards can live on different nodes. Only hot posts need it: start with one shard and split when a post's write rate crosses a threshold.</figcaption>
+</figure>
+
+<ul>
+<li><strong>Sharded counters</strong>, as above, for the live count in the cache tier.</li>
+<li><strong>Write-behind aggregation</strong> for the durable count: each like inserts a <code>(post_id, user_id)</code> row (which makes it idempotent) and emits an event; a stream job sums events per post per second and applies one <code>UPDATE ... SET like_count = like_count + 4812</code>. The database sees one write per hot post per second instead of tens of thousands.</li>
+</ul>
+<p>The displayed number is allowed to lag by a few seconds and to be slightly off. "18.4K likes" never needs to be exact, but "liked by me" does, and it comes from the likes table, not from the counter.</p>
+
+<h3 id="media">Media</h3>
+<p>Clients upload images and videos directly to <a href="blob-storage.html">blob storage</a> with presigned URLs; the post only references <code>media_ids</code>. A processing pipeline produces several sizes (thumbnail, feed width, full screen, in modern formats such as WebP or AVIF) and the feed returns URLs on the <a href="cdn.html">CDN</a>. At 5 TB a day of new media, the CDN serves almost all media bytes and the origin sees mostly first requests.</p>
+
+<h2 id="scaling">9. Bottlenecks and how the design handles them</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Pressure</th><th>What breaks first</th><th>Response</th></tr></thead>
+<tbody>
+<tr><th>Celebrity post</th><td>Fan-out workers and timeline cache writes</td><td>Threshold-based pull; never push above it</td></tr>
+<tr><th>Viral post</th><td>Post cache key, like counter</td><td>Replicate hot keys to every cache node or an in-process cache; sharded counters</td></tr>
+<tr><th>Timeline cache loss</th><td>Feed reads fall back to rebuilding from sources</td><td>Redis replicas; rebuild lazily on read, rate-limited, with a chronological fallback</td></tr>
+<tr><th>Fan-out backlog</th><td>Freshness: posts appear late</td><td>Scale workers on Kafka lag; prioritise active followers first</td></tr>
+<tr><th>Ranking latency</th><td>p99 feed load time</td><td>Strict timeout and chronological fallback; cache ranked pages</td></tr>
+<tr><th>Unfollow, block, delete</th><td>Stale ids in pushed timelines</td><td>Filter at read time against the current graph and tombstones; clean lists lazily</td></tr>
+</tbody></table></div>
+
+<h2 id="tradeoffs">10. Key trade-offs to state</h2>
+<ul>
+<li><strong>Hybrid fan-out</strong>: cheap reads and bounded writes, in exchange for two code paths and a tuned threshold.</li>
+<li><strong>Ids in timelines, bodies hydrated</strong>: one copy of each post, easy edits and deletes, in exchange for a batched lookup on every read.</li>
+<li><strong>Eventual consistency</strong>: a post may take seconds to reach followers, which nobody notices; it buys an asynchronous, retryable fan-out.</li>
+<li><strong>Ranked over chronological</strong>: higher engagement, in exchange for a latency-heavy pipeline that needs a fallback and makes pagination stateful.</li>
+<li><strong>Approximate counters</strong>: write scalability for hot posts, in exchange for displayed counts that lag by seconds.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>What the interviewer is checking</h4>
+<p>Whether you derive fan-out costs from numbers (followers per post, reads per day), spot the celebrity problem yourself, and land on a hybrid with a clear threshold. Senior candidates also cover pagination stability, hydration and the ranking fallback.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>A user with 100 million followers posts. Walk me through what happens.</li>
+<li>How does a user who has been inactive for a year get a feed?</li>
+<li>How do you paginate a ranked feed without duplicates when new posts arrive?</li>
+<li>A post is deleted. How do you make it disappear from 5 million timelines?</li>
+<li>How do you keep like counts correct for a viral post?</li>
+<li>Ranking is slow today. What does the user see?</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>Pure fan-out on write with no plan for celebrities, or pure fan-out on read with no plan for read cost.</li>
+<li>Copying full post bodies into every timeline.</li>
+<li>Offset-based pagination for a constantly changing list.</li>
+<li>A single counter row updated on every like.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://www.infoq.com/presentations/Twitter-Timeline-Scalability/" target="_blank" rel="noopener">Timelines at Scale</a><span>Raffi Krikorian, QCon 2012 (InfoQ). Twitter's Redis timelines, fan-out on write and the high-follower exception.</span></li>
+<li><a href="https://blog.x.com/engineering/en_us/topics/open-source/2023/twitter-recommendation-algorithm" target="_blank" rel="noopener">Twitter's Recommendation Algorithm</a><span>Twitter engineering, 2023. Candidate sources, the heavy ranker, and heuristics and filters in the "For You" feed.</span></li>
+<li><a href="https://www.usenix.org/conference/atc13/technical-sessions/presentation/bronson" target="_blank" rel="noopener">TAO: Facebook's Distributed Data Store for the Social Graph</a><span>Bronson et al., USENIX ATC 2013. How the follow graph and associations are stored and cached at read-heavy scale.</span></li>
+<li><a href="https://github.com/twitter/snowflake/tree/snowflake-2010" target="_blank" rel="noopener">Twitter Snowflake</a><span>The original time-ordered 64-bit id generator that makes <code>max_id</code> cursors work.</span></li>
+</ul>

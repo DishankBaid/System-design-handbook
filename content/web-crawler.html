@@ -1,0 +1,458 @@
+<p class="lead">A web crawler downloads pages, extracts their links, and follows those links to download more, for a search engine, an archive or a training corpus. The loop fits on a whiteboard. Running it over a billion pages a month means deciding which of billions of known URLs to fetch next, never hammering a single website, recognising the same URL spelled ten ways and the same article served at a hundred URLs, escaping infinite link mazes, and revisiting pages roughly as often as they change.</p>
+
+<div class="callout note">
+<div class="callout-title">How to use this case study</div>
+<p>Sections follow the order of a real interview. Concepts used here have their own chapters: <a href="probabilistic.html">Probabilistic Data Structures</a> (Bloom filters), <a href="consistent-hashing.html">Consistent Hashing</a>, <a href="message-queues.html">Message Queues</a>, <a href="blob-storage.html">Blob Storage</a>, <a href="dns.html">DNS</a>.</p>
+</div>
+
+<h2 id="requirements">1. Requirements</h2>
+<div class="defs">
+<div><h4>Functional</h4><p>Start from seed URLs and discover the web by following links. Download HTML pages and store them with metadata (fetch time, status, headers). Respect robots.txt. Recrawl pages to keep the collection fresh. Skip duplicate URLs and duplicate content.</p></div>
+<div><h4>Non-functional</h4><p>1 billion pages per month. Polite: never more than about one request at a time per host, with a delay between requests. Robust against malformed HTML, slow servers, crawler traps and hostile sites. Horizontally scalable and restartable without losing the frontier.</p></div>
+<div><h4>Out of scope</h4><p>Indexing and ranking, rendering JavaScript-heavy pages (mention a headless-browser tier for a small fraction of URLs), images and video.</p></div>
+</div>
+<p>The key observation: <strong>a crawler's throughput is limited by politeness, not by hardware</strong>. A single machine can open thousands of connections, but each website must be visited slowly. The design is mostly about choosing what to fetch and from where, so that the fetchers always have a host they are allowed to visit.</p>
+
+<h2 id="estimation">2. Estimation</h2>
+<p>Assume 1 billion pages per month, 100 KB of HTML per page on average, 50 links per page, and 5 years of retention for raw pages.</p>
+<div class="stats">
+<div><b>~386/s</b><span>pages fetched, ~800/s at peak</span></div>
+<div><b>~310 Mbps</b><span>download bandwidth</span></div>
+<div><b>~100 TB</b><span>raw HTML per month</span></div>
+<div><b>~12 GB</b><span>Bloom filter for 10B seen URLs</span></div>
+</div>
+<div class="calc">Pages         1B / (30 × 86,400 s = 2.59M s)                 ≈ <span class="r">386 pages/s</span>   (×2 for peak ≈ 800/s)
+Bandwidth     386 × 100 KB ≈ 38.6 MB/s                        ≈ <span class="r">310 Mbps</span>
+Storage       1B × 100 KB = <span class="r">100 TB/month</span> raw  ≈ 20 TB compressed (HTML compresses ~5:1)
+              × 12 × 5 years                                  ≈ 6 PB raw, ~1.2 PB compressed
+Links         1B × 50 = 50B links extracted/month; most point to already-seen URLs
+Seen set      10B URLs × 9.6 bits (Bloom filter, 1% false positives) ≈ <span class="r">12 GB</span>
+              10B URLs × 8 B exact fingerprints                        = 80 GB
+Concurrency   386 pages/s × ~1 s per fetch (Little's law)     ≈ 386 fetches in flight
+Hosts         if each host is fetched at most once per 2 s    → at least 772 hosts must be ready at any moment</div>
+<p>At 386 pages per second, raw throughput is modest: a few machines can do it. The numbers that shape the design are the last two. The crawler needs hundreds of distinct, polite-to-visit hosts ready at every instant, and the frontier must be organised by host so it can find them. The seen-URL set, at billions of entries, has to be compact.</p>
+
+<h2 id="api">3. Interfaces</h2>
+<p>A crawler has no public API, but its components have clear contracts, and naming them structures the rest of the discussion.</p>
+<pre><code class="language-http">Frontier.add(url, priority, not_before)        // from seeds, link extraction and the recrawl scheduler
+Frontier.next(fetcher_id) → (url, host)        // only returns a URL whose host may be fetched now
+Fetcher.fetch(url) → status, headers, body, fetch_ms
+Robots.allowed(host, path, user_agent) → bool, crawl_delay
+Store.put(url, fetched_at, status, headers, body) → content_id
+Dedup.seen_url(url) → bool                     // after normalisation
+Dedup.near_duplicate(simhash) → content_id | none
+Scheduler.next_visit(url, changed: bool) → timestamp</code></pre>
+<p>Operators also need controls: a per-host override for crawl rate (some sites ask to be crawled slower, some partners faster), a blocklist, and a way to inject URLs at high priority, such as a sitemap that was just updated.</p>
+
+<h2 id="data-model">4. Data model</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Data</th><th>Store</th><th>Key</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><th>Raw pages</th><td>Object storage, WARC files</td><td>file + offset</td><td>Pages appended into ~1 GB WARC files: the standard web-archive container</td></tr>
+<tr><th>URL metadata</th><td>Wide-column store</td><td>reversed URL: <code>com.example.news/world/eu-summit</code></td><td>Last fetch, status, content hash, SimHash, change history, next visit</td></tr>
+<tr><th>Frontier</th><td>Per-node queues on local disk, in-memory heads</td><td>priority, then host</td><td>Billions of URLs; only the queue heads are in memory</td></tr>
+<tr><th>Seen URLs</th><td>Bloom filter in memory + exact set on disk</td><td>URL fingerprint</td><td>Sharded by host, like the frontier</td></tr>
+<tr><th>Host state</th><td>In memory, checkpointed</td><td>host</td><td>robots.txt rules and expiry, crawl delay, next allowed fetch, error counts</td></tr>
+</tbody></table></div>
+<p>The metadata key is the URL with the host reversed. Bigtable's original "webtable" used this trick: all pages of <code>news.example.com</code> and its sibling subdomains sort next to each other, so per-site scans and statistics are range reads.</p>
+
+<h2 id="high-level">5. High-level design</h2>
+
+<figure class="fig wide">
+<div class="fig-frame">
+<svg viewBox="0 0 760 400" role="img" aria-label="Architecture: seeds and the recrawl scheduler feed the URL frontier; fetchers take URLs, consult the DNS cache and robots cache, and download from web servers; the parser stores pages in the content store, checks content fingerprints, and passes extracted links through normalisation and the seen-URL Bloom filter back into the frontier">
+<rect class="n ext" x="20" y="40" width="110" height="46" rx="8"/><text class="t b mid" x="75" y="60">Seed URLs</text><text class="t xs mute mid" x="75" y="76">and sitemaps</text>
+<rect class="n svc" x="20" y="200" width="110" height="46" rx="8"/><text class="t b mid" x="75" y="220">Recrawl</text><text class="t xs mute mid" x="75" y="236">scheduler</text>
+<rect class="n queue" x="160" y="120" width="130" height="60" rx="8"/><text class="t b mid" x="225" y="145">URL frontier</text><text class="t xs mute mid" x="225" y="162">priority + politeness</text>
+<rect class="n svc" x="340" y="120" width="120" height="60" rx="8"/><text class="t b mid" x="400" y="145">Fetchers</text><text class="t xs mute mid" x="400" y="162">async HTTP</text>
+<rect class="n cache" x="340" y="20" width="120" height="46" rx="8"/><text class="t b mid" x="400" y="40">DNS cache</text><text class="t xs mute mid" x="400" y="56">local resolver</text>
+<rect class="n cache" x="500" y="20" width="120" height="46" rx="8"/><text class="t b mid" x="560" y="40">robots.txt</text><text class="t xs mute mid" x="560" y="56">cache, 24 h</text>
+<rect class="n ext" x="640" y="120" width="100" height="60" rx="8"/><text class="t b mid" x="690" y="145">Web</text><text class="t xs mute mid" x="690" y="162">servers</text>
+<rect class="n svc" x="340" y="250" width="120" height="50" rx="8"/><text class="t b mid" x="400" y="272">Parser</text><text class="t xs mute mid" x="400" y="288">extract links, text</text>
+<rect class="n db" x="520" y="250" width="120" height="50" rx="8"/><text class="t b mid" x="580" y="272">Content store</text><text class="t xs mute mid" x="580" y="288">WARC, object store</text>
+<rect class="n cache" x="520" y="340" width="120" height="46" rx="8"/><text class="t b mid" x="580" y="360">SimHash index</text><text class="t xs mute mid" x="580" y="376">near-duplicates</text>
+<rect class="n svc" x="160" y="250" width="130" height="50" rx="8"/><text class="t b mid" x="225" y="272">URL filter</text><text class="t xs mute mid" x="225" y="288">normalize, trap rules</text>
+<rect class="n cache" x="160" y="340" width="130" height="46" rx="8"/><text class="t b mid" x="225" y="360">Seen URLs</text><text class="t xs mute mid" x="225" y="376">Bloom filter</text>
+
+<path class="e" d="M130,63 C148,63 148,140 156,140"/>
+<path class="e" d="M130,223 C148,223 148,165 156,165"/>
+<path class="e" d="M290,150 H336"/>
+<path class="e both" d="M400,120 V70"/>
+<path class="e both" d="M440,120 C440,95 540,95 540,70"/>
+<path class="e both" d="M460,150 H636"/>
+<path class="e" d="M400,180 V246"/>
+<path class="e" d="M460,275 H516"/>
+<path class="e" d="M440,300 C440,363 480,363 516,363"/>
+<path class="e" d="M340,275 H294"/>
+<path class="e both" d="M225,300 V336"/>
+<path class="e" d="M210,250 V184"/>
+
+<path class="flow" d="M290,150 H336"/>
+<path class="flow" d="M460,150 H636"/>
+<path class="flow" d="M400,180 V246"/>
+<path class="flow" d="M340,275 H294"/>
+<path class="flow" d="M210,250 V184"/>
+
+<text class="t xs mute" x="216" y="222">new URLs</text>
+<text class="t xs mute mid" x="317" y="266">links</text>
+<text class="t xs mute" x="408" y="220">HTML</text>
+<text class="t xs mute mid" x="548" y="142">GET, one host at a time</text>
+</svg>
+</div>
+<figcaption><b>Architecture.</b> The animated loop is the crawl itself: frontier, fetch, parse, filter, and back into the frontier. DNS and robots.txt are cached beside the fetchers so neither becomes a per-page round trip.</figcaption>
+</figure>
+
+<ol class="steps">
+<li><strong>Select.</strong> A fetcher asks the frontier for work. The frontier returns a URL whose host is allowed to be fetched now, chosen by priority.</li>
+<li><strong>Resolve and check.</strong> The fetcher resolves the host through a local caching DNS resolver and checks the cached robots.txt rules for the path. A host without fresh rules gets its robots.txt fetched first.</li>
+<li><strong>Fetch.</strong> Download with a strict timeout (say 10 s), a size cap (say 10 MB), redirect limits and an honest user agent with a contact URL. Record status, headers and timing.</li>
+<li><strong>Store and parse.</strong> Append the raw response to the content store. Parse HTML, compute the content fingerprint and SimHash, and skip link extraction for near-duplicates.</li>
+<li><strong>Filter and enqueue.</strong> Normalise each extracted link, drop the ones that fail filters or are already seen, and add the rest to the frontier with a priority.</li>
+</ol>
+
+<h2 id="frontier">6. Deep dive: the URL frontier</h2>
+<p>The frontier answers one question, many hundreds of times per second: which URL next? A single FIFO queue fails immediately, because pages link heavily within their own site. Pop the first URL from <code>en.wikipedia.org</code> and the next thousand URLs are also from Wikipedia, so either the crawler hammers one host or the fetchers sit idle. The classic answer is the frontier from the Mercator crawler: two layers of queues, one for priority and one for politeness.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 320" role="img" aria-label="Mercator-style frontier: a prioritizer puts URLs into front queues by priority; a biased selector moves URLs into back queues, one per host; a heap keyed by each host's next allowed fetch time tells fetchers which back queue to read">
+<text class="t xs b mute mid" x="210" y="30">front queues: priority</text>
+<text class="t xs b mute mid" x="505" y="30">back queues: one host each</text>
+<rect class="n svc" x="20" y="130" width="100" height="50" rx="8"/><text class="t b mid" x="70" y="152">Prioritizer</text><text class="t xs mute mid" x="70" y="168">rank, freshness</text>
+<rect class="n queue" x="155" y="45" width="110" height="36" rx="6"/><text class="t sm mid" x="210" y="68">F1 high</text>
+<rect class="n queue" x="155" y="95" width="110" height="36" rx="6"/><text class="t sm mid" x="210" y="118">F2</text>
+<rect class="n queue" x="155" y="145" width="110" height="36" rx="6"/><text class="t sm mid" x="210" y="168">F3</text>
+<rect class="n ghost" x="155" y="195" width="110" height="36" rx="6"/><text class="t sm mute mid" x="210" y="218">F4 low</text>
+<rect class="n svc" x="300" y="130" width="110" height="50" rx="8"/><text class="t b mid" x="355" y="152">Router</text><text class="t xs mute mid" x="355" y="168">biased pick</text>
+<rect class="n queue" x="445" y="45" width="120" height="36" rx="6"/><text class="t xs mono mid" x="505" y="67">en.wikipedia.org</text>
+<rect class="n queue" x="445" y="95" width="120" height="36" rx="6"/><text class="t xs mono mid" x="505" y="117">news.example.com</text>
+<rect class="n queue" x="445" y="145" width="120" height="36" rx="6"/><text class="t xs mono mid" x="505" y="167">blog.acme.io</text>
+<rect class="n queue" x="445" y="195" width="120" height="36" rx="6"/><text class="t xs mono mid" x="505" y="217">shop.example.de</text>
+<rect class="n cache" x="600" y="100" width="105" height="80" rx="8"/><text class="t b mid" x="652" y="128">Heap</text><text class="t xs mute mid" x="652" y="146">host → next</text><text class="t xs mute mid" x="652" y="160">allowed time</text>
+<rect class="n svc" x="600" y="250" width="105" height="46" rx="8"/><text class="t b mid" x="652" y="272">Fetchers</text><text class="t xs mute mid" x="652" y="287">~400 in flight</text>
+<path class="e" d="M120,145 C138,145 138,63 151,63"/>
+<path class="e" d="M120,152 C138,152 138,113 151,113"/>
+<path class="e" d="M120,160 H151"/>
+<path class="e" d="M120,168 C138,168 138,213 151,213"/>
+<path class="e" d="M265,63 C285,63 280,140 296,140"/>
+<path class="e" d="M265,113 C282,113 282,148 296,148"/>
+<path class="e" d="M265,163 H296"/>
+<path class="e" d="M265,213 C285,213 280,172 296,172"/>
+<path class="e" d="M410,145 C428,145 428,63 441,63"/>
+<path class="e" d="M410,150 C428,150 428,113 441,113"/>
+<path class="e" d="M410,160 H441"/>
+<path class="e" d="M410,170 C428,170 428,213 441,213"/>
+<path class="line faint" d="M565,63 C585,63 585,120 600,120 M565,113 H600 M565,163 H600 M565,213 C585,213 585,170 600,170" style="stroke-dasharray:3 3"/>
+<path class="e" d="M652,180 V246"/>
+<text class="t xs mute" x="20" y="270">New hosts get a back queue when one empties.</text>
+<text class="t xs mute" x="20" y="286">Each back queue holds one host's URLs only.</text>
+<text class="t xs mute" x="662" y="220">pop</text>
+</svg>
+</div>
+<figcaption><b>Two layers of queues.</b> Front queues decide <em>what</em> is important; back queues decide <em>when</em> each host may be visited. The heap always knows which host becomes available next, so a fetcher never scans queues looking for work.</figcaption>
+</figure>
+
+<ul>
+<li><strong>Front queues (priority).</strong> The prioritizer scores each URL: estimated importance (link-based rank of the page or its site), how stale the copy is, and whether it came from a sitemap. Higher scores go to higher queues, and the router draws from them with a bias, for example 50% from F1, 25% from F2, so low-priority work still progresses.</li>
+<li><strong>Back queues (politeness).</strong> Each back queue holds URLs of exactly one host, and there are a few times as many back queues as fetcher threads. When a back queue empties, the router pulls URLs from the front queues until it finds one for a host that has no back queue yet, and assigns it.</li>
+<li><strong>The heap.</strong> A min-heap keyed by each host's next allowed fetch time. A fetcher pops the earliest entry, sleeps until that time if needed, fetches one URL, and pushes the host back with a new time.</li>
+</ul>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 270" role="img" aria-label="Politeness heap over three steps: a fetcher pops news.example.com at 10:00:00.0, the fetch takes 0.4 seconds so the host is pushed back at 10:00:04.4, and later a host whose queue emptied is replaced by a new host">
+<text class="t b" x="40" y="34">Heap (earliest first)</text>
+<text class="t b" x="420" y="34">What happens</text>
+<path class="line faint" d="M390,20 V222"/>
+<g data-show="1">
+<rect class="n good" x="40" y="50" width="300" height="34" rx="6"/><text class="t mono" x="54" y="72">10:00:00.0</text><text class="t mono" x="150" y="72">news.example.com</text>
+<rect class="n" x="40" y="92" width="300" height="34" rx="6"/><text class="t mono" x="54" y="114">10:00:00.3</text><text class="t mono" x="150" y="114">en.wikipedia.org</text>
+<rect class="n" x="40" y="134" width="300" height="34" rx="6"/><text class="t mono" x="54" y="156">10:00:01.2</text><text class="t mono" x="150" y="156">blog.acme.io</text>
+<rect class="n" x="40" y="176" width="300" height="34" rx="6"/><text class="t mono" x="54" y="198">10:00:02.9</text><text class="t mono" x="150" y="198">shop.example.de</text>
+<text class="t sm" x="420" y="72">It is 10:00:00.0. A fetcher pops</text>
+<text class="t sm" x="420" y="90">news.example.com: its time has come.</text>
+<text class="t sm" x="420" y="118">It takes the head URL of that host's</text>
+<text class="t sm" x="420" y="136">back queue, /world/eu-summit.</text>
+</g>
+<g data-show="2">
+<rect class="n" x="40" y="50" width="300" height="34" rx="6"/><text class="t mono" x="54" y="72">10:00:00.3</text><text class="t mono" x="150" y="72">en.wikipedia.org</text>
+<rect class="n" x="40" y="92" width="300" height="34" rx="6"/><text class="t mono" x="54" y="114">10:00:01.2</text><text class="t mono" x="150" y="114">blog.acme.io</text>
+<rect class="n" x="40" y="134" width="300" height="34" rx="6"/><text class="t mono" x="54" y="156">10:00:02.9</text><text class="t mono" x="150" y="156">shop.example.de</text>
+<rect class="n cache" x="40" y="176" width="300" height="34" rx="6"/><text class="t mono" x="54" y="198">10:00:04.4</text><text class="t mono" x="150" y="198">news.example.com</text>
+<text class="t sm" x="420" y="72">The fetch took 0.4 s. Next allowed</text>
+<text class="t sm" x="420" y="90">time = end + 10 × 0.4 s = 10:00:04.4.</text>
+<text class="t sm" x="420" y="118">A slow server is visited less often</text>
+<text class="t sm" x="420" y="136">automatically. A robots.txt</text>
+<text class="t sm" x="420" y="154">Crawl-delay raises the floor.</text>
+</g>
+<g data-show="3">
+<rect class="n" x="40" y="50" width="300" height="34" rx="6"/><text class="t mono" x="54" y="72">10:00:01.2</text><text class="t mono" x="150" y="72">blog.acme.io</text>
+<rect class="n" x="40" y="92" width="300" height="34" rx="6"/><text class="t mono" x="54" y="114">10:00:01.3</text><text class="t mono" x="150" y="114">docs.python.org</text>
+<rect class="n" x="40" y="134" width="300" height="34" rx="6"/><text class="t mono" x="54" y="156">10:00:02.9</text><text class="t mono" x="150" y="156">shop.example.de</text>
+<rect class="n" x="40" y="176" width="300" height="34" rx="6"/><text class="t mono" x="54" y="198">10:00:04.4</text><text class="t mono" x="150" y="198">news.example.com</text>
+<text class="t sm" x="420" y="72">Wikipedia's back queue just emptied.</text>
+<text class="t sm" x="420" y="90">The router pulls front-queue URLs until</text>
+<text class="t sm" x="420" y="108">it finds a host with no back queue,</text>
+<text class="t sm" x="420" y="126">docs.python.org, and gives it the slot.</text>
+</g>
+<text class="t xs mute" x="40" y="240">One entry per active host; a fetcher sleeps until the top entry's time.</text>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Pop</button><button type="button" data-step="2" aria-pressed="false">Push back</button><button type="button" data-step="3" aria-pressed="false">New host</button></div>
+</div>
+<figcaption><b>The politeness heap.</b> Mercator waited ten times the last download time before revisiting a host. The rule adapts to each server: fast servers are visited every few hundred milliseconds, struggling ones back off on their own.</figcaption>
+</figure>
+
+<p>Billions of URLs do not fit in memory, so each queue is a file on local disk with only its head and tail buffered in RAM. Appends go to the tail buffer and are flushed in large sequential writes; reads refill the head buffer the same way. The frontier is checkpointed regularly, so a crashed node restarts from its last checkpoint and loses minutes of discovery, not the crawl.</p>
+
+<h3 id="robots-dns">robots.txt and DNS</h3>
+<ul>
+<li><strong>robots.txt</strong> is fetched once per host and cached. RFC 9309 says crawlers should not use a cached copy for more than 24 hours, must parse at least 500 KiB of it, may treat a 4xx response as "no restrictions", and must treat a 5xx or unreachable robots.txt as "disallow everything" (or keep using a cached copy) until it can be fetched again. Match the most specific <code>Allow</code>/<code>Disallow</code> rule for the path, and honour <code>Crawl-delay</code> where given even though the RFC does not define it.</li>
+<li><strong>DNS</strong> is a hidden bottleneck: a standard resolver call is synchronous, can take hundreds of milliseconds, and public resolvers rate-limit heavy users. Run a local caching resolver on every crawler node, resolve asynchronously, and prefetch: when a URL enters a back queue, resolve its host before its turn comes.</li>
+</ul>
+
+<h2 id="dedup">7. Deep dive: deduplication</h2>
+<h3 id="url-dedup">Duplicate URLs</h3>
+<p>The same page appears under many spellings: different case in the host, default ports, <code>//</code> in the path, reordered query parameters, tracking parameters, fragments. Normalise every URL before checking whether it has been seen, then check a <a href="probabilistic.html">Bloom filter</a> of fingerprints. A Bloom filter can say "seen" for a URL that was not (a false positive, here 1%), which means that URL is never crawled while that filter lives (rotating or rebuilding the filter per crawl cycle gives it another chance); it can never say "not seen" for a seen URL, so it never causes a duplicate fetch. For important URLs, confirm a "seen" answer against the exact on-disk set.</p>
+
+<h3 id="content-dedup">Duplicate content</h3>
+<p>Different URLs often serve the same content: mirrors, syndicated articles, printer-friendly versions, session-id variants that slipped past normalisation. An exact hash of the body catches byte-identical copies. Most copies are not byte-identical, though: they differ in an ad, a timestamp or a footer. <dfn>SimHash</dfn> gives similar documents fingerprints that differ in only a few bits.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 300" role="img" aria-label="SimHash with 8-bit hashes: four shingles each hashed to 8 bits, each bit column summed with plus one for a 1 and minus one for a 0, and the fingerprint takes 1 where the sum is positive">
+<text class="t b" x="20" y="34">Shingle and its hash</text>
+<text class="t xs mono mute mid" x="268" y="44">b7</text>
+<text class="t xs mono mute mid" x="304" y="44">b6</text>
+<text class="t xs mono mute mid" x="340" y="44">b5</text>
+<text class="t xs mono mute mid" x="376" y="44">b4</text>
+<text class="t xs mono mute mid" x="412" y="44">b3</text>
+<text class="t xs mono mute mid" x="448" y="44">b2</text>
+<text class="t xs mono mute mid" x="484" y="44">b1</text>
+<text class="t xs mono mute mid" x="520" y="44">b0</text>
+<text class="t sm" x="20" y="73">"leaders met in"</text>
+<rect class="n svc" x="252" y="54" width="32" height="26" rx="4"/><text class="t xs mono mid" x="268" y="71">1</text>
+<rect class="n ghost" x="288" y="54" width="32" height="26" rx="4"/><text class="t xs mono mid" x="304" y="71">0</text>
+<rect class="n svc" x="324" y="54" width="32" height="26" rx="4"/><text class="t xs mono mid" x="340" y="71">1</text>
+<rect class="n svc" x="360" y="54" width="32" height="26" rx="4"/><text class="t xs mono mid" x="376" y="71">1</text>
+<rect class="n ghost" x="396" y="54" width="32" height="26" rx="4"/><text class="t xs mono mid" x="412" y="71">0</text>
+<rect class="n ghost" x="432" y="54" width="32" height="26" rx="4"/><text class="t xs mono mid" x="448" y="71">0</text>
+<rect class="n svc" x="468" y="54" width="32" height="26" rx="4"/><text class="t xs mono mid" x="484" y="71">1</text>
+<rect class="n ghost" x="504" y="54" width="32" height="26" rx="4"/><text class="t xs mono mid" x="520" y="71">0</text>
+<text class="t sm" x="20" y="105">"met in brussels"</text>
+<rect class="n svc" x="252" y="86" width="32" height="26" rx="4"/><text class="t xs mono mid" x="268" y="103">1</text>
+<rect class="n ghost" x="288" y="86" width="32" height="26" rx="4"/><text class="t xs mono mid" x="304" y="103">0</text>
+<rect class="n ghost" x="324" y="86" width="32" height="26" rx="4"/><text class="t xs mono mid" x="340" y="103">0</text>
+<rect class="n svc" x="360" y="86" width="32" height="26" rx="4"/><text class="t xs mono mid" x="376" y="103">1</text>
+<rect class="n svc" x="396" y="86" width="32" height="26" rx="4"/><text class="t xs mono mid" x="412" y="103">1</text>
+<rect class="n ghost" x="432" y="86" width="32" height="26" rx="4"/><text class="t xs mono mid" x="448" y="103">0</text>
+<rect class="n svc" x="468" y="86" width="32" height="26" rx="4"/><text class="t xs mono mid" x="484" y="103">1</text>
+<rect class="n ghost" x="504" y="86" width="32" height="26" rx="4"/><text class="t xs mono mid" x="520" y="103">0</text>
+<text class="t sm" x="20" y="137">"in brussels on"</text>
+<rect class="n ghost" x="252" y="118" width="32" height="26" rx="4"/><text class="t xs mono mid" x="268" y="135">0</text>
+<rect class="n ghost" x="288" y="118" width="32" height="26" rx="4"/><text class="t xs mono mid" x="304" y="135">0</text>
+<rect class="n svc" x="324" y="118" width="32" height="26" rx="4"/><text class="t xs mono mid" x="340" y="135">1</text>
+<rect class="n svc" x="360" y="118" width="32" height="26" rx="4"/><text class="t xs mono mid" x="376" y="135">1</text>
+<rect class="n ghost" x="396" y="118" width="32" height="26" rx="4"/><text class="t xs mono mid" x="412" y="135">0</text>
+<rect class="n svc" x="432" y="118" width="32" height="26" rx="4"/><text class="t xs mono mid" x="448" y="135">1</text>
+<rect class="n svc" x="468" y="118" width="32" height="26" rx="4"/><text class="t xs mono mid" x="484" y="135">1</text>
+<rect class="n ghost" x="504" y="118" width="32" height="26" rx="4"/><text class="t xs mono mid" x="520" y="135">0</text>
+<text class="t sm" x="20" y="169">"brussels on thursday"</text>
+<rect class="n svc" x="252" y="150" width="32" height="26" rx="4"/><text class="t xs mono mid" x="268" y="167">1</text>
+<rect class="n svc" x="288" y="150" width="32" height="26" rx="4"/><text class="t xs mono mid" x="304" y="167">1</text>
+<rect class="n ghost" x="324" y="150" width="32" height="26" rx="4"/><text class="t xs mono mid" x="340" y="167">0</text>
+<rect class="n svc" x="360" y="150" width="32" height="26" rx="4"/><text class="t xs mono mid" x="376" y="167">1</text>
+<rect class="n ghost" x="396" y="150" width="32" height="26" rx="4"/><text class="t xs mono mid" x="412" y="167">0</text>
+<rect class="n ghost" x="432" y="150" width="32" height="26" rx="4"/><text class="t xs mono mid" x="448" y="167">0</text>
+<rect class="n svc" x="468" y="150" width="32" height="26" rx="4"/><text class="t xs mono mid" x="484" y="167">1</text>
+<rect class="n svc" x="504" y="150" width="32" height="26" rx="4"/><text class="t xs mono mid" x="520" y="167">1</text>
+<text class="t sm b" x="20" y="213">column sum (+1 / -1)</text>
+<text class="t mono mid green" x="268" y="213">+2</text>
+<text class="t mono mid" x="304" y="213">-2</text>
+<text class="t mono mid" x="340" y="213">+0</text>
+<text class="t mono mid green" x="376" y="213">+4</text>
+<text class="t mono mid" x="412" y="213">-2</text>
+<text class="t mono mid" x="448" y="213">-2</text>
+<text class="t mono mid green" x="484" y="213">+4</text>
+<text class="t mono mid" x="520" y="213">-2</text>
+<text class="t sm b" x="20" y="255">fingerprint (sum &gt; 0)</text>
+<rect class="n good" x="252" y="236" width="32" height="26" rx="4"/><text class="t xs mono b mid" x="268" y="253">1</text>
+<rect class="n ghost" x="288" y="236" width="32" height="26" rx="4"/><text class="t xs mono b mid" x="304" y="253">0</text>
+<rect class="n ghost" x="324" y="236" width="32" height="26" rx="4"/><text class="t xs mono b mid" x="340" y="253">0</text>
+<rect class="n good" x="360" y="236" width="32" height="26" rx="4"/><text class="t xs mono b mid" x="376" y="253">1</text>
+<rect class="n ghost" x="396" y="236" width="32" height="26" rx="4"/><text class="t xs mono b mid" x="412" y="253">0</text>
+<rect class="n ghost" x="432" y="236" width="32" height="26" rx="4"/><text class="t xs mono b mid" x="448" y="253">0</text>
+<rect class="n good" x="468" y="236" width="32" height="26" rx="4"/><text class="t xs mono b mid" x="484" y="253">1</text>
+<rect class="n ghost" x="504" y="236" width="32" height="26" rx="4"/><text class="t xs mono b mid" x="520" y="253">0</text>
+<text class="t sm" x="560" y="80">Similar pages share</text>
+<text class="t sm" x="560" y="98">most shingles, so most</text>
+<text class="t sm" x="560" y="116">column sums keep their</text>
+<text class="t sm" x="560" y="134">sign and most bits stay</text>
+<text class="t sm" x="560" y="152">the same.</text>
+<text class="t xs mute" x="560" y="190">Real fingerprints: 64 bits.</text>
+<text class="t xs mute" x="560" y="206">Near-duplicate: at most</text>
+<text class="t xs mute" x="560" y="222">3 bits differ.</text>
+</svg>
+</div>
+<figcaption><b>SimHash in miniature.</b> Each shingle votes on every bit. A small edit changes a few shingles, which rarely flips a column's sign, so the fingerprint barely moves. Tied columns (sum 0) give 0.</figcaption>
+</figure>
+
+<pre><code class="language-python">import hashlib
+import re
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+TRACKING = {"utm_source", "utm_medium", "utm_campaign", "gclid", "fbclid", "sessionid"}
+
+
+def normalize(url):
+    """One spelling per page, so the seen-set catches duplicates."""
+    s = urlsplit(url.strip())
+    scheme, host = s.scheme.lower(), (s.hostname or "").lower()
+    port = s.port
+    netloc = host if port in (None, 80 if scheme == "http" else 443) else f"{host}:{port}"
+    path = re.sub(r"/{2,}", "/", s.path) or "/"
+    query = urlencode(sorted((k, v) for k, v in parse_qsl(s.query) if k.lower() not in TRACKING))
+    return urlunsplit((scheme, netloc, path, query, ""))          # fragment dropped
+
+
+def simhash(text, bits=64):
+    """Charikar's SimHash over 3-word shingles: similar texts get close fingerprints."""
+    words = re.findall(r"\w+", text.lower())
+    weights = [0] * bits
+    for i in range(len(words) - 2):
+        h = int.from_bytes(hashlib.md5(" ".join(words[i:i + 3]).encode()).digest()[:8], "big")
+        for b in range(bits):
+            weights[b] += 1 if h &gt;&gt; b &amp; 1 else -1
+    return sum(1 &lt;&lt; b for b in range(bits) if weights[b] &gt; 0)
+
+
+def distance(a, b):
+    return bin(a ^ b).count("1")
+
+
+print(normalize("HTTPS://News.Example.com:443//world/eu-summit?utm_source=x&amp;b=2&amp;a=1#comments"))
+# https://news.example.com/world/eu-summit?a=1&amp;b=2
+
+article = ("European leaders met in Brussels on Thursday to agree a common plan for energy prices "
+           "after a month of negotiations. The summit ended with a joint statement on gas storage, "
+           "grid investment and support for households facing higher bills this winter. Ministers "
+           "will meet again in November to agree how the cost is shared between member states, and "
+           "the commission will publish draft rules for joint gas purchasing before the end of the "
+           "month. Several countries asked for a cap on wholesale prices, which was left out of the "
+           "final text after objections from the largest importers. Analysts said the agreement was "
+           "less ambitious than expected but would calm markets ahead of the heating season. ")
+mirror = article.replace("on Thursday", "on Thursday evening") + "Updated 10:41 CET."
+other = ("The city council approved a new cycling network on Monday, adding forty kilometres of "
+         "protected lanes over three years and closing two central streets to through traffic. "
+         "Shops on the affected streets will get delivery windows each morning, and bus routes "
+         "will move to parallel avenues. Opponents said the plan was rushed, while cycling groups "
+         "called it the biggest change to the city centre in a generation. ")
+a, b, c = simhash(article), simhash(mirror), simhash(other)
+print(f"{a:016x} {b:016x} {c:016x}")
+# 9c906dfd5cbaa229 1c906dfd1cbaa629 b1893933b0516fc5
+print("article vs mirror:", distance(a, b), "bits   article vs other:", distance(a, c), "bits")
+# article vs mirror: 3 bits   article vs other: 36 bits</code></pre>
+<p>Finding whether any of billions of stored fingerprints is within 3 bits of a new one cannot be a linear scan. Google's crawler paper splits each 64-bit fingerprint into blocks and keeps several sorted tables, each keyed by a different subset of blocks: by the pigeonhole principle, two fingerprints that differ in at most 3 bits must agree exactly on at least one of 4 blocks, so each table lookup is an exact-match range query on that block. Near-duplicate pages are stored (cheaply, as a pointer to the original) but their links are not re-extracted, which also kills a whole class of crawler traps.</p>
+
+<h3 id="traps">Crawler traps</h3>
+<p>Some sites generate infinite URL spaces, by accident or on purpose: a calendar with a "next month" link forever, faceted search with every filter combination, session ids in paths, symbolic-link loops such as <code>/a/b/a/b/a/b/</code>, and soft-404 pages that return 200 for any path. Defences are budgets and heuristics, applied in the URL filter:</p>
+<ul>
+<li>A maximum URL length (2,048 characters) and path depth.</li>
+<li>A per-host page budget per crawl cycle, scaled by the host's importance, so a trap can waste at most its host's budget.</li>
+<li>Rejecting paths with repeating segments, and query strings with more than a handful of parameters.</li>
+<li>Detecting soft 404s by fetching a random nonsense path once per host and comparing SimHashes with suspicious pages.</li>
+</ul>
+
+<h2 id="freshness">8. Deep dive: recrawling and distribution</h2>
+<h3 id="recrawl">Recrawl scheduling by change rate</h3>
+<p>Pages change at wildly different rates: a news homepage every few minutes, an article rarely after its first day, a company's About page once a year. Recrawling everything every month wastes most of the budget on unchanged pages and still misses the fast ones. The scheduler keeps, per URL, a history of whether each visit found a change (compare the content hash), estimates a change rate from it, and sets the next visit accordingly:</p>
+<ul>
+<li>A simple adaptive rule: if the page changed since the last visit, halve the interval; if not, multiply it by 1.5, bounded between, say, 1 hour and 60 days.</li>
+<li>Weight by importance: an important page that changes daily is worth visiting daily; an obscure one that changes daily may only be worth weekly.</li>
+<li>Use cheap signals first: conditional requests with <code>If-Modified-Since</code> or <code>If-None-Match</code> return <code>304 Not Modified</code> without a body, and sitemaps list <code>lastmod</code> dates.</li>
+</ul>
+<p>Cho and Garcia-Molina showed a counter-intuitive result here: with a fixed crawl budget, visiting the very fastest-changing pages as often as possible can lower average freshness, because they go stale again almost immediately. Spending on pages that change at moderate rates keeps more of the collection fresh.</p>
+
+<h3 id="distributed">Partitioning the crawl by host</h3>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 300" role="img" aria-label="Three crawler nodes, each owning a set of hosts by hash of the host name, each with its own frontier, fetchers and seen-URL shard; discovered URLs for hosts owned by another node are batched and sent to that node; all nodes write to a shared content store and metadata store">
+<rect class="zone" x="20" y="20" width="210" height="170" rx="10"/><text class="t b mid" x="125" y="42">Node 1</text><text class="t xs mute mid" x="125" y="58">hash(host) in range 1</text>
+<rect class="zone" x="255" y="20" width="210" height="170" rx="10"/><text class="t b mid" x="360" y="42">Node 2</text><text class="t xs mute mid" x="360" y="58">hash(host) in range 2</text>
+<rect class="zone" x="490" y="20" width="210" height="170" rx="10"/><text class="t b mid" x="595" y="42">Node 3</text><text class="t xs mute mid" x="595" y="58">hash(host) in range 3</text>
+<rect class="n queue" x="40" y="72" width="170" height="30" rx="6"/><text class="t sm mid" x="125" y="92">frontier</text>
+<rect class="n svc" x="40" y="110" width="170" height="30" rx="6"/><text class="t sm mid" x="125" y="130">fetchers + parser</text>
+<rect class="n cache" x="40" y="148" width="170" height="30" rx="6"/><text class="t sm mid" x="125" y="168">seen-URL shard</text>
+<rect class="n queue" x="275" y="72" width="170" height="30" rx="6"/><text class="t sm mid" x="360" y="92">frontier</text>
+<rect class="n svc" x="275" y="110" width="170" height="30" rx="6"/><text class="t sm mid" x="360" y="130">fetchers + parser</text>
+<rect class="n cache" x="275" y="148" width="170" height="30" rx="6"/><text class="t sm mid" x="360" y="168">seen-URL shard</text>
+<rect class="n queue" x="510" y="72" width="170" height="30" rx="6"/><text class="t sm mid" x="595" y="92">frontier</text>
+<rect class="n svc" x="510" y="110" width="170" height="30" rx="6"/><text class="t sm mid" x="595" y="130">fetchers + parser</text>
+<rect class="n cache" x="510" y="148" width="170" height="30" rx="6"/><text class="t sm mid" x="595" y="168">seen-URL shard</text>
+<path class="e accent" d="M210,125 C240,125 245,87 271,87"/>
+<path class="e accent" d="M445,125 C475,125 480,87 506,87"/>
+<path class="e accent" d="M595,190 C595,215 125,215 125,194"/>
+<text class="t xs accent mid" x="360" y="230">links for hosts owned elsewhere, sent in batches</text>
+<rect class="n db" x="140" y="248" width="200" height="40" rx="8"/><text class="t sm b mid" x="240" y="273">Content store (WARC)</text>
+<rect class="n db" x="380" y="248" width="200" height="40" rx="8"/><text class="t sm b mid" x="480" y="273">URL metadata store</text>
+</svg>
+</div>
+<figcaption><b>One owner per host.</b> Because a node owns all URLs of its hosts, politeness, robots.txt caching and URL dedup for a host are purely local. Only discovered links cross node boundaries, and they travel in batches.</figcaption>
+</figure>
+
+<p>Partition by <strong>host</strong>, not by URL. If URLs of one host were spread over many nodes, each node would enforce its own delay and the host would get several times the intended rate; robots.txt would be fetched by every node; and the seen-set would need a network call per link. With host ownership, a node that extracts a link to a host it does not own appends it to an outbound batch for the owner, flushed every second or every few thousand URLs. Assign hosts to nodes with <a href="consistent-hashing.html">consistent hashing</a>, so adding a node moves only a fraction of hosts, together with their frontier queues and seen-set shards.</p>
+<p>One refinement: a handful of giant hosts (Wikipedia, large forums) have far more URLs than average. They are still fetched politely, one request at a time, so their URLs simply wait longer in their back queue; the per-host budget keeps them from crowding out everything else.</p>
+
+<h2 id="scaling">9. Bottlenecks and how the design handles them</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Pressure</th><th>What breaks first</th><th>Response</th></tr></thead>
+<tbody>
+<tr><th>Too few polite-ready hosts</th><td>Fetchers idle while the frontier is huge</td><td>More back queues than fetchers; diversify front-queue selection across hosts</td></tr>
+<tr><th>DNS latency</th><td>Fetch throughput</td><td>Local caching resolvers, async resolution, prefetch on back-queue assignment</td></tr>
+<tr><th>Frontier size</th><td>Memory</td><td>Disk-backed queues with buffered heads and tails</td></tr>
+<tr><th>Seen-URL set</th><td>Memory, lookup latency</td><td>Bloom filter per node, exact set on disk for confirmation</td></tr>
+<tr><th>Traps and spam farms</th><td>Crawl budget wasted</td><td>Per-host budgets, URL heuristics, near-duplicate suppression, host reputation</td></tr>
+<tr><th>Node crash</th><td>That node's hosts</td><td>Checkpointed frontier; hosts reassigned by consistent hashing</td></tr>
+<tr><th>Complaints from site owners</th><td>Reputation, blocking</td><td>Honest user agent with contact page, per-host rate overrides, fast robots.txt compliance</td></tr>
+</tbody></table></div>
+
+<h2 id="tradeoffs">10. Key trade-offs to state</h2>
+<ul>
+<li><strong>Politeness over speed</strong>: one request per host at a time and adaptive delays cap the crawl rate per site; parallelism comes from many hosts, not many connections to one.</li>
+<li><strong>Bloom filter over an exact set</strong>: 12 GB instead of 80 GB for 10 billion URLs, in exchange for never discovering about 1% of genuinely new URLs unless the filter is rebuilt.</li>
+<li><strong>Host-partitioned nodes</strong>: local politeness and dedup, in exchange for shipping links between nodes and uneven host sizes.</li>
+<li><strong>Adaptive recrawl over fixed cycles</strong>: fresher collection for the same budget, in exchange for per-URL history and scheduling logic.</li>
+<li><strong>Near-duplicate suppression</strong>: saves storage and stops many traps, at the risk of occasionally treating two genuinely different pages as copies.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>What the interviewer is checking</h4>
+<p>Whether you go past "BFS with a queue" to a frontier that enforces politeness and priority, whether you handle URL and content duplicates with appropriate data structures, and whether you know the practical hazards: robots.txt, DNS, traps and freshness.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>How do you make sure you never send more than one request per second to a site?</li>
+<li>How do you detect that two different URLs are the same page? What about the same article on two sites?</li>
+<li>Your crawler is stuck in a calendar that links to the next month forever. How do you notice and stop?</li>
+<li>How do you split the work across 50 machines without breaking politeness?</li>
+<li>How often should you recrawl a page?</li>
+<li>How would you crawl pages that need JavaScript to render?</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>A single global FIFO queue.</li>
+<li>Partitioning by URL hash, so one host is hit by every node.</li>
+<li>An exact in-memory hash set for billions of URLs with no size estimate.</li>
+<li>Ignoring robots.txt or treating it as optional.</li>
+<li>No defence against infinite URL spaces.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://www.rfc-editor.org/rfc/rfc9309" target="_blank" rel="noopener">RFC 9309: Robots Exclusion Protocol</a><span>Koster et al., 2022. Rule matching, caching for up to 24 hours, and how to treat 4xx and 5xx responses.</span></li>
+<li><a href="https://link.springer.com/article/10.1023/A:1019213109274" target="_blank" rel="noopener">Mercator: A Scalable, Extensible Web Crawler</a><span>Heydon and Najork, World Wide Web journal, 1999. Front and back queues, the politeness heap, and DNS as a bottleneck.</span></li>
+<li><a href="https://research.google/pubs/detecting-near-duplicates-for-web-crawling/" target="_blank" rel="noopener">Detecting Near-Duplicates for Web Crawling</a><span>Manku, Jain and Das Sarma, WWW 2007. 64-bit SimHash with a 3-bit threshold over 8 billion pages, and the block-permutation tables for fast lookup.</span></li>
+<li><a href="https://dl.acm.org/doi/10.1145/509907.509965" target="_blank" rel="noopener">Similarity Estimation Techniques from Rounding Algorithms</a><span>Charikar, STOC 2002. The origin of SimHash.</span></li>
+<li><a href="https://dl.acm.org/doi/10.1145/958942.958945" target="_blank" rel="noopener">Effective Page Refresh Policies for Web Crawlers</a><span>Cho and Garcia-Molina, ACM TODS 2003. Why uniform revisits can beat proportional ones, and how to schedule by change rate.</span></li>
+</ul>
