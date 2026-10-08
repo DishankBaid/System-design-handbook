@@ -1,0 +1,380 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">A mobile app sends <code>POST /v1/charges</code> for $29.99. The payment service charges the card and returns <code>201 Created</code>, but the phone switches from Wi-Fi to 4G and the response never arrives. After 10 seconds the app times out and, like any well-behaved client, retries. The customer is charged twice.</p>
+<p>Nothing in that story is a bug in the usual sense. Timeouts and retries are what make distributed systems survive failures (<a href="fault-tolerance.html">Timeouts, Retries &amp; Circuit Breakers</a>), and every queue redelivers messages that were not acknowledged. Retries are necessary, and retries create duplicates. The way to have both is <dfn>idempotency</dfn>: an operation is idempotent if performing it several times has the same effect as performing it once. This chapter covers what delivery guarantees are actually possible, how idempotency keys turn an unsafe API call into a safe one, and how consumers deduplicate messages.</p>
+
+<h2 id="delivery-semantics">Delivery semantics</h2>
+<p>Every messaging system, RPC framework and queue falls into one of three categories, depending on what it does when it is unsure whether a message got through.</p>
+<div class="defs">
+<div><h4>At-most-once</h4><p>Send once, never retry. A message is never duplicated but may be lost. Fine for metrics samples, presence pings and log lines where a gap is harmless.</p></div>
+<div><h4>At-least-once</h4><p>Retry until acknowledged. A message is never lost but may be processed more than once. The default for SQS, RabbitMQ, Kafka consumers, webhooks and nearly every HTTP client with retries.</p></div>
+<div><h4>Exactly-once</h4><p>Each message has its effect exactly one time. Not achievable as a pure <em>delivery</em> guarantee over an unreliable network. Achievable as a <em>processing</em> guarantee: at-least-once delivery plus idempotent or deduplicating handling.</p></div>
+</div>
+<p>The reason exactly-once <em>delivery</em> is impossible is the same ambiguity as in the opening story. The sender can only learn that a message arrived through an acknowledgement, and the acknowledgement can be lost too. When it is, the sender must pick: resend (risking a duplicate, at-least-once) or give up (risking a loss, at-most-once). No protocol escapes this choice; it is a version of the Two Generals problem.</p>
+<p>So when a system advertises "exactly-once", read it as <dfn>effectively-once</dfn>: duplicates still happen on the wire, but they are detected and discarded before they change state twice. Kafka's exactly-once semantics, Flink's exactly-once state and Stripe's idempotent requests all work this way. The useful formula is:</p>
+<div class="calc">effectively-once  =  at-least-once delivery  +  <span class="r">idempotent processing</span></div>
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>At-most-once</th><th>At-least-once</th><th>Effectively-once</th></tr></thead>
+<tbody>
+<tr><th>Lost messages</th><td class="no">Possible</td><td class="yes">None</td><td class="yes">None</td></tr>
+<tr><th>Duplicate effects</th><td class="yes">None</td><td class="no">Possible</td><td class="yes">None</td></tr>
+<tr><th>What it costs</th><td>Nothing</td><td>Retries and acks</td><td>Retries, acks, plus dedup state or idempotent design</td></tr>
+<tr><th>Typical use</th><td>Telemetry, UDP game state</td><td>Queues, webhooks, notifications that tolerate a repeat</td><td>Payments, orders, balances, inventory</td></tr>
+</tbody></table></div>
+
+<h2 id="retries-duplicate">Why retries create duplicates</h2>
+<p>From the client's point of view, three very different failures look identical. The request may have been lost on the way in, the server may have crashed halfway through, or the work may be done and only the response lost. All three end in the same timeout.</p>
+
+<figure class="fig" data-steps data-step="3">
+<div class="fig-frame">
+<svg viewBox="0 0 720 320" role="img" aria-label="Three failure cases for a charge request: request lost, server crashes mid-way, response lost. In every case the client sees a timeout; when the response was lost, the retry charges the card a second time">
+<rect class="n client" x="60" y="16" width="120" height="36" rx="7"/><text class="t sm b mid" x="120" y="39">Mobile app</text>
+<rect class="n svc" x="410" y="16" width="120" height="36" rx="7"/><text class="t sm b mid" x="470" y="39">Payments API</text>
+<path class="line faint" d="M120,52 V272 M470,52 V272" style="stroke-dasharray:3 4"/>
+<text class="t sm b" x="575" y="39">card charged</text>
+
+<g data-show="1"><path class="e red" d="M120,90 H283"/><circle class="n bad" cx="295" cy="90" r="10"/><text class="t b red mid" x="295" y="95">×</text>
+<text class="t mono mid" x="200" y="83">POST /charges</text>
+<text class="t xs red" x="310" y="94">packet dropped</text>
+<text class="t mono" x="575" y="130">0 times</text></g>
+<g data-show="2 3"><path class="e" d="M120,90 H466"/><text class="t mono mid" x="200" y="83">POST /charges</text></g>
+<g data-show="2"><rect class="n bad" x="420" y="112" width="100" height="26" rx="5"/><text class="t xs mid" x="470" y="129">crash mid-charge</text>
+<text class="t mono" x="575" y="130">0 or 1 times?</text></g>
+<g data-show="3"><rect class="n good" x="420" y="112" width="100" height="26" rx="5"/><text class="t xs mid" x="470" y="129">charge card</text>
+<text class="t mono" x="575" y="130">1 time</text>
+<path class="e dash red" d="M470,165 H307"/><circle class="n bad" cx="295" cy="165" r="10"/><text class="t b red mid" x="295" y="170">×</text>
+<text class="t mono mid" x="390" y="158">201 Created</text></g>
+
+<text class="t sm red end" x="112" y="204">timeout</text>
+<text class="t xs mute end" x="112" y="219">after 10 s</text>
+<path class="e dash accent" d="M120,235 H466"/><text class="t mono accent mid" x="295" y="228">retry: POST /charges</text>
+<g data-show="1"><rect class="n good" x="420" y="246" width="100" height="26" rx="5"/><text class="t xs mid" x="470" y="263">charge card</text><text class="t mono green" x="575" y="263">1 time: fine</text></g>
+<g data-show="2"><rect class="n good" x="420" y="246" width="100" height="26" rx="5"/><text class="t xs mid" x="470" y="263">charge card</text><text class="t mono red" x="575" y="263">1 or 2 times</text></g>
+<g data-show="3"><rect class="n bad" x="420" y="246" width="100" height="26" rx="5"/><text class="t xs mid" x="470" y="263">charge card</text><text class="t mono red" x="575" y="263">2 times</text></g>
+
+<text class="t sm b mid" x="360" y="298">The client sees the same timeout in all three cases.</text>
+<text class="t sm mute mid" x="360" y="316" data-show="1">Request lost: nothing happened, so the retry is exactly right.</text>
+<text class="t sm mute mid" x="360" y="316" data-show="2">Crash: the client cannot know whether the charge went through.</text>
+<text class="t sm red mid" x="360" y="316" data-show="3">Response lost: the work is done, and the retry does it again.</text>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="false">Request lost</button><button type="button" data-step="2" aria-pressed="false">Server crashes</button><button type="button" data-step="3" aria-pressed="true">Response lost</button></div>
+</div>
+<figcaption><b>Three failures, one symptom.</b> Because the client cannot tell which case it is in, the only safe client behaviour is to retry, and the only way to make that retry harmless is on the server.</figcaption>
+</figure>
+
+<p>Not retrying is not an option either: then the "request lost" case silently drops the payment. The fix has to make the third case behave like the first, which means the server must recognise the retry as the same operation it already performed.</p>
+
+<h2 id="natural-idempotency">Naturally idempotent operations</h2>
+<p>Some operations are idempotent by their nature, and the cheapest fix is to design APIs and handlers out of those. HTTP itself defines <code>GET</code>, <code>HEAD</code>, <code>PUT</code>, <code>DELETE</code> and <code>OPTIONS</code> as idempotent methods, which is why proxies and clients may retry them automatically; <code>POST</code> and <code>PATCH</code> are not guaranteed to be.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Operation</th><th>Idempotent?</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td><code>SET balance = 120</code>, <code>PUT /users/42/email</code></td><td class="yes">Yes</td><td>Assigning a value twice leaves the same value</td></tr>
+<tr><td><code>DELETE /carts/77/items/3</code></td><td class="yes">Yes, in effect</td><td>Second delete finds nothing; it may return 404, but state is the same</td></tr>
+<tr><td><code>INSERT ... ON CONFLICT (order_id) DO NOTHING</code></td><td class="yes">Yes</td><td>The natural key makes the second insert a no-op</td></tr>
+<tr><td><code>UPDATE ... SET status='SHIPPED' WHERE status='PACKED'</code></td><td class="yes">Yes</td><td>A conditional state transition only fires once</td></tr>
+<tr><td><code>balance = balance + 10</code></td><td class="no">No</td><td>Each run adds another 10</td></tr>
+<tr><td><code>POST /charges</code>, <code>POST /orders</code></td><td class="no">No</td><td>Each call creates a new resource</td></tr>
+<tr><td>Append to a list, send an email or SMS</td><td class="no">No</td><td>Each call has a new visible effect</td></tr>
+</tbody></table></div>
+<p>Three techniques convert the "No" rows into "Yes":</p>
+<ul>
+<li><strong>Use a natural or client-supplied identifier.</strong> Let the client choose the order id (<code>PUT /orders/ord_7f3a</code>) so a retry targets the same resource instead of creating a new one.</li>
+<li><strong>Turn deltas into conditional writes.</strong> Instead of "add 10 points", write "apply event <code>evt_88</code> if not yet applied", or use an optimistic version check: <code>UPDATE accounts SET balance = 130, version = 8 WHERE id = 42 AND version = 7</code>. A retry finds version 8 and changes nothing.</li>
+<li><strong>Attach an idempotency key</strong> when neither is possible, for example when the operation calls a third party. That is the general mechanism, covered next.</li>
+</ul>
+
+<h2 id="idempotency-keys">Idempotency keys</h2>
+<p>An <dfn>idempotency key</dfn> is a unique value the client generates for one logical operation and sends with every attempt of it, usually as an HTTP header: <code>Idempotency-Key: 8e0f2b6c-4a1d-4c55-9f3e-2b7d91c0a6e4</code>. The server records the key with the outcome of the first attempt. A later attempt with the same key gets the recorded outcome instead of running again.</p>
+
+<h3 id="key-rules">Client-side rules</h3>
+<ul>
+<li><strong>One key per operation, not per attempt.</strong> Generate it before the first attempt and reuse it for every retry. A new key per retry defeats the whole mechanism.</li>
+<li><strong>Persist it if the client can restart.</strong> A checkout page that reloads should reuse the key stored with the cart, otherwise a crash-and-retry still double charges.</li>
+<li><strong>Use enough randomness.</strong> A UUIDv4 (122 random bits) makes accidental collisions between clients irrelevant. The server scopes keys per account anyway, so one client cannot replay another's result.</li>
+</ul>
+
+<h3 id="key-storage">Server-side storage</h3>
+<p>The server keeps a table keyed by account and idempotency key. Along with the stored response it keeps a <dfn>request fingerprint</dfn>, a hash of the method, path and body, so it can detect a client that mistakenly reuses a key for a different request.</p>
+<pre><code class="language-sql">CREATE TABLE idempotency_keys (
+  account_id     text         NOT NULL,
+  idem_key       text         NOT NULL,
+  request_hash   bytea        NOT NULL,   -- sha256 of method + path + canonical body
+  state          text         NOT NULL,   -- 'started' | 'done'
+  response_code  int,
+  response_body  jsonb,
+  locked_at      timestamptz,             -- for detecting abandoned 'started' rows
+  created_at     timestamptz  NOT NULL DEFAULT now(),
+  PRIMARY KEY (account_id, idem_key)
+);
+
+-- Claim the key. Exactly one concurrent request gets a row back.
+INSERT INTO idempotency_keys (account_id, idem_key, request_hash, state, locked_at)
+VALUES ('acct_42', '8e0f2b6c-4a1d-4c55-9f3e-2b7d91c0a6e4', '\x9c1f...', 'started', now())
+ON CONFLICT (account_id, idem_key) DO NOTHING
+RETURNING idem_key;</code></pre>
+<p>The primary key is what makes concurrent duplicates safe. Two requests with the same key that arrive at the same millisecond on two different servers both try the <code>INSERT</code>; the database lets exactly one succeed. The loser reads the existing row and responds according to its state.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 320" role="img" aria-label="Idempotency key sequence in four cases: first request claims the key, charges and stores the response; a retry gets the stored response; a concurrent duplicate gets 409; reusing a key with a different body gets 422">
+<rect class="n client" x="25" y="16" width="110" height="36" rx="7"/><text class="t sm b mid" x="80" y="39">Client</text>
+<rect class="n svc" x="235" y="16" width="110" height="36" rx="7"/><text class="t sm b mid" x="290" y="39">Payments API</text>
+<rect class="n db" x="425" y="16" width="110" height="36" rx="7"/><text class="t sm b mid" x="480" y="39">Key table</text>
+<rect class="n ext" x="595" y="16" width="110" height="36" rx="7"/><text class="t sm b mid" x="650" y="39">Card network</text>
+<path class="line faint" d="M80,52 V272 M290,52 V272 M480,52 V272 M650,52 V272" style="stroke-dasharray:3 4"/>
+
+<g data-show="1"><text class="t mono mid" x="185" y="83">POST, key 8e0f</text></g>
+<g data-show="2"><text class="t mono accent mid" x="185" y="83">retry, key 8e0f</text></g>
+<g data-show="3"><text class="t mono accent mid" x="185" y="83">duplicate, key 8e0f</text></g>
+<g data-show="4"><text class="t mono red mid" x="185" y="83">key 8e0f, $99.00</text></g>
+<path class="e" d="M80,90 H286"/>
+<path class="e" d="M290,120 H476"/><text class="t mono mid" x="385" y="113">INSERT (key, hash)</text>
+
+<g data-show="1"><path class="e dash green" d="M480,148 H294"/><text class="t mono green mid" x="385" y="141">ok: new row</text>
+<path class="e" d="M290,178 H646"/><text class="t mono mid" x="565" y="171">charge $29.99</text>
+<path class="e dash" d="M650,204 H294"/><text class="t mono mid" x="565" y="197">ch_1</text>
+<path class="e" d="M290,232 H476"/><text class="t mono mid" x="385" y="225">UPDATE done + resp</text>
+<path class="e green" d="M286,260 H84"/><text class="t mono green mid" x="185" y="253">201 ch_1</text>
+<text class="t sm mid" x="360" y="296">First attempt: claim the key, do the work once, store the response next to the key.</text></g>
+
+<g data-show="2"><path class="e dash" d="M480,148 H294"/><text class="t mono mid" x="385" y="141">conflict: done</text>
+<text class="t xs mute mid" x="650" y="182">not called</text>
+<path class="e green" d="M286,260 H84"/><text class="t mono green mid" x="185" y="253">201 ch_1 (replay)</text>
+<text class="t sm mid" x="360" y="296">Retry after a lost response: same key, same hash, state done. Return the stored response.</text></g>
+
+<g data-show="3"><path class="e dash" d="M480,148 H294"/><text class="t mono mid" x="385" y="141">conflict: started</text>
+<text class="t xs mute mid" x="650" y="182">not called</text>
+<path class="e red" d="M286,178 H84"/><text class="t mono red mid" x="185" y="171">409 in progress</text>
+<text class="t sm mid" x="360" y="296">A duplicate arrives while the first is still running. Refuse it; the client retries after a backoff.</text></g>
+
+<g data-show="4"><path class="e dash" d="M480,148 H294"/><text class="t mono red mid" x="385" y="141">conflict: hash differs</text>
+<text class="t xs mute mid" x="650" y="182">not called</text>
+<path class="e red" d="M286,178 H84"/><text class="t mono red mid" x="185" y="171">422 key reused</text>
+<text class="t sm mid" x="360" y="296">Same key, different body: a client bug. Never replay a response that belongs to another request.</text></g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">First request</button><button type="button" data-step="2" aria-pressed="false">Retry</button><button type="button" data-step="3" aria-pressed="false">Concurrent duplicate</button><button type="button" data-step="4" aria-pressed="false">Different body</button></div>
+</div>
+<figcaption><b>The idempotency key lifecycle.</b> The <code>INSERT</code> on a primary key is the lock: exactly one attempt gets to call the card network. Every other attempt is answered from the key table.</figcaption>
+</figure>
+
+<h3 id="key-edge-cases">The hard cases</h3>
+<ul>
+<li><strong>Crash while <code>started</code>.</strong> If the server dies after claiming the key, the row stays <code>started</code> and every retry gets 409 forever. Store <code>locked_at</code> and let a retry take over a row older than, say, 60 seconds. Taking over is only safe if the work itself can be resumed or repeated safely, which leads to the next point.</li>
+<li><strong>External side effects.</strong> If the key row and the charge live in the same database, update both in one transaction and the problem disappears. When the side effect is a call to another system, pass an idempotency key derived from yours (for example <code>8e0f...:charge</code>) to that system, so a takeover that repeats the call is deduplicated downstream. Stripe-style implementations break a request into <dfn>atomic phases</dfn>, each committed with a <em>recovery point</em> on the key row, so a retry resumes from the last completed phase.</li>
+<li><strong>Which responses to store.</strong> Store the result of any request that started executing, including server errors, because a retry should not run a half-done operation again. Do not store results of requests rejected before doing anything, such as validation failures or a 409 for concurrency, so the client can fix and retry with the same key.</li>
+<li><strong>Expiry.</strong> Keys cannot be kept forever. Stripe removes keys after they are at least 24 hours old, which comfortably exceeds any sensible retry window. After expiry the key is treated as new, so clients must not retry for longer than the retention period.</li>
+</ul>
+
+<h3 id="key-middleware">A middleware simulation</h3>
+<p>Idempotency belongs in shared middleware rather than in each handler. The sketch below wraps a charge handler, simulates a client whose first response is lost, then shows a duplicate that arrives mid-request and a key reused with a different body.</p>
+<pre><code class="language-python">import hashlib
+import json
+import time
+import uuid
+
+charges = []   # the side effect we must never duplicate
+
+
+def create_charge(body):
+    charges.append(body["amount"])
+    return 201, {"id": f"ch_{len(charges)}", "amount": body["amount"]}
+
+
+class KeyStore:
+    """Stands in for a table with PRIMARY KEY (account_id, idem_key)."""
+
+    def __init__(self, ttl=24 * 3600):
+        self.rows, self.ttl = {}, ttl
+
+    def insert_if_absent(self, k, fingerprint):          # INSERT ... ON CONFLICT DO NOTHING
+        row = self.rows.get(k)
+        if row and row["expires_at"] &gt; time.time():
+            return False
+        self.rows[k] = {"fp": fingerprint, "state": "started", "response": None,
+                        "expires_at": time.time() + self.ttl}
+        return True
+
+
+store = KeyStore()
+
+
+def idempotent(handler):
+    def wrapped(account, key, body):
+        if key is None:
+            return handler(body)
+        fp = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+        k = (account, key)
+        if store.insert_if_absent(k, fp):                 # we won the race: do the work once
+            try:
+                response = handler(body)
+            except Exception:
+                del store.rows[k]                         # simplification: assumes the handler failed before any side effect; otherwise store the 5xx (as Stripe does)
+                raise
+            store.rows[k].update(state="done", response=response)
+            return response
+        row = store.rows[k]
+        if row["fp"] != fp:
+            return 422, {"error": "idempotency key reused with a different request"}
+        if row["state"] == "started":
+            return 409, {"error": "original request still in progress, retry later"}
+        return row["response"]                            # replay the stored response
+    return wrapped
+
+
+def client_with_retries(api, body, use_key, lose_first_response=True):
+    key = str(uuid.uuid4()) if use_key else None          # one key per logical operation, reused on retry
+    for attempt in (1, 2, 3):
+        code, resp = api("acct_42", key, body)
+        if lose_first_response and attempt == 1:
+            continue                                      # server did the work; the client saw a timeout
+        return attempt, code, resp
+
+
+raw = lambda account, key, body: create_charge(body)
+safe = idempotent(create_charge)
+
+print("no key:  ", client_with_retries(raw, {"amount": 2999}, use_key=False), "charges:", charges)
+charges.clear()
+print("with key:", client_with_retries(safe, {"amount": 2999}, use_key=True), "charges:", charges)
+
+
+# A duplicate that arrives while the first request is still running
+def slow_charge(body):
+    print("  duplicate during processing -&gt;", api("acct_42", "k-77", body))
+    return create_charge(body)
+
+
+api = idempotent(slow_charge)
+print("first:   ", api("acct_42", "k-77", {"amount": 500}))
+print("reused:  ", api("acct_42", "k-77", {"amount": 900}))
+print("charges: ", charges)
+
+# no key:   (2, 201, {'id': 'ch_2', 'amount': 2999}) charges: [2999, 2999]
+# with key: (2, 201, {'id': 'ch_1', 'amount': 2999}) charges: [2999]
+#   duplicate during processing -&gt; (409, {'error': 'original request still in progress, retry later'})
+# first:    (201, {'id': 'ch_2', 'amount': 500})
+# reused:   (422, {'error': 'idempotency key reused with a different request'})
+# charges:  [2999, 500]</code></pre>
+<p>Without a key the lost response turns into a second charge (<code>[2999, 2999]</code>). With a key the retry receives <code>ch_1</code>, the response of the first attempt, and the card is charged once. In production the <code>KeyStore</code> is the SQL table above, and the <code>update(state="done")</code> is committed in the same transaction as the business write whenever the two share a database.</p>
+
+<h2 id="consumer-dedup">Deduplicating in consumers</h2>
+<p>Message consumers face the same problem from the other side. A consumer reads message <code>m-1043</code>, adds 300 loyalty points, and crashes before acknowledging. The broker redelivers <code>m-1043</code> to another consumer. Every at-least-once queue behaves this way (<a href="message-queues.html">Message Queues</a>, <a href="event-streaming.html">Pub/Sub &amp; Event Streaming</a>), and so does the <a href="distributed-transactions.html#outbox">transactional outbox</a> relay that publishes events.</p>
+<p>The standard fix is a <dfn>processed-messages table</dfn> (also called an inbox) written <strong>in the same database transaction</strong> as the consumer's own state change.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 250" role="img" aria-label="A queue delivers message m-1043 twice to a consumer; the consumer inserts the message id into processed_messages and updates loyalty_points in one transaction, so the duplicate insert fails and the points are added once">
+<rect class="n queue" x="20" y="84" width="150" height="62" rx="8"/><text class="t b mid" x="95" y="109">order-events</text><text class="t mono mid" x="95" y="130">m-1043 (again)</text>
+<rect class="n svc" x="240" y="84" width="130" height="62" rx="8"/><text class="t b mid" x="305" y="109">Points</text><text class="t xs mute mid" x="305" y="127">consumer</text>
+<path class="e" d="M170,115 H236"/>
+<text class="t xs mute mid" x="95" y="168">redelivered after a</text><text class="t xs mute mid" x="95" y="182">crash before the ack</text>
+<rect class="n db" x="440" y="20" width="260" height="190" rx="10"/><text class="t b mid" x="570" y="42">points DB</text>
+<rect class="zone" x="455" y="54" width="230" height="142" rx="8"/><text class="t xs mute mid" x="570" y="72">one transaction</text>
+<rect class="n" x="470" y="84" width="200" height="40" rx="6"/><text class="t mono mid" x="570" y="102">processed_messages</text><text class="t xs mute mid" x="570" y="116">PK message_id</text>
+<rect class="n" x="470" y="140" width="200" height="40" rx="6"/><text class="t mono mid" x="570" y="158">loyalty_points</text><text class="t xs mute mid" x="570" y="172">balance += 300</text>
+<path class="e" d="M370,106 C410,106 425,104 466,104"/>
+<path class="e" d="M370,126 C410,126 425,160 466,160"/>
+<text class="t sm mid" x="360" y="236">Second delivery: the INSERT hits the primary key, the transaction rolls back, and the points are added only once.</text>
+</svg>
+</div>
+<figcaption><b>Inbox deduplication.</b> Recording "I processed m-1043" and applying its effect must commit together. If they were separate writes, a crash between them would recreate the problem the table is meant to solve.</figcaption>
+</figure>
+
+<pre><code class="language-sql">BEGIN;
+INSERT INTO processed_messages (message_id, processed_at) VALUES ('m-1043', now());
+-- a duplicate fails here with a unique violation: ROLLBACK, then ack the message
+UPDATE loyalty_points SET balance = balance + 300 WHERE customer_id = 'cus_88';
+COMMIT;
+-- ack the message only after COMMIT</code></pre>
+<p>Practical details:</p>
+<ul>
+<li><strong>Ack after commit, never before.</strong> Acking first turns a crash into a lost message (at-most-once).</li>
+<li><strong>The message id must be stable.</strong> Use an id assigned by the producer (the outbox <code>event_id</code>), not a broker-assigned delivery id that changes on redelivery.</li>
+<li><strong>Bound the table.</strong> Delete ids older than the longest possible redelivery delay (for example 7 days, matching topic retention). With Kafka, a single partition is consumed in order, so a consumer can instead store the last processed offset per partition in the same transaction and skip anything at or below it.</li>
+<li><strong>Prefer idempotent effects when you can.</strong> If the event says "order <code>ord_1002</code> is now SHIPPED, version 5", an upsert that applies it only when <code>version &gt; current_version</code> needs no dedup table at all, and also handles events arriving out of order.</li>
+<li><strong>When the effect is not in your database</strong> (sending an email, calling an API), you cannot commit both atomically. Pass the message id as an idempotency key downstream, or accept a small chance of a duplicate email.</li>
+</ul>
+
+<h2 id="kafka-exactly-once">Kafka's idempotent producer and transactions</h2>
+<p>Kafka shows how effectively-once is built into infrastructure. The producer-to-broker hop has the same lost-ack problem: a producer sends a batch, the broker appends it, the ack is lost, the producer retries, and the log contains the batch twice.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 220" role="img" aria-label="A Kafka producer with producer id 7 sends sequence 42, the ack is lost, and it retries sequence 42; the broker sees the sequence was already appended at offset 103 and acknowledges without appending again">
+<rect class="n svc" x="20" y="56" width="130" height="104" rx="8"/><text class="t b mid" x="85" y="98">Producer</text><text class="t mono mid" x="85" y="118">PID 7</text>
+<path class="e" d="M150,78 H256"/><text class="t mono mid" x="203" y="70">seq=42</text>
+<path class="e dash red" d="M256,108 H154"/><text class="t sm red mid" x="203" y="101">ack lost</text>
+<path class="e accent" d="M150,140 H256"/><text class="t mono accent mid" x="203" y="133">retry seq=42</text>
+<rect class="zone" x="260" y="24" width="440" height="160" rx="10"/>
+<text class="t b" x="280" y="50">Partition 0 leader</text>
+<text class="t mono" x="460" y="50">last seq for PID 7: 42</text>
+<text class="t xs mute" x="280" y="80">offset</text>
+<g>
+<rect class="n" x="330" y="88" width="64" height="40" rx="5"/><text class="t mono mid" x="362" y="113">100</text>
+<rect class="n" x="400" y="88" width="64" height="40" rx="5"/><text class="t mono mid" x="432" y="113">101</text>
+<rect class="n svc" x="470" y="88" width="64" height="40" rx="5"/><text class="t mono mid" x="502" y="106">102</text><text class="t xs mute mid" x="502" y="120">PID 7 s41</text>
+<rect class="n svc" x="540" y="88" width="64" height="40" rx="5"/><text class="t mono mid" x="572" y="106">103</text><text class="t xs mute mid" x="572" y="120">PID 7 s42</text>
+<rect class="n ghost" x="610" y="88" width="64" height="40" rx="5"/><text class="t xs mute mid" x="642" y="113">not written</text>
+</g>
+<text class="t sm" x="330" y="156">Retry of seq 42 is a duplicate: ack it, do not append.</text>
+<text class="t sm mute mid" x="360" y="210">The broker keeps the last sequence numbers per producer per partition, so retries are free of duplicates.</text>
+</svg>
+</div>
+<figcaption><b>Idempotent producer.</b> The same idea as an idempotency key, with the key being the pair (producer id, sequence number). It is on by default in modern Kafka clients.</figcaption>
+</figure>
+
+<ul>
+<li><strong>Idempotent producer</strong> (<code>enable.idempotence=true</code>, the default since Kafka 3.0): each producer gets a producer id, and each batch per partition carries an increasing sequence number. The broker rejects sequences it has already appended. This removes duplicates caused by producer retries within a producer session.</li>
+<li><strong>Transactions</strong> extend this to read-process-write pipelines. A stream processor consumes from topic A, writes results to topic B, and commits its consumer offsets, all in one Kafka transaction. Consumers with <code>isolation.level=read_committed</code> never see output from aborted transactions. That is Kafka's "exactly-once semantics".</li>
+<li><strong>The boundary.</strong> These guarantees hold only while data stays inside Kafka. The moment a consumer writes to PostgreSQL or calls a payment API, you are back to idempotent consumers and dedup tables.</li>
+</ul>
+
+<h2 id="tradeoffs">Choosing a technique</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Technique</th><th>Where it lives</th><th>Cost</th><th>Use when</th></tr></thead>
+<tbody>
+<tr><th>Naturally idempotent design</th><td>API and data model</td><td class="yes">None at runtime</td><td>You control the operation: PUT with client ids, conditional or versioned updates</td></tr>
+<tr><th>Idempotency key table</th><td>API server</td><td class="meh">One extra write per request, storage for 24 h or more</td><td>Non-idempotent POSTs, especially money and orders</td></tr>
+<tr><th>Processed-messages table</th><td>Consumer's database</td><td class="meh">One insert per message, periodic cleanup</td><td>At-least-once consumers that change state</td></tr>
+<tr><th>Stored offset / version check</th><td>Consumer's database</td><td class="yes">One column</td><td>Ordered partitions, or events carrying versions</td></tr>
+<tr><th>Broker-level dedup</th><td>Kafka producer, SQS FIFO</td><td class="yes">Configuration</td><td>Duplicates introduced by the producer-to-broker hop only</td></tr>
+</tbody></table></div>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+<li><strong>Stripe</strong>: every <code>POST</code> accepts an <code>Idempotency-Key</code> header. Stripe saves the status code and body of the first request that started executing for that key, returns the same result for retries (including server errors), rejects reuse of a key with different parameters, and prunes keys once they are at least 24 hours old. Its official client libraries generate keys and retry automatically.</li>
+<li><strong>Apache Kafka</strong>: the idempotent producer and transactions (introduced in 0.11 through KIP-98) provide effectively-once processing inside Kafka; Kafka Streams turns it on with one setting, <code>processing.guarantee=exactly_once_v2</code>.</li>
+<li><strong>Amazon SQS FIFO queues</strong>: deduplicate messages with the same deduplication id sent within a 5-minute window. Messages sent outside that window are not deduplicated, so consumers still need their own protection.</li>
+<li><strong>AWS EC2</strong>: <code>RunInstances</code> takes a <code>ClientToken</code>, so a retried launch request does not start a second fleet of instances.</li>
+<li><strong>IETF</strong>: the <code>Idempotency-Key</code> HTTP header is being standardised by the HTTPAPI working group, codifying what payment APIs already do.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>Any time your design has retries, a queue, or money. Say it proactively when you draw a payment or order API ("clients send an idempotency key; we store it with the response for 24 hours") and when you draw a consumer ("delivery is at-least-once, so the consumer records processed message ids in the same transaction"). It also comes up in <a href="api-design.html">API design</a> and in the <a href="notification-system.html">notification system</a> case.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>Is exactly-once delivery possible? No; explain the lost-ack ambiguity and effectively-once processing.</li>
+<li>Two requests with the same key arrive concurrently. What happens? Unique constraint, one wins, the other gets 409 or waits.</li>
+<li>The server crashes after charging but before saving the response. Then what? Same transaction where possible; otherwise recovery points and downstream idempotency keys.</li>
+<li>How long do you keep keys, and what happens after? Longer than the client's retry window; after expiry a retry is a new request.</li>
+<li>How do you make a counter increment idempotent? Record the event id, or convert it to a versioned conditional write.</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>"We use Kafka, so it's exactly-once" for a consumer that writes to an external database.</li>
+<li>Checking for a key with a <code>SELECT</code> and then inserting it, without a unique constraint: two concurrent duplicates both pass the check.</li>
+<li>Generating a new idempotency key on every retry.</li>
+<li>Acknowledging a message before the state change commits.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://docs.stripe.com/api/idempotent_requests" target="_blank" rel="noopener">Stripe API reference: Idempotent requests</a><span>The canonical production design: key header, stored responses, parameter checks and 24-hour retention.</span></li>
+<li><a href="https://brandur.org/idempotency-keys" target="_blank" rel="noopener">Implementing Stripe-like Idempotency Keys in Postgres</a><span>Brandur Leach, 2017. Atomic phases, recovery points and handling foreign side effects, with full SQL.</span></li>
+<li><a href="https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/" target="_blank" rel="noopener">The Idempotency-Key HTTP Header Field</a><span>IETF HTTPAPI working group draft standardising the header and its error responses.</span></li>
+<li><a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging" target="_blank" rel="noopener">KIP-98: Exactly Once Delivery and Transactional Messaging</a><span>The Kafka design for idempotent producers and transactions.</span></li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9110#name-idempotent-methods" target="_blank" rel="noopener">RFC 9110: HTTP Semantics, Idempotent Methods</a><span>Which HTTP methods are idempotent by definition, and why that permits automatic retries.</span></li>
+</ul>

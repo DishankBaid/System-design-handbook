@@ -1,0 +1,590 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">An API is the one part of a system you cannot quietly change. Once a mobile app version, a partner's batch job or another team's service depends on a response shape, that shape is a promise. Internal code can be refactored on a Tuesday afternoon; a published API carries its mistakes for years, because some client still running a 2023 build will break the day you fix them.</p>
+<p>API design is two jobs: choosing a style (REST, gRPC or GraphQL) that fits who calls you, and getting the cross-cutting contracts right from day one: paging, errors, safe retries, slow work, and growth without breakage.</p>
+
+<h2 id="rest">REST: resources and a uniform interface</h2>
+<p><dfn>REST</dfn> (Representational State Transfer) models the API as a set of <strong>resources</strong>, each with a URL, manipulated through the small fixed set of HTTP methods. The URL names a thing; the method says what to do with it.</p>
+<pre><code class="language-http">GET    /v1/users/42                 read one user
+GET    /v1/users/42/posts?limit=20  list a user's posts
+POST   /v1/users/42/posts           create a post (server assigns the id)
+PUT    /v1/posts/9817               replace post 9817 entirely
+PATCH  /v1/posts/9817               change some fields of post 9817
+DELETE /v1/posts/9817               delete it</code></pre>
+<p>Resource names are plural nouns, ids are opaque strings, and nesting stops at one level (<code>/users/42/posts</code>, not <code>/users/42/posts/9817/comments/3/likes</code>). Actions that do not map onto a noun, such as "cancel this order", become either a state change (<code>PATCH /orders/7 {"status": "cancelled"}</code>) or a sub-resource (<code>POST /orders/7/cancellation</code>). Google's guidelines also allow a custom verb, <code>POST /orders/7:cancel</code>.</p>
+
+<h3 id="methods">Safe and idempotent methods</h3>
+<p>HTTP defines two properties per method that clients, proxies and retry libraries rely on. A <dfn>safe</dfn> method does not change server state, so crawlers and prefetchers may call it freely. An <dfn>idempotent</dfn> method has the same effect whether it is applied once or ten times, so a client that timed out can simply send it again.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Method</th><th>Safe</th><th>Idempotent</th><th>Why</th></tr></thead>
+<tbody>
+<tr><th><code>GET</code>, <code>HEAD</code></th><td class="yes">Yes</td><td class="yes">Yes</td><td>Reads only</td></tr>
+<tr><th><code>PUT</code></th><td class="no">No</td><td class="yes">Yes</td><td>"Set post 9817 to this": the second identical PUT changes nothing</td></tr>
+<tr><th><code>DELETE</code></th><td class="no">No</td><td class="yes">Yes</td><td>The post stays deleted; a repeat may return 404, but the state is the same</td></tr>
+<tr><th><code>POST</code></th><td class="no">No</td><td class="no">No</td><td>"Create a post": two calls create two posts</td></tr>
+<tr><th><code>PATCH</code></th><td class="no">No</td><td class="meh">Depends</td><td><code>{"title": "x"}</code> is idempotent; <code>{"op": "increment"}</code> is not</td></tr>
+</tbody></table></div>
+<p>This table is why payment and order creation, which are POSTs, need <a href="#idempotency-keys">idempotency keys</a>: they are exactly the calls you most want to retry and least want to duplicate.</p>
+
+<h3 id="status-codes">Status codes that carry meaning</h3>
+<p>Clients branch on the status code before they read the body, so pick codes that tell them what to do next. The classes are the important part: <code>2xx</code> done, <code>4xx</code> the client must change something before retrying, <code>5xx</code> the server failed and a retry may work.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Code</th><th>Use it for</th><th>Client should</th></tr></thead>
+<tbody>
+<tr><th>200 / 204</th><td>Success with / without a body</td><td>Proceed</td></tr>
+<tr><th>201 Created</th><td>POST created a resource; include <code>Location</code></td><td>Store the new id</td></tr>
+<tr><th>202 Accepted</th><td>Work queued, not done (see <a href="#long-running">long-running operations</a>)</td><td>Poll or wait for a callback</td></tr>
+<tr><th>400 / 422</th><td>Malformed request / well-formed but fails validation</td><td>Fix input; do not retry as is</td></tr>
+<tr><th>401 / 403</th><td>Not authenticated / authenticated but not allowed</td><td>Refresh credentials / give up</td></tr>
+<tr><th>404</th><td>No such resource (also used to hide ones the caller may not see)</td><td>Give up</td></tr>
+<tr><th>409 / 412</th><td>Conflicts with current state / <code>If-Match</code> version check failed</td><td>Re-read, merge, retry</td></tr>
+<tr><th>429</th><td>Rate limited; include <code>Retry-After</code></td><td>Back off, then retry</td></tr>
+<tr><th>500 / 502 / 503 / 504</th><td>Bug / bad upstream / overloaded or down / upstream timeout</td><td>Retry with backoff if the method is idempotent</td></tr>
+</tbody></table></div>
+<p>The classic mistake is returning <code>200 {"success": false}</code>. Every load balancer, retry library, dashboard and alert keys off the status code, and all of them now think the call worked.</p>
+
+<h2 id="grpc">gRPC: typed RPC over HTTP/2</h2>
+<p><dfn>gRPC</dfn> drops the resource model and exposes <strong>methods</strong>. You describe services and messages in a <code>.proto</code> file, and a compiler generates client stubs and server interfaces in each language. Calling a remote service looks like calling a local function, with types checked at compile time on both sides.</p>
+<pre><code class="language-protobuf">syntax = "proto3";
+
+service UserService {
+  rpc GetUser(GetUserRequest) returns (User);                       // unary
+  rpc WatchPosts(WatchPostsRequest) returns (stream Post);          // server streaming
+  rpc UploadEvents(stream ClickEvent) returns (UploadSummary);      // client streaming
+  rpc Chat(stream ChatMessage) returns (stream ChatMessage);        // bidirectional
+}
+
+message User {
+  int64  id        = 1;
+  string name      = 2;
+  string email     = 3;
+  int64  followers = 4;
+  reserved 5;            // was "phone"; the number is never reused
+}</code></pre>
+
+<h3 id="protobuf">Protobuf on the wire</h3>
+<p><dfn>Protocol Buffers</dfn> encode each field as a field number plus a value, not as a field name. Small integers become one or two bytes (varints) and strings are length-prefixed. Encoding <code>{id: 42, name: "Ada Lovelace", email: "ada@example.com", followers: 18422}</code> by hand gives <strong>37 bytes</strong> of protobuf against <strong>75 bytes</strong> of compact JSON, and parsing binary fields is far cheaper than parsing text. The field numbers are the contract: renaming a field is free, but changing or reusing a number silently corrupts data for old clients, which is why removed fields are marked <code>reserved</code>.</p>
+
+<h3 id="grpc-streaming">HTTP/2 and the four call types</h3>
+<p>gRPC runs on <a href="network-protocols.html">HTTP/2</a>, where every call is a stream multiplexed over one long-lived TCP connection. That makes streaming a first-class feature: the proto above shows all four shapes. Unary is ordinary request/response. Server streaming suits feeds and watch APIs, client streaming suits uploads of many small events, and bidirectional streaming suits chat or live collaboration.</p>
+<p>The long-lived connection has a cost that bites in production. A layer-4 load balancer balances <em>connections</em>, so once a client has opened its one connection, every request goes to the same backend, and new backends get no traffic. gRPC needs request-level balancing: an L7 proxy such as Envoy, or client-side balancing over a list from <a href="service-discovery.html">service discovery</a>. See <a href="load-balancing.html">Load Balancing</a>.</p>
+
+<h3 id="deadlines">Deadlines</h3>
+<p>Every gRPC call should carry a <dfn>deadline</dfn>: an absolute time by which the caller stops caring. It travels in the <code>grpc-timeout</code> header, and a well-behaved server passes the <em>remaining</em> time on to the calls it makes downstream. If the user-facing request has 300 ms left and the first hop used 120 ms, the second hop gets 180 ms, not a fresh timeout of its own. When time runs out every service in the chain stops work for that request and returns <code>DEADLINE_EXCEEDED</code>. Most gRPC libraries set no deadline by default, which means a stuck backend holds the caller's resources forever. Always set one. <a href="fault-tolerance.html">Timeouts, Retries &amp; Circuit Breakers</a> covers the budgeting.</p>
+<p>Browsers cannot speak raw gRPC (page JavaScript cannot read HTTP/2 trailers), so browser clients need gRPC-Web and a translating proxy. In practice gRPC dominates service-to-service traffic.</p>
+
+<h2 id="graphql">GraphQL: the client chooses the shape</h2>
+<p><dfn>GraphQL</dfn> exposes one endpoint and a typed schema of the whole data graph. The client sends a query naming exactly the fields it wants, nested as deeply as the schema allows, and gets back JSON in the same shape. Facebook built it in 2012 for its mobile apps, where one screen needed data from many resources and every round trip on a phone network was expensive.</p>
+<pre><code class="language-graphql">type User { id: ID!  name: String!  email: String  posts(first: Int, after: String): PostConnection! }
+type Post { id: ID!  title: String!  author: User! }
+type Query { user(id: ID!): User }
+
+# the client's query
+query ProfileCard {
+  user(id: "42") {
+    name
+    posts(first: 3) { edges { node { title } } }
+  }
+}</code></pre>
+
+<h3 id="resolvers">Resolvers and the N+1 problem</h3>
+<p>The server executes a query by calling a <dfn>resolver</dfn> function per field. <code>user</code> has a resolver that loads a user; <code>posts</code> has a resolver that loads the posts of whichever user it is given. This composes nicely and hides a trap. A query for 10 users with their posts runs the users resolver once and then the posts resolver <strong>once per user</strong>: 11 database queries. A list of 100 users with posts and each post's comments can fan out into thousands.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 280" role="img" aria-label="Left: ten posts resolvers each send their own query to the database, eleven queries in total. Right: the same ten resolvers hand their keys to DataLoader, which sends one batched query, two queries in total">
+<text class="t b" x="30" y="24">Naive resolvers</text><text class="t xs mute" x="30" y="40">one query per parent</text>
+<rect class="n svc" x="30" y="56" width="300" height="34" rx="7"/>
+<text class="t xs mute" x="38" y="77">posts()</text>
+<text class="t xs mono mid" x="93" y="77">u1</text>
+<text class="t xs mono mid" x="117" y="77">u2</text>
+<text class="t xs mono mid" x="141" y="77">u3</text>
+<text class="t xs mono mid" x="165" y="77">u4</text>
+<text class="t xs mono mid" x="189" y="77">u5</text>
+<text class="t xs mono mid" x="213" y="77">u6</text>
+<text class="t xs mono mid" x="237" y="77">u7</text>
+<text class="t xs mono mid" x="261" y="77">u8</text>
+<text class="t xs mono mid" x="285" y="77">u9</text>
+<text class="t xs mono mid" x="309" y="77">u10</text>
+<rect class="n db" x="110" y="196" width="160" height="40" rx="7"/><text class="t sm b mid" x="190" y="220">posts table</text>
+<path class="e red" d="M93,94 L122.0,190" style="stroke-width:1"/>
+<path class="e red" d="M117,94 L137.5,190" style="stroke-width:1"/>
+<path class="e red" d="M141,94 L153.0,190" style="stroke-width:1"/>
+<path class="e red" d="M165,94 L168.5,190" style="stroke-width:1"/>
+<path class="e red" d="M189,94 L184.0,190" style="stroke-width:1"/>
+<path class="e red" d="M213,94 L199.5,190" style="stroke-width:1"/>
+<path class="e red" d="M237,94 L215.0,190" style="stroke-width:1"/>
+<path class="e red" d="M261,94 L230.5,190" style="stroke-width:1"/>
+<path class="e red" d="M285,94 L246.0,190" style="stroke-width:1"/>
+<path class="e red" d="M309,94 L261.5,190" style="stroke-width:1"/>
+<text class="t sm red mid" x="190" y="262">1 query for users + 10 for posts = 11</text>
+<text class="t b" x="390" y="24">With DataLoader</text><text class="t xs mute" x="390" y="40">collect keys, one batched query</text>
+<rect class="n svc" x="390" y="56" width="300" height="34" rx="7"/>
+<text class="t xs mute" x="398" y="77">posts()</text>
+<text class="t xs mono mid" x="453" y="77">u1</text>
+<text class="t xs mono mid" x="477" y="77">u2</text>
+<text class="t xs mono mid" x="501" y="77">u3</text>
+<text class="t xs mono mid" x="525" y="77">u4</text>
+<text class="t xs mono mid" x="549" y="77">u5</text>
+<text class="t xs mono mid" x="573" y="77">u6</text>
+<text class="t xs mono mid" x="597" y="77">u7</text>
+<text class="t xs mono mid" x="621" y="77">u8</text>
+<text class="t xs mono mid" x="645" y="77">u9</text>
+<text class="t xs mono mid" x="669" y="77">u10</text>
+<rect class="n cache" x="460" y="126" width="180" height="34" rx="7"/><text class="t sm b mid" x="550" y="147">DataLoader</text>
+<path class="e" d="M453,94 L478,121" style="stroke-width:1"/>
+<path class="e" d="M477,94 L494,121" style="stroke-width:1"/>
+<path class="e" d="M501,94 L510,121" style="stroke-width:1"/>
+<path class="e" d="M525,94 L526,121" style="stroke-width:1"/>
+<path class="e" d="M549,94 L542,121" style="stroke-width:1"/>
+<path class="e" d="M573,94 L558,121" style="stroke-width:1"/>
+<path class="e" d="M597,94 L574,121" style="stroke-width:1"/>
+<path class="e" d="M621,94 L590,121" style="stroke-width:1"/>
+<path class="e" d="M645,94 L606,121" style="stroke-width:1"/>
+<path class="e" d="M669,94 L622,121" style="stroke-width:1"/>
+<rect class="n db" x="470" y="196" width="160" height="40" rx="7"/><text class="t sm b mid" x="550" y="220">posts table</text>
+<path class="e green" d="M550,160 V191"/>
+<text class="t mono" x="560" y="181">author_id IN (1..10)</text>
+<text class="t sm green mid" x="550" y="262">1 query for users + 1 for posts = 2</text>
+<path class="line faint" d="M360,20 V270" style="stroke-dasharray:4 4"/>
+</svg>
+</div>
+<figcaption><b>N+1 queries and DataLoader.</b> Each <code>posts()</code> resolver asks for one user's posts. DataLoader collects the keys requested during one execution tick and turns them into a single <code>IN (...)</code> query, then hands each resolver its own slice of the result.</figcaption>
+</figure>
+
+<p>The standard fix is <strong>DataLoader</strong>, a small batching and per-request caching layer. Resolvers call <code>loader.load(userId)</code> instead of querying directly. The loader waits until the current tick of execution finishes, sends one batched query for every id requested, and resolves each promise with its own rows. Query count drops from 1 + N to 1 + 1 per level of nesting.</p>
+
+<h3 id="persisted-queries">Caching, cost and persisted queries</h3>
+<p>Letting clients write arbitrary queries creates problems REST does not have:</p>
+<ul>
+<li><strong>HTTP caching is lost.</strong> Queries are usually POSTs to <code>/graphql</code>, so CDNs and browser caches see nothing cacheable. Caching moves into the client (normalized caches like Apollo's) and the server's data loaders.</li>
+<li><strong>Cost is unbounded.</strong> One deeply nested query can do more work than a thousand REST calls. Servers enforce depth limits and compute a <em>query cost</em> from the shape before running it; GitHub and Shopify rate-limit their GraphQL APIs by points derived from that cost rather than by request count.</li>
+<li><strong>Persisted queries</strong> address both. With trusted (persisted) documents, the client registers its queries at build time and at runtime sends only an id or hash. Apollo's automatic persisted queries (a SHA-256 of the query text, registered at runtime on first use) give the same bandwidth and caching benefit but no allowlist, because any query can register itself. Requests become small, can go over GET and hit a CDN, and the server can refuse any query not on its allowlist, which shuts the door on expensive ad-hoc queries from attackers.</li>
+</ul>
+<p>Note that a GraphQL response is often <code>200 OK</code> with partial <code>data</code> plus an <code>errors</code> array, so monitoring that watches only status codes misses failures.</p>
+
+<h2 id="compare">Same request, three styles</h2>
+<p>A profile card needs a user's name and the titles of their three latest posts. Step through how each style fetches it.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 360" role="img" aria-label="Sequence diagram: REST needs two requests returning fixed shapes; GraphQL needs one query naming the fields; gRPC calls one typed method returning a binary message">
+<rect class="n client" x="30" y="16" width="100" height="36" rx="7"/><text class="t sm b mid" x="80" y="39">Mobile app</text>
+<rect class="n svc" x="270" y="16" width="140" height="36" rx="7"/>
+<text class="t sm b mid" x="340" y="39" data-show="1">REST API</text>
+<text class="t sm b mid" x="340" y="39" data-show="2">GraphQL server</text>
+<text class="t sm b mid" x="340" y="39" data-show="3">gRPC server</text>
+<rect class="n db" x="560" y="16" width="120" height="36" rx="7"/><text class="t sm b mid" x="620" y="39">Users, Posts</text>
+<path class="line faint" d="M80,52 V280 M340,52 V280 M620,52 V280" style="stroke-dasharray:3 4"/>
+
+<g data-show="1">
+<path class="e" d="M80,90 H336"/><text class="t mono mid" x="210" y="83">GET /users/42</text>
+<path class="e both" d="M344,112 H616"/><text class="t sm mute mid" x="480" y="105">read user row</text>
+<path class="e dash" d="M340,140 H84"/><text class="t sm mid" x="210" y="133">200 · every user field</text>
+<path class="e" d="M80,185 H336"/><text class="t mono mid" x="210" y="178">GET /users/42/posts?limit=3</text>
+<path class="e both" d="M344,207 H616"/><text class="t sm mute mid" x="480" y="200">read post rows</text>
+<path class="e dash" d="M340,235 H84"/><text class="t sm mid" x="210" y="228">200 · 3 full posts with bodies</text>
+<text class="t sm mid" x="360" y="315">REST: two requests, each returning a fixed shape. The app downloads</text>
+<text class="t sm mid" x="360" y="335">every field and post body to show one name and three titles.</text>
+</g>
+
+<g data-show="2">
+<path class="e" d="M80,90 H336"/><text class="t mono mid" x="210" y="83">POST /graphql</text>
+<path class="e both" d="M344,115 H616"/><text class="t sm mute mid" x="480" y="108">user resolver</text>
+<path class="e both" d="M344,145 H616"/><text class="t sm mute mid" x="480" y="138">posts resolver</text>
+<path class="e dash green" d="M340,175 H84"/><text class="t sm mid" x="210" y="168">200 · name + 3 titles, nothing else</text>
+<rect class="n" x="20" y="196" width="270" height="88" rx="7"/>
+<text class="t mono" x="34" y="217">{ user(id: "42") {</text>
+<text class="t mono" style="white-space:pre" x="34" y="235">    name</text>
+<text class="t mono" style="white-space:pre" x="34" y="253">    posts(first: 3) { edges {</text>
+<text class="t mono" style="white-space:pre" x="34" y="271">      node { title } } } } }</text>
+<text class="t sm mid" x="360" y="315">GraphQL: one round trip, and the client names the fields it wants.</text>
+<text class="t sm mid" x="360" y="335">The server runs one resolver per field, which is where N+1 hides.</text>
+</g>
+
+<g data-show="3">
+<path class="e" d="M80,90 H336"/><text class="t mono mid" x="210" y="83">GetUserWithPosts(42)</text>
+<text class="t xs mute mid" x="210" y="106">HTTP/2 stream, protobuf</text>
+<path class="e both" d="M344,120 H616"/><text class="t sm mute mid" x="480" y="113">read user</text>
+<path class="e both" d="M344,148 H616"/><text class="t sm mute mid" x="480" y="141">read posts</text>
+<path class="e dash green" d="M340,178 H84"/><text class="t sm mid" x="210" y="171">UserWithPosts, binary</text>
+<rect class="n" x="20" y="198" width="290" height="52" rx="7"/>
+<text class="t mono" x="34" y="219">rpc GetUserWithPosts(GetUserRequest)</text>
+<text class="t mono" style="white-space:pre" x="34" y="237">    returns (UserWithPosts);</text>
+<text class="t sm mid" x="360" y="315">gRPC: one call to a method built for this need, typed stubs on</text>
+<text class="t sm mid" x="360" y="335">both sides, and a binary payload about half the size of JSON.</text>
+</g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">REST</button><button type="button" data-step="2" aria-pressed="false">GraphQL</button><button type="button" data-step="3" aria-pressed="false">gRPC</button></div>
+</div>
+<figcaption><b>One screen, three contracts.</b> REST spreads the data over generic resources; GraphQL lets the caller compose them; gRPC gives the caller a purpose-built method. Each choice moves the work to a different place.</figcaption>
+</figure>
+
+<p>None of these is free. REST can add <code>?fields=name&amp;embed=posts</code> to curb over-fetching. GraphQL moves composition to the server, which then needs batching and cost limits. gRPC's purpose-built method couples the API to one screen.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>REST</th><th>gRPC</th><th>GraphQL</th></tr></thead>
+<tbody>
+<tr><th>Model</th><td>Resources + HTTP methods</td><td>Methods on services</td><td>Typed graph + queries</td></tr>
+<tr><th>Payload</th><td>JSON, usually</td><td class="yes">Protobuf, compact binary</td><td>JSON</td></tr>
+<tr><th>Contract</th><td class="meh">OpenAPI, optional</td><td class="yes">.proto, required, code-generated</td><td class="yes">Schema, required, introspectable</td></tr>
+<tr><th>Response shape</th><td>Server decides</td><td>Server decides, per method</td><td class="yes">Client decides</td></tr>
+<tr><th>HTTP caching</th><td class="yes">Native: GET, ETags, CDNs</td><td class="no">None</td><td class="meh">Only with persisted GET queries</td></tr>
+<tr><th>Streaming</th><td class="meh">Via SSE or WebSockets</td><td class="yes">Built in, four modes</td><td class="meh">Subscriptions, usually over WebSockets</td></tr>
+<tr><th>Browsers</th><td class="yes">Everywhere</td><td class="no">Needs gRPC-Web proxy</td><td class="yes">Everywhere</td></tr>
+<tr><th>Debugging</th><td class="yes">curl and a browser</td><td class="meh">Needs tooling (grpcurl)</td><td class="yes">Explorer UIs from the schema</td></tr>
+<tr><th>Best fit</th><td>Public APIs, CRUD, cacheable reads</td><td>Internal service-to-service, low latency, streaming</td><td>Many client types over many backends</td></tr>
+</tbody></table></div>
+<p>A common and defensible answer in interviews: <strong>REST or GraphQL at the edge, gRPC inside.</strong> Public clients get a familiar, cacheable, browser-friendly API; internal calls get typed contracts, small payloads and deadlines.</p>
+
+<h2 id="pagination">Pagination</h2>
+<p>Any endpoint that returns a list must be paged from the first release, with a default and a maximum page size (say 20 and 100). Adding paging later is a breaking change, and an unpaged list is a denial-of-service waiting for the table to grow.</p>
+
+<h3 id="offset">Offset pagination and why it degrades</h3>
+<pre><code class="language-sql">-- GET /posts?limit=20&amp;offset=100000
+SELECT id, created_at, title
+FROM posts
+ORDER BY created_at DESC, id DESC
+LIMIT 20 OFFSET 100000;</code></pre>
+<p>Offset is easy to build and lets the UI jump to page 5,000. It has two problems. First, <strong>the database cannot skip rows it has not read</strong>. Even with an index on the sort columns, it walks 100,020 index entries and throws 100,000 away, so page 5,001 costs about 5,000 times as much as page 1. Second, <strong>pages shift under concurrent writes</strong>. If a new post arrives between the client fetching page 1 and page 2, every row moves down one place, and the last row of page 1 shows up again at the top of page 2. A deletion does the opposite and a row is silently skipped.</p>
+
+<h3 id="keyset">Keyset (cursor) pagination</h3>
+<p><dfn>Keyset pagination</dfn>, also called seek pagination, remembers <em>where the previous page ended</em> instead of how many rows came before. The next query asks for rows strictly after that point in sort order:</p>
+<pre><code class="language-sql">-- index: CREATE INDEX posts_feed ON posts (created_at, id);
+-- GET /posts?limit=20&amp;cursor=eyJjIjoxNzAxMDAwMDAxLCJpIjo5ODgxfQ
+SELECT id, created_at, title
+FROM posts
+WHERE (created_at, id) &lt; (1701000001, 9881)   -- last row of the previous page
+ORDER BY created_at DESC, id DESC
+LIMIT 20;</code></pre>
+<p>The database seeks straight to the cursor position in the B-tree and reads 20 entries, whatever the page number. The <code>id</code> tiebreaker matters: <code>created_at</code> alone is not unique, and two posts in the same second would be skipped or repeated at a page boundary. The sort key must be unique, and every column in it must be in the index in the same order.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 300" role="img" aria-label="Two strips of 24 index entries sorted newest first. OFFSET 12 LIMIT 4 reads entries 1 to 16 and discards the first 12. Keyset pagination seeks directly to the entry after the cursor and reads only entries 13 to 16">
+<text class="t xs mute" x="40" y="18">index on (created_at DESC, id DESC): newest first</text>
+<text class="t sm b" x="40" y="44">OFFSET 12 LIMIT 4</text><text class="t sm mute" x="182" y="44">walks 16 entries, returns 4</text>
+<rect class="n bad" x="40" y="56" width="24" height="28" rx="4"/><text class="t xs mute mid" x="52" y="74">1</text>
+<rect class="n bad" x="67" y="56" width="24" height="28" rx="4"/><text class="t xs mute mid" x="79" y="74">2</text>
+<rect class="n bad" x="94" y="56" width="24" height="28" rx="4"/><text class="t xs mute mid" x="106" y="74">3</text>
+<rect class="n bad" x="121" y="56" width="24" height="28" rx="4"/><text class="t xs mute mid" x="133" y="74">4</text>
+<rect class="n bad" x="148" y="56" width="24" height="28" rx="4"/><text class="t xs mute mid" x="160" y="74">5</text>
+<rect class="n bad" x="175" y="56" width="24" height="28" rx="4"/><text class="t xs mute mid" x="187" y="74">6</text>
+<rect class="n bad" x="202" y="56" width="24" height="28" rx="4"/><text class="t xs mute mid" x="214" y="74">7</text>
+<rect class="n bad" x="229" y="56" width="24" height="28" rx="4"/><text class="t xs mute mid" x="241" y="74">8</text>
+<rect class="n bad" x="256" y="56" width="24" height="28" rx="4"/><text class="t xs mute mid" x="268" y="74">9</text>
+<rect class="n bad" x="283" y="56" width="24" height="28" rx="4"/><text class="t xs mute mid" x="295" y="74">10</text>
+<rect class="n bad" x="310" y="56" width="24" height="28" rx="4"/><text class="t xs mute mid" x="322" y="74">11</text>
+<rect class="n bad" x="337" y="56" width="24" height="28" rx="4"/><text class="t xs mute mid" x="349" y="74">12</text>
+<rect class="n good" x="364" y="56" width="24" height="28" rx="4"/><text class="t xs mute mid" x="376" y="74">13</text>
+<rect class="n good" x="391" y="56" width="24" height="28" rx="4"/><text class="t xs mute mid" x="403" y="74">14</text>
+<rect class="n good" x="418" y="56" width="24" height="28" rx="4"/><text class="t xs mute mid" x="430" y="74">15</text>
+<rect class="n good" x="445" y="56" width="24" height="28" rx="4"/><text class="t xs mute mid" x="457" y="74">16</text>
+<rect class="n " x="472" y="56" width="24" height="28" rx="4"/><text class="t xs mute mid" x="484" y="74">17</text>
+<rect class="n " x="499" y="56" width="24" height="28" rx="4"/><text class="t xs mute mid" x="511" y="74">18</text>
+<rect class="n " x="526" y="56" width="24" height="28" rx="4"/><text class="t xs mute mid" x="538" y="74">19</text>
+<rect class="n " x="553" y="56" width="24" height="28" rx="4"/><text class="t xs mute mid" x="565" y="74">20</text>
+<rect class="n " x="580" y="56" width="24" height="28" rx="4"/><text class="t xs mute mid" x="592" y="74">21</text>
+<rect class="n " x="607" y="56" width="24" height="28" rx="4"/><text class="t xs mute mid" x="619" y="74">22</text>
+<rect class="n " x="634" y="56" width="24" height="28" rx="4"/><text class="t xs mute mid" x="646" y="74">23</text>
+<rect class="n " x="661" y="56" width="24" height="28" rx="4"/><text class="t xs mute mid" x="673" y="74">24</text>
+<path class="e red" d="M40,96 H469" style="stroke-width:1.2"/>
+<text class="t xs red mid" x="200.5" y="112">12 entries read, then thrown away</text>
+<text class="t xs green mid" x="416.5" y="112">returned</text>
+<text class="t sm b" x="40" y="148">WHERE (created_at, id) &lt; cursor LIMIT 4</text>
+<rect class="n ghost" x="40" y="196" width="24" height="28" rx="4"/><text class="t xs mute mid" x="52" y="214">1</text>
+<rect class="n ghost" x="67" y="196" width="24" height="28" rx="4"/><text class="t xs mute mid" x="79" y="214">2</text>
+<rect class="n ghost" x="94" y="196" width="24" height="28" rx="4"/><text class="t xs mute mid" x="106" y="214">3</text>
+<rect class="n ghost" x="121" y="196" width="24" height="28" rx="4"/><text class="t xs mute mid" x="133" y="214">4</text>
+<rect class="n ghost" x="148" y="196" width="24" height="28" rx="4"/><text class="t xs mute mid" x="160" y="214">5</text>
+<rect class="n ghost" x="175" y="196" width="24" height="28" rx="4"/><text class="t xs mute mid" x="187" y="214">6</text>
+<rect class="n ghost" x="202" y="196" width="24" height="28" rx="4"/><text class="t xs mute mid" x="214" y="214">7</text>
+<rect class="n ghost" x="229" y="196" width="24" height="28" rx="4"/><text class="t xs mute mid" x="241" y="214">8</text>
+<rect class="n ghost" x="256" y="196" width="24" height="28" rx="4"/><text class="t xs mute mid" x="268" y="214">9</text>
+<rect class="n ghost" x="283" y="196" width="24" height="28" rx="4"/><text class="t xs mute mid" x="295" y="214">10</text>
+<rect class="n ghost" x="310" y="196" width="24" height="28" rx="4"/><text class="t xs mute mid" x="322" y="214">11</text>
+<rect class="n ghost" x="337" y="196" width="24" height="28" rx="4"/><text class="t xs mute mid" x="349" y="214">12</text>
+<rect class="n good" x="364" y="196" width="24" height="28" rx="4"/><text class="t xs mute mid" x="376" y="214">13</text>
+<rect class="n good" x="391" y="196" width="24" height="28" rx="4"/><text class="t xs mute mid" x="403" y="214">14</text>
+<rect class="n good" x="418" y="196" width="24" height="28" rx="4"/><text class="t xs mute mid" x="430" y="214">15</text>
+<rect class="n good" x="445" y="196" width="24" height="28" rx="4"/><text class="t xs mute mid" x="457" y="214">16</text>
+<rect class="n ghost" x="472" y="196" width="24" height="28" rx="4"/><text class="t xs mute mid" x="484" y="214">17</text>
+<rect class="n ghost" x="499" y="196" width="24" height="28" rx="4"/><text class="t xs mute mid" x="511" y="214">18</text>
+<rect class="n ghost" x="526" y="196" width="24" height="28" rx="4"/><text class="t xs mute mid" x="538" y="214">19</text>
+<rect class="n ghost" x="553" y="196" width="24" height="28" rx="4"/><text class="t xs mute mid" x="565" y="214">20</text>
+<rect class="n ghost" x="580" y="196" width="24" height="28" rx="4"/><text class="t xs mute mid" x="592" y="214">21</text>
+<rect class="n ghost" x="607" y="196" width="24" height="28" rx="4"/><text class="t xs mute mid" x="619" y="214">22</text>
+<rect class="n ghost" x="634" y="196" width="24" height="28" rx="4"/><text class="t xs mute mid" x="646" y="214">23</text>
+<rect class="n ghost" x="661" y="196" width="24" height="28" rx="4"/><text class="t xs mute mid" x="673" y="214">24</text>
+<path class="e accent" d="M46,192 C100,170 284,170 372,192"/>
+<text class="t xs accent mid" x="222.0" y="168">index seek, O(log n)</text>
+<path class="line" d="M362.5,188 V232" style="stroke:var(--accent);stroke-width:2"/>
+<text class="t xs accent end" x="356.5" y="248">cursor = last entry of the previous page</text>
+<text class="t xs green mid" x="416.5" y="248">returned</text>
+<text class="t xs mute" x="472" y="248">never touched</text>
+<text class="t xs mute mid" x="360" y="284">Cost of OFFSET grows with page depth. Cost of the keyset query depends only on page size.</text>
+</svg>
+</div>
+<figcaption><b>Offset walks, keyset seeks.</b> To return entries 13 to 16, OFFSET reads all 16 and discards 12. The keyset query descends the B-tree to the cursor and reads only the 4 it returns. At page 1 they cost the same; at page 50,000 they do not.</figcaption>
+</figure>
+
+<p>The script below measures both on a one-million-row SQLite table with the right index, and then reproduces the duplicate-row bug.</p>
+<pre><code class="language-python">import sqlite3
+import time
+
+db = sqlite3.connect(":memory:")
+db.execute("CREATE TABLE posts (id INTEGER PRIMARY KEY, created_at INTEGER, title TEXT)")
+db.executemany("INSERT INTO posts VALUES (?, ?, ?)",
+               ((i, 1_700_000_000 + i, f"post {i}") for i in range(1, 1_000_001)))
+db.execute("CREATE INDEX posts_feed ON posts (created_at, id)")
+
+OFFSET = "SELECT created_at, id FROM posts ORDER BY created_at DESC, id DESC LIMIT 20 OFFSET ?"
+KEYSET = ("SELECT created_at, id FROM posts WHERE (created_at, id) &lt; (?, ?) "
+          "ORDER BY created_at DESC, id DESC LIMIT 20")
+
+
+def best_us(sql, args):
+    times = []
+    for _ in range(5):
+        t = time.perf_counter()
+        rows = db.execute(sql, args).fetchall()
+        times.append(time.perf_counter() - t)
+    return min(times) * 1e6, rows
+
+
+for skip in (20, 10_000, 100_000, 900_000):
+    cursor = db.execute(OFFSET.replace("20 OFFSET", "1 OFFSET"), (skip - 1,)).fetchone()
+    off_us, rows = best_us(OFFSET, (skip,))
+    key_us, same = best_us(KEYSET, cursor)   # cursor = last row of the previous page
+    assert rows == same
+    print(f"skip {skip:&gt;7,}: OFFSET {off_us:8.0f} us   keyset {key_us:4.0f} us")
+
+# Offset pages shift when a row is inserted between two requests
+page1 = db.execute(OFFSET, (0,)).fetchall()
+db.execute("INSERT INTO posts VALUES (1000001, 1701000001, 'new post')")
+page2 = db.execute(OFFSET, (20,)).fetchall()
+print("duplicate across pages:", set(page1) &amp; set(page2))
+page2_keyset = db.execute(KEYSET, page1[-1]).fetchall()
+print("keyset duplicates:", set(page1) &amp; set(page2_keyset))
+
+# One run on a laptop:
+# skip      20: OFFSET        3 us   keyset    3 us
+# skip  10,000: OFFSET       31 us   keyset    3 us
+# skip 100,000: OFFSET      275 us   keyset    3 us
+# skip 900,000: OFFSET     2605 us   keyset    3 us
+# duplicate across pages: {(1700999981, 999981)}
+# keyset duplicates: set()</code></pre>
+<p>Offset cost grows linearly with depth, nearly 900 times slower at row 900,000 than at the start, while keyset stays flat. This is a small table held entirely in memory; on a real database where the skipped entries come off disk and compete with other queries, deep offsets turn into multi-second queries that a scraper can trigger on purpose.</p>
+
+<h3 id="cursors">Designing the cursor</h3>
+<ul>
+<li><strong>Make it opaque.</strong> Encode the sort values as base64 JSON (<code>{"c":1701000001,"i":9881}</code>) and return it as <code>next_cursor</code>. Clients must not parse it, which leaves you free to change what is inside. Sign or encrypt it if it would reveal anything sensitive.</li>
+<li><strong>Bind it to the query.</strong> A cursor issued for <code>sort=-created_at&amp;status=open</code> is meaningless for another sort. Include them in it, or reject mismatches with 400.</li>
+<li><strong>Signal the end</strong> with a missing or null <code>next_cursor</code>, not with a short page. Skip <code>total_count</code> unless the product needs it: an exact <code>COUNT(*)</code> over a large filtered set costs more than the page itself.</li>
+<li><strong>Accept the trade.</strong> Keyset cannot jump to page 5,000. That suits feeds, infinite scroll and exports; admin tables with numbered pages can keep offset with a capped depth.</li>
+</ul>
+
+<h2 id="filtering">Filtering and sorting</h2>
+<p>Keep the grammar flat and boring: one query parameter per filter, explicit ranges and a single <code>sort</code> parameter with a minus sign for descending.</p>
+<pre><code class="language-http">GET /v1/orders?status=open&amp;created_after=2026-10-01T00:00:00Z&amp;sort=-created_at&amp;limit=50</code></pre>
+<p>The important rule is server-side: <strong>only allow filters and sorts that an index supports.</strong> Each allowed combination is a query plan you have committed to keep fast forever. When users genuinely need free-form search, give them a separate search endpoint backed by a search engine; see <a href="search.html">Search &amp; Inverted Indexes</a>.</p>
+
+<h2 id="versioning">Versioning</h2>
+<p>Most API changes should not need a new version at all (see <a href="#evolution">evolution rules</a>). Versions exist for the rare change that cannot be made additive. The strategies differ in where the version lives and how often it changes.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Strategy</th><th>Example</th><th>Strength</th><th>Weakness</th></tr></thead>
+<tbody>
+<tr><th>URL path</th><td><code>/v1/orders</code>, <code>/v2/orders</code></td><td class="yes">Visible, easy to route and to cache</td><td>Coarse: a whole new surface for one breaking change</td></tr>
+<tr><th>Header / media type</th><td><code>Accept: application/vnd.shop.v2+json</code></td><td>Clean URLs; versions per representation</td><td class="meh">Invisible in logs and links; easy to forget</td></tr>
+<tr><th>Date-pinned</th><td><code>Stripe-Version: 2024-06-20</code></td><td class="yes">Small, frequent changes; each account stays on its version until it upgrades</td><td>Server must translate between every supported version</td></tr>
+<tr><th>None (evolve only)</th><td>GraphQL with <code>@deprecated</code></td><td class="yes">One schema; usage data shows when a field can go</td><td>Needs discipline and field-level usage tracking</td></tr>
+</tbody></table></div>
+<p>Stripe's model is worth knowing: every account is pinned to the API version current when it made its first call, and the latest code internally runs a chain of small "version change" transformations to produce each older shape. GitHub's REST API uses a dated header too (<code>X-GitHub-Api-Version: 2022-11-28</code>). In an interview, URL major versions plus strictly additive evolution is the simple, safe answer.</p>
+<p>Whatever the scheme, retire old versions deliberately: announce a date, return <code>Deprecation</code> (RFC 9745) and <code>Sunset</code> (RFC 8594) headers on old calls, and contact the callers still using them.</p>
+
+<h2 id="errors">Error contract: problem details</h2>
+<p>Every error from every endpoint should have the same shape, so clients write one error handler. <a href="https://www.rfc-editor.org/rfc/rfc9457" target="_blank" rel="noopener">RFC 9457</a> (which replaced RFC 7807) standardizes one, served as <code>application/problem+json</code>:</p>
+<pre><code class="language-http">HTTP/1.1 422 Unprocessable Content
+Content-Type: application/problem+json
+
+{
+  "type": "https://api.shop.example/problems/insufficient-stock",
+  "title": "Not enough stock",
+  "status": 422,
+  "detail": "Only 2 units of SKU TS-0042 are available; 5 were requested.",
+  "instance": "/v1/orders/ord_7Qx2/lines/1",
+  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "available": 2
+}</code></pre>
+<ul>
+<li><code>type</code> is the stable, machine-readable identifier clients branch on. It is a URI that can point to documentation. <code>title</code> is a short human summary for that type, and <code>detail</code> explains this occurrence.</li>
+<li><strong>Extension members</strong> such as <code>available</code> carry data the client can act on, for example to offer "buy 2 instead". Validation errors usually add a list of field-level problems.</li>
+<li>Include a request or trace id, so a support ticket can be matched to logs. Never include stack traces, SQL or internal host names.</li>
+</ul>
+<p>gRPC's equivalent is a status code (<code>INVALID_ARGUMENT</code>, <code>UNAVAILABLE</code>, ...) plus structured details in the trailers; map between the two consistently at the edge.</p>
+
+<h2 id="idempotency-keys">Idempotency keys for unsafe retries</h2>
+<p>A client sends <code>POST /v1/payments</code>, the server charges the card, and the response is lost to a network blip. The client cannot tell "never arrived" from "succeeded but the reply was lost". Retrying risks a double charge; not retrying risks a lost order.</p>
+<p>The fix is an <dfn>idempotency key</dfn>: the client generates a unique value (a UUID) per logical operation and sends it as <code>Idempotency-Key: 5d1f6a0e-...</code>. The server records the key with the outcome, and a retry with the same key returns the stored response instead of charging again. Stripe popularized the pattern and an IETF draft standardizes the header. Storage, concurrent duplicates, request fingerprints and expiry are covered in <a href="idempotency.html">Idempotency &amp; Delivery Semantics</a>. For API design the rule is simple: <strong>every non-idempotent endpoint that moves money or creates something users care about accepts an idempotency key.</strong></p>
+
+<h2 id="long-running">Long-running operations</h2>
+<p>Some requests take longer than any sane HTTP timeout: exporting a year of orders, transcoding a video, provisioning a database. Holding a connection open for minutes breaks on proxy timeouts and network switches and leaves the client unsure whether the work happened. Instead, accept the work, return at once, and give the client a resource to watch.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 730 370" role="img" aria-label="Sequence diagram of an asynchronous job: the API returns 202 with a status URL, a worker updates the operation record, and the client polls until it succeeds or receives a webhook">
+<rect class="n client" x="20" y="16" width="100" height="36" rx="7"/><text class="t sm b mid" x="70" y="39">Client</text>
+<rect class="n svc" x="200" y="16" width="100" height="36" rx="7"/><text class="t sm b mid" x="250" y="39">API</text>
+<rect class="n db" x="350" y="16" width="100" height="36" rx="7"/><text class="t sm b mid" x="400" y="39">Operations</text>
+<rect class="n queue" x="480" y="16" width="100" height="36" rx="7"/><text class="t sm b mid" x="530" y="39">Job queue</text>
+<rect class="n svc" x="610" y="16" width="100" height="36" rx="7"/><text class="t sm b mid" x="660" y="39">Worker</text>
+<path class="line faint" d="M70,52 V290 M250,52 V290 M400,52 V290 M530,52 V290 M660,52 V290" style="stroke-dasharray:3 4"/>
+
+<g data-show="1">
+<path class="e" d="M70,90 H246"/><text class="t mono mid" x="160" y="83">POST /v1/exports</text>
+<path class="e" d="M250,115 H396"/><text class="t sm mid" x="325" y="108">insert op_7Qx</text>
+<path class="e" d="M250,140 H526"/><text class="t sm mid" x="465" y="133">enqueue</text>
+<path class="e dash green" d="M250,170 H74"/><text class="t sm b mid" x="160" y="163">202 Accepted</text>
+<text class="t xs mute mid" x="160" y="186">Location: /v1/operations/op_7Qx</text>
+<text class="t sm mid" x="365" y="325">The API validates, records the operation as PENDING and enqueues it.</text>
+<text class="t sm mid" x="365" y="345">It answers in milliseconds; the export has not started yet.</text>
+</g>
+
+<g data-show="2">
+<path class="e" d="M530,90 H656"/><text class="t sm mid" x="595" y="83">op_7Qx</text>
+<path class="e" d="M660,115 H404"/><text class="t sm mid" x="595" y="108">RUNNING 40%</text>
+<path class="e" d="M70,150 H246"/><text class="t sm mid" x="160" y="143">GET /v1/operations/op_7Qx</text>
+<path class="e both" d="M254,175 H396"/><text class="t sm mute mid" x="325" y="168">read</text>
+<path class="e dash" d="M250,205 H74"/><text class="t sm mid" x="160" y="198">200 RUNNING, 40%</text>
+<text class="t xs mute mid" x="160" y="221">Retry-After: 5</text>
+<text class="t sm mid" x="365" y="325">A worker picks up the job and writes progress to the operation record.</text>
+<text class="t sm mid" x="365" y="345">The client polls the status resource, spacing polls by Retry-After.</text>
+</g>
+
+<g data-show="3">
+<path class="e" d="M660,90 H404"/><text class="t sm mid" x="595" y="83">SUCCEEDED</text>
+<path class="e" d="M70,125 H246"/><text class="t sm mid" x="160" y="118">GET /v1/operations/op_7Qx</text>
+<path class="e both" d="M254,150 H396"/><text class="t sm mute mid" x="325" y="143">read</text>
+<path class="e dash" d="M250,180 H74"/><text class="t sm mid" x="160" y="173">200 SUCCEEDED</text>
+<text class="t xs mute mid" x="160" y="196">result: /v1/exports/ex_91</text>
+<path class="e" d="M70,230 H246"/><text class="t sm mid" x="160" y="223">GET /v1/exports/ex_91</text>
+<path class="e dash green" d="M250,260 H74"/><text class="t sm mid" x="160" y="253">200 with download URL</text>
+<text class="t sm mid" x="365" y="325">The operation records the outcome and links to the result,</text>
+<text class="t sm mid" x="365" y="345">or to a problem-details error if the job failed.</text>
+</g>
+
+<g data-show="4">
+<path class="e" d="M660,90 H404"/><text class="t sm mid" x="595" y="83">SUCCEEDED</text>
+<path class="e dash accent" d="M660,130 H74"/><text class="t sm accent mid" x="160" y="123">POST webhook</text>
+<text class="t xs mute mid" x="160" y="146">export.completed, op_7Qx</text>
+<path class="e dash" d="M70,175 H656"/><text class="t sm mid" x="160" y="168">200 OK</text>
+<path class="e" d="M70,220 H246"/><text class="t sm mid" x="160" y="213">GET /v1/exports/ex_91</text>
+<path class="e dash green" d="M250,250 H74"/><text class="t sm mid" x="160" y="243">200 with download URL</text>
+<text class="t sm mid" x="365" y="325">Instead of polling, the client is told. Webhooks can be lost or arrive</text>
+<text class="t sm mid" x="365" y="345">twice, so the status resource stays the source of truth.</text>
+</g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">1. Submit</button><button type="button" data-step="2" aria-pressed="false">2. Work and poll</button><button type="button" data-step="3" aria-pressed="false">3. Done</button><button type="button" data-step="4" aria-pressed="false">4. Webhook instead</button></div>
+</div>
+<figcaption><b>The 202 pattern.</b> The request that starts the work and the work itself are decoupled by a queue. The operation record is what the client watches, and what survives a worker crash: another worker picks the job up from the queue.</figcaption>
+</figure>
+
+<ul>
+<li><strong>The operation is a resource</strong> with a status (<code>PENDING</code>, <code>RUNNING</code>, <code>SUCCEEDED</code>, <code>FAILED</code>, <code>CANCELLED</code>), optional progress, creation time, and a result link or error. Google's API design guide (AIP-151) defines exactly this as an <code>Operation</code> with a <code>done</code> flag and either a <code>response</code> or an <code>error</code>.</li>
+<li><strong>Make submission idempotent.</strong> A client that loses the 202 and retries should get the same operation back, not start a second export. An idempotency key on the POST does it.</li>
+<li><strong>Allow cancellation</strong> (<code>POST /v1/operations/op_7Qx:cancel</code>) and expire finished operation records after a retention period, such as seven days.</li>
+<li><strong>Bound the polling.</strong> <code>Retry-After</code> tells well-behaved clients how long to wait; rate limits handle the rest.</li>
+</ul>
+
+<h2 id="webhooks">Webhooks</h2>
+<p>A <dfn>webhook</dfn> is an HTTP callback: when an event happens, your system POSTs it to a URL the customer registered. It is how Stripe tells merchants a payment succeeded and GitHub tells CI a branch was pushed. Design for receivers that are slow, down or malicious.</p>
+<ul>
+<li><strong>Deliver at least once.</strong> Send from a queue, retry failures with exponential backoff over hours or days, and disable endpoints that keep failing. Because retries happen, the same event can arrive twice: include a unique event id so receivers can deduplicate.</li>
+<li><strong>Do not promise order.</strong> Retries reorder events. Either include a version or timestamp so the receiver can drop stale updates, or send thin events ("invoice in_4410 changed") and let the receiver fetch the current state from the API.</li>
+<li><strong>Receivers acknowledge fast.</strong> Return 2xx as soon as the event is stored, then process it asynchronously. Slow handlers cause timeouts and therefore duplicate deliveries.</li>
+<li><strong>Sign every delivery.</strong> The receiver's URL is public, so anyone can POST to it. Sign the body plus a timestamp with a per-endpoint secret, and have receivers reject bad signatures and old timestamps.</li>
+</ul>
+<pre><code class="language-python">import hashlib
+import hmac
+import time
+
+SECRET = b"whsec_5f1c9a7e2b"     # shared once, when the customer registers the endpoint
+TOLERANCE = 300                  # seconds; rejects replays of old deliveries
+
+
+def sign(body: bytes, ts: int) -&gt; str:
+    mac = hmac.new(SECRET, f"{ts}.".encode() + body, hashlib.sha256).hexdigest()
+    return f"t={ts},v1={mac}"
+
+
+def verify(body: bytes, header: str, now: float) -&gt; bool:
+    parts = dict(p.split("=", 1) for p in header.split(","))
+    ts = int(parts["t"])
+    if abs(now - ts) &gt; TOLERANCE:
+        return False
+    expected = sign(body, ts).split("v1=")[1]
+    return hmac.compare_digest(expected, parts["v1"])   # constant-time compare
+
+
+body = b'{"id":"evt_81F","type":"invoice.paid","data":{"invoice":"in_4410"}}'
+header = sign(body, int(time.time()))
+print(verify(body, header, time.time()))                         # True
+print(verify(body.replace(b"4410", b"9999"), header, time.time()))  # False: body tampered
+print(verify(body, header, time.time() + 3600))                  # False: replayed an hour later</code></pre>
+<p>The timestamp is inside the signed bytes, so an attacker who captured one delivery cannot replay it later with a fresh timestamp. Receivers must verify the raw request bytes, not re-serialized JSON. Stripe's <code>Stripe-Signature</code> header uses this same <code>t=...,v1=...</code> layout.</p>
+
+<h2 id="evolution">Evolving an API without breaking clients</h2>
+<p>Clients are deployed on their own schedules, and some are never updated. The working rule is: <strong>only make additive changes, and make clients tolerant readers</strong> that ignore fields they do not recognize.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Change</th><th>Safe?</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Add a new endpoint or method</td><td class="yes">Safe</td><td>Nobody calls it yet</td></tr>
+<tr><td>Add an optional request field or query parameter</td><td class="yes">Safe</td><td>Old clients do not send it; the default preserves old behaviour</td></tr>
+<tr><td>Add a field to a response</td><td class="yes">Safe</td><td>Tolerant readers ignore it (strict schema validators on the client do not)</td></tr>
+<tr><td>Add a value to an enum in a response</td><td class="meh">Risky</td><td>Clients with an exhaustive <code>switch</code> crash on the unknown value; document that enums may grow</td></tr>
+<tr><td>Make an optional request field required</td><td class="no">Breaking</td><td>Old clients do not send it and now get 400</td></tr>
+<tr><td>Remove or rename a field</td><td class="no">Breaking</td><td>Clients reading it get nothing</td></tr>
+<tr><td>Change a field's type or meaning</td><td class="no">Breaking</td><td><code>"amount": 1000</code> going from cents to dollars corrupts data silently</td></tr>
+<tr><td>Change defaults, error codes, or validation strictness</td><td class="no">Breaking</td><td>Clients depend on observed behaviour, not just the documented schema</td></tr>
+</tbody></table></div>
+<p>Renaming is done by expansion and contraction: add the new field, write both, migrate clients, watch usage of the old field fall to zero, then remove it in the next major version. The same discipline appears in protobuf (never reuse a field number), in GraphQL (<code>@deprecated(reason: "...")</code> plus per-field usage metrics) and in database migrations; see <a href="data-modeling.html">Data Modeling</a>.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+<li><strong>Stripe</strong>: resource-oriented REST with date-pinned versions, idempotency keys on POSTs, cursor pagination via <code>starting_after</code> (an object id) and signed webhooks.</li>
+<li><strong>GitHub</strong>: a REST API with dated versions alongside a public GraphQL API, rate-limited by a points budget computed from each query's cost rather than by request count.</li>
+<li><strong>Google</strong>: gRPC (2015) is the open-source successor to its internal Stubby RPC. Its API Improvement Proposals codify custom methods (<code>:cancel</code>), <code>page_token</code> pagination and long-running operations.</li>
+<li><strong>Facebook and Netflix</strong>: Facebook open-sourced GraphQL in 2015. Netflix runs a federated GraphQL gateway in which each domain service owns part of the schema.</li>
+<li><strong>Slack</strong>: Web API list methods use cursor pagination, returning <code>response_metadata.next_cursor</code>.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>Every design question has an API step after requirements. Write three to five endpoints with methods, key parameters and response codes, and say which style you chose and why ("REST for the public API, gRPC between internal services"). Mention pagination and write idempotency without being asked. In the <a href="url-shortener.html">URL shortener</a> case, the 301 vs 302 choice is an API decision with product consequences.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>Why is page 10,000 slow, and how do you fix it? Offset walks and discards rows; keyset seeks to the cursor.</li>
+<li>The client timed out on a payment POST. Can it retry safely? Only with an idempotency key.</li>
+<li>REST, gRPC or GraphQL for this system? Tie the answer to the callers: browsers, mobile, internal services, third parties.</li>
+<li>How do you handle a 10-minute report? 202 Accepted, an operation resource, polling with <code>Retry-After</code> or a webhook.</li>
+<li>How do you change a response field without breaking old mobile apps? Additive change, deprecation, usage tracking, then removal.</li>
+<li>GraphQL is slow on lists. Why? N+1 resolvers; batch with DataLoader and cap query cost.</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>Verbs in REST paths (<code>/getUser</code>, <code>/createOrder</code>) and <code>200</code> responses that contain errors.</li>
+<li>List endpoints with no pagination, or offset pagination on an infinite feed.</li>
+<li>Retrying non-idempotent POSTs blindly, or no retry story at all.</li>
+<li>Holding an HTTP request open for minutes of work.</li>
+<li>Renaming fields in place and calling it a minor release.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://www.rfc-editor.org/rfc/rfc9110" target="_blank" rel="noopener">RFC 9110: HTTP Semantics</a><span>Fielding, Nottingham and Reschke, 2022. The definitions of safe and idempotent methods and of every status code used above.</span></li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9457" target="_blank" rel="noopener">RFC 9457: Problem Details for HTTP APIs</a><span>Nottingham, Wilde and Dalal, 2023. The standard error body; obsoletes RFC 7807.</span></li>
+<li><a href="https://grpc.io/docs/what-is-grpc/core-concepts/" target="_blank" rel="noopener">gRPC core concepts</a><span>Official documentation. Service definitions, the four streaming modes, deadlines and cancellation.</span></li>
+<li><a href="https://spec.graphql.org/" target="_blank" rel="noopener">GraphQL Specification</a><span>The GraphQL Foundation. Type system, execution model and how resolvers are invoked.</span></li>
+<li><a href="https://google.aip.dev/" target="_blank" rel="noopener">Google API Improvement Proposals</a><span>Google's public API design rules: resource-oriented design, pagination (AIP-158), long-running operations (AIP-151) and compatibility (AIP-180).</span></li>
+</ul>

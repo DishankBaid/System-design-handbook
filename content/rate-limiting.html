@@ -1,0 +1,430 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">A single API key sends 40,000 requests per second to your search endpoint. Maybe it is a scraper, maybe a customer's retry loop gone wrong after a deploy. Either way the database behind search saturates, latency climbs for every other customer, and the on-call engineer gets paged. A <dfn>rate limiter</dfn> caps how many requests a client can make in a period of time and rejects the rest cheaply, before they reach anything expensive.</p>
+<p>Rate limits exist for four reasons, and naming the one you care about decides where and how strictly you enforce it:</p>
+<ul>
+<li><strong>Abuse.</strong> Credential stuffing, scraping, spam sign-ups and enumeration attacks all depend on volume. A login endpoint limited to 5 attempts per minute per account makes brute force useless.</li>
+<li><strong>Fairness.</strong> In a multi-tenant system one noisy tenant should not consume capacity everyone else paid for. Limits turn shared capacity into per-tenant quotas.</li>
+<li><strong>Cost.</strong> Some requests cost real money: an SMS, a call to a paid LLM API, a GPU inference. A limit is a budget.</li>
+<li><strong>Protecting downstreams.</strong> A database that handles 30,000 queries per second falls over at 60,000. Shedding the excess with fast rejections keeps the system serving the requests it can handle, instead of timing out on all of them.</li>
+</ul>
+<p>This chapter covers the algorithms and how to enforce them across many servers. The <a href="rate-limiter-design.html">Design a Rate Limiter</a> case study builds a complete limiter service on top of these ideas.</p>
+
+<h2 id="algorithms">The five algorithms</h2>
+<p>Every algorithm answers the same question, "may this request proceed right now?", with different state and different behaviour at the edges. Throughout this section the example limit is <strong>100 requests per minute</strong> per client.</p>
+
+<h3 id="fixed-window">Fixed window counter</h3>
+<p>Divide time into fixed windows (12:00:00 to 12:00:59, 12:01:00 to 12:01:59, ...) and keep one counter per client per window. Each request increments the counter; once it passes 100 the rest of the window is rejected. The key is something like <code>rl:key_42:1739876460</code>, the window start, so old windows simply expire.</p>
+<p>It is the cheapest algorithm there is: one integer per client and one atomic increment per request. Its flaw is the window boundary. The limit is applied to each calendar window, not to <em>any</em> 60-second span, so a client can spend its full quota at the end of one window and again at the start of the next.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 250" role="img" aria-label="Fixed window boundary burst: 100 requests in the last second of window 1 and 100 in the first second of window 2, so 200 requests pass in 2 seconds">
+<rect class="zone" x="60" y="20" width="300" height="180"/>
+<rect class="zone" x="360" y="20" width="300" height="180"/>
+<text class="t b mid" x="210" y="46">window 1: 0:00 to 1:00</text>
+<text class="t sm mute mid" x="210" y="64">count 100 / 100, all allowed</text>
+<text class="t b mid" x="510" y="46">window 2: 1:00 to 2:00</text>
+<text class="t sm mute mid" x="510" y="64">count 100 / 100, all allowed</text>
+<path class="line" d="M360,20 V76 M360,112 V200" style="stroke:var(--accent);stroke-dasharray:4 3"/>
+<rect class="n bad" x="350" y="120" width="10" height="80"/>
+<rect class="n bad" x="360" y="120" width="10" height="80"/>
+<text class="t sm end" x="342" y="156">100 requests</text>
+<text class="t xs mute end" x="342" y="171">during 0:59</text>
+<text class="t sm" x="378" y="156">100 requests</text>
+<text class="t xs mute" x="378" y="171">during 1:00</text>
+<path class="line" d="M350,108 V100 H370 V108"/>
+<text class="t sm b red mid" x="360" y="92">200 in 2 s</text>
+<path class="line" d="M60,200 H660"/>
+<path class="line faint" d="M60,200 V206 M160,200 V206 M260,200 V206 M360,200 V206 M460,200 V206 M560,200 V206 M660,200 V206"/>
+<text class="t xs mono mute mid" x="60" y="220">0:30</text>
+<text class="t xs mono mute mid" x="160" y="220">0:40</text>
+<text class="t xs mono mute mid" x="260" y="220">0:50</text>
+<text class="t xs mono mute mid" x="360" y="220">1:00</text>
+<text class="t xs mono mute mid" x="460" y="220">1:10</text>
+<text class="t xs mono mute mid" x="560" y="220">1:20</text>
+<text class="t xs mono mute mid" x="660" y="220">1:30</text>
+<text class="t xs mute mid" x="360" y="242">time axis to scale: 10 px per second</text>
+</svg>
+</div>
+<figcaption><b>The boundary burst.</b> Each window sees exactly 100 requests, so neither counter trips. But the 60 seconds from 0:01 to 1:01 contain 200 requests, double the intended rate, and they arrived within two seconds.</figcaption>
+</figure>
+
+<p>Whether this matters depends on the reason for the limit. For a daily quota on a paid API, a 2x spike at midnight is harmless. For protecting a database sized for 100 requests per minute, a 200-request burst is exactly the overload you were trying to prevent.</p>
+
+<h3 id="sliding-log">Sliding window log</h3>
+<p>Store the timestamp of every accepted request, for example in a Redis sorted set. On each new request, delete timestamps older than 60 seconds, count what remains, and accept only if the count is under 100. This is exact: any 60-second span contains at most 100 accepted requests, with no boundary effect.</p>
+<p>The cost is memory proportional to the limit. A limit of 10,000 requests per hour across 1 million active users needs up to 10 billion timestamps. At 8 bytes each that is 80 GB before data-structure overhead, and a sorted set adds several times that. The log is the right choice only when limits are small (5 login attempts per 15 minutes) and exactness matters.</p>
+
+<h3 id="sliding-counter">Sliding window counter</h3>
+<p>The <dfn>sliding window counter</dfn> keeps the memory of the fixed window and gets close to the accuracy of the log. Keep two counters per client: the previous window's total and the current window's count so far. Then assume the previous window's requests were spread evenly, and count only the part of it that still overlaps the last 60 seconds:</p>
+<div class="calc">estimate = prev_count × (1 - elapsed / window) + curr_count
+allow if  estimate + 1 ≤ limit</div>
+<p>Here <code>elapsed</code> is how far we are into the current window. The weight on the previous window falls linearly from 1 at the start of the current window to 0 at its end.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 260" role="img" aria-label="Sliding window counter: previous window had 84 requests, 15 seconds into the current window with 36 requests, estimate 84 times 0.75 plus 36 equals 99">
+<path class="line" d="M135,46 V40 H435 V46" style="stroke:var(--accent)"/>
+<text class="t sm b accent mid" x="285" y="32">sliding window: the last 60 s</text>
+<rect class="n" x="60" y="70" width="300" height="60" rx="4"/>
+<rect x="135" y="70" width="225" height="60" class="fill-soft"/>
+<rect class="n svc" x="360" y="70" width="75" height="60" rx="4"/>
+<rect class="n ghost" x="435" y="70" width="225" height="60" rx="4"/>
+<text class="t b mid" x="97" y="96">25%</text>
+<text class="t xs mute mid" x="97" y="112">dropped</text>
+<text class="t b mid" x="247" y="96">previous window: 84</text>
+<text class="t sm mute mid" x="247" y="114">75% overlaps, counts as 63</text>
+<text class="t b mid" x="397" y="96">36</text>
+<text class="t xs mute mid" x="397" y="114">so far</text>
+<text class="t sm mute mid" x="547" y="104">rest of current window</text>
+<path class="line" d="M135,46 V150" style="stroke:var(--accent);stroke-dasharray:3 3"/>
+<path class="line" d="M435,46 V150" style="stroke:var(--accent)"/>
+<text class="t sm b accent" x="441" y="60">now</text>
+<path class="line" d="M60,150 H660"/>
+<path class="line faint" d="M60,150 V156 M135,150 V156 M360,150 V156 M435,150 V156 M660,150 V156"/>
+<text class="t xs mono mute mid" x="60" y="170">1:00</text>
+<text class="t xs mono mute mid" x="135" y="170">1:15</text>
+<text class="t xs mono mute mid" x="360" y="170">2:00</text>
+<text class="t xs mono mute mid" x="435" y="170">2:15</text>
+<text class="t xs mono mute mid" x="660" y="170">3:00</text>
+<text class="t mono mid" x="360" y="208">84 × (1 - 15/60) + 36  =  63 + 36  =  99</text>
+<text class="t sm mid" x="360" y="232">99 + 1 ≤ 100: allow this request. The next one sees 100 and is rejected.</text>
+</svg>
+</div>
+<figcaption><b>Weighted estimate.</b> At 2:15 the last 60 seconds cover the final 45 seconds of the previous window and the first 15 of the current one. The algorithm credits 75% of the previous count, assuming those 84 requests were evenly spread.</figcaption>
+</figure>
+
+<p>The even-spread assumption is the only source of error. If all 84 previous requests came in the first second of that window, they are no longer in the sliding window and the estimate is too strict; if they all came in the last second, it is too lenient. In practice the error is small. Cloudflare measured it on real traffic and found that only 0.003% of requests were wrongly allowed or limited compared with an exact log. Memory is two integers per client, and the state is a pair of counters that work with plain atomic increments.</p>
+
+<h3 id="token-bucket">Token bucket</h3>
+<p>The <dfn>token bucket</dfn> separates two things the window algorithms blend together: the sustained rate and the largest burst. A bucket holds up to <code>capacity</code> tokens and is refilled at <code>rate</code> tokens per second. Each request takes a token; a request that finds the bucket empty is rejected. A client that has been idle has a full bucket and can burst up to <code>capacity</code> requests at once, but over any long period it cannot exceed <code>rate</code>.</p>
+<p>No timer is needed to add tokens. Store the token count and the time of the last update; on each request, credit <code>(now - last) × rate</code> tokens, capped at capacity, then try to spend one. The state is two numbers per client.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 300" role="img" aria-label="Token bucket with capacity 5 and refill 1 token per second: full, burst of 5 drains it, a sixth request is rejected, refill restores 2 tokens">
+<rect class="n client" x="20" y="130" width="90" height="50" rx="8"/><text class="t b mid" x="65" y="160">Client</text>
+<path class="line" d="M170,110 V250 H270 V110"/>
+<path class="e" d="M220,48 V104"/>
+<text class="t sm" x="230" y="72">+1 token / s</text>
+<text class="t sm mute mid" x="220" y="272">capacity 5</text>
+<rect class="n svc" x="320" y="130" width="90" height="50" rx="8"/><text class="t b mid" x="365" y="160">API</text>
+<circle data-show="1 4" class="n cache" cx="220" cy="236" r="11"/>
+<circle data-show="1 4" class="n cache" cx="220" cy="210" r="11"/>
+<circle data-show="1" class="n cache" cx="220" cy="184" r="11"/>
+<circle data-show="1" class="n cache" cx="220" cy="158" r="11"/>
+<circle data-show="1" class="n cache" cx="220" cy="132" r="11"/>
+<circle data-show="3" class="n ghost" cx="220" cy="236" r="11"/>
+<path class="e" d="M110,155 H166"/>
+<g data-show="2 4"><path class="e green" d="M270,155 H316"/></g>
+<g data-show="3"><path class="e red" d="M166,195 C140,205 130,205 114,190"/><text class="t sm red mid" x="65" y="214">429 Too Many</text><text class="t sm red mid" x="65" y="230">Requests</text></g>
+<rect class="n" x="450" y="30" width="250" height="250" rx="10"/>
+<text class="t b" x="470" y="60" data-show="1">Idle client, bucket full</text>
+<text class="t b" x="470" y="60" data-show="2">t = 0 s: burst of 5</text>
+<text class="t b" x="470" y="60" data-show="3">t = 0.3 s: request 6</text>
+<text class="t b" x="470" y="60" data-show="4">t = 2.0 s: refilled</text>
+<path class="line faint" d="M470,74 H680"/>
+<text class="t mono" x="470" y="100" data-show="1">tokens = 5.0 / 5</text>
+<text class="t mono" x="470" y="100" data-show="2">tokens = 0.0 / 5</text>
+<text class="t mono" x="470" y="100" data-show="3">tokens = 0.3 / 5</text>
+<text class="t mono" x="470" y="100" data-show="4">tokens = 2.0 / 5</text>
+<g data-show="1"><text class="t sm" x="470" y="134">The client was quiet, so the bucket</text><text class="t sm" x="470" y="152">filled to capacity. Tokens beyond</text><text class="t sm" x="470" y="170">5 are discarded: idle time does not</text><text class="t sm" x="470" y="188">bank an unlimited burst.</text></g>
+<g data-show="2"><text class="t sm" x="470" y="134">Five requests arrive together. Each</text><text class="t sm" x="470" y="152">takes a token and passes with no</text><text class="t sm" x="470" y="170">delay. The bucket is now empty.</text></g>
+<g data-show="3"><text class="t sm" x="470" y="134">0.3 s × 1 token/s = 0.3 tokens have</text><text class="t sm" x="470" y="152">refilled, less than the 1 needed.</text><text class="t sm" x="470" y="170">Reject now, and tell the client to</text><text class="t sm" x="470" y="188">wait: Retry-After: 1.</text></g>
+<g data-show="4"><text class="t sm" x="470" y="134">Two seconds after the burst, two</text><text class="t sm" x="470" y="152">tokens are back. The next two</text><text class="t sm" x="470" y="170">requests pass. However the client</text><text class="t sm" x="470" y="188">behaves, the long-run rate is 1/s.</text></g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Full</button><button type="button" data-step="2" aria-pressed="false">Burst</button><button type="button" data-step="3" aria-pressed="false">Empty: reject</button><button type="button" data-step="4" aria-pressed="false">Refill</button></div>
+</div>
+<figcaption><b>Token bucket, capacity 5, rate 1/s.</b> Capacity controls the burst, rate controls the average. Setting capacity equal to rate × window (100 tokens, 100/60 per second) approximates "100 per minute" while still allowing a quick burst after a quiet period. A full bucket plus a minute of refill can admit up to about 200 requests in one 60-second span; the guarantee is about the long-run rate, not any single window.</figcaption>
+</figure>
+
+<p>Two parameters make the token bucket the most widely deployed algorithm: real clients are bursty (a page load fires 20 API calls at once, then nothing for a minute), and operators can tune burst and rate independently. Requests can also cost more than one token, so an expensive export endpoint can take 50 tokens while a cheap read takes 1.</p>
+
+<h3 id="leaky-bucket">Leaky bucket</h3>
+<p>The <dfn>leaky bucket</dfn> name covers two different things, and interviewers notice when you mix them up.</p>
+<ul>
+<li><strong>Leaky bucket as a queue.</strong> Requests go into a FIFO queue of fixed size. A worker drains it at a constant rate, say 2 per second. If the queue is full, new requests are dropped. The output is perfectly smooth no matter how bursty the input is. This is <em>traffic shaping</em>: requests are delayed, not just accepted or rejected.</li>
+<li><strong>Leaky bucket as a meter.</strong> A counter "leaks" at a constant rate and each request adds to it; if a request would overflow the bucket, it is rejected immediately. This version never queues, and it is mathematically equivalent to a token bucket viewed upside down (a full meter is an empty token bucket). The Generic Cell Rate Algorithm (GCRA) from ATM networks is an efficient form of it that stores a single timestamp per client.</li>
+</ul>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 30 720 345" role="img" aria-label="Twelve requests arrive at once; a token bucket of capacity 10 passes 10 immediately and rejects 2; a leaky bucket queue of size 10 draining 2 per second emits one request every half second for 4.5 seconds and drops 2">
+<text class="t b" x="20" y="96">Arrivals</text>
+<text class="t xs mute" x="20" y="112">burst at t = 0</text>
+<path class="line faint" d="M160,120 H680"/>
+<rect class="n ext" x="163" y="48" width="14" height="72"/>
+<text class="t sm" x="190" y="88">12 requests at t = 0</text>
+<text class="t b" x="20" y="206">Token bucket</text>
+<text class="t xs mute" x="20" y="222">capacity 10, 2 tokens/s</text>
+<path class="line faint" d="M160,230 H680"/>
+<rect class="n svc" x="163" y="170" width="14" height="60"/>
+<text class="t sm" x="190" y="198">10 pass at once, no added latency</text>
+<text class="t sm red" x="190" y="216">2 rejected with 429</text>
+<text class="t b" x="20" y="316">Leaky bucket</text>
+<text class="t xs mute" x="20" y="332">queue of 10, drains 2/s</text>
+<path class="line faint" d="M160,340 H680"/>
+<rect class="n db" x="163" y="334" width="14" height="6"/>
+<rect class="n db" x="213" y="334" width="14" height="6"/>
+<rect class="n db" x="263" y="334" width="14" height="6"/>
+<rect class="n db" x="313" y="334" width="14" height="6"/>
+<rect class="n db" x="363" y="334" width="14" height="6"/>
+<rect class="n db" x="413" y="334" width="14" height="6"/>
+<rect class="n db" x="463" y="334" width="14" height="6"/>
+<rect class="n db" x="513" y="334" width="14" height="6"/>
+<rect class="n db" x="563" y="334" width="14" height="6"/>
+<rect class="n db" x="613" y="334" width="14" height="6"/>
+<text class="t sm" x="163" y="300">one request every 0.5 s; the last waits 4.5 s</text>
+<text class="t sm red" x="163" y="318">2 dropped: queue full</text>
+<text class="t xs mono mute mid" x="170" y="360">0 s</text>
+<text class="t xs mono mute mid" x="270" y="360">1 s</text>
+<text class="t xs mono mute mid" x="370" y="360">2 s</text>
+<text class="t xs mono mute mid" x="470" y="360">3 s</text>
+<text class="t xs mono mute mid" x="570" y="360">4 s</text>
+<text class="t xs mono mute mid" x="670" y="360">5 s</text>
+</svg>
+</div>
+<figcaption><b>Same burst, two shapes.</b> Bar height is requests let through at that instant. The token bucket forwards the burst as a burst. The leaky queue smooths it into a constant 2 per second, which protects a fragile downstream but adds up to 4.5 s of queueing delay.</figcaption>
+</figure>
+
+<p>Use the queue form in front of something that genuinely needs a steady input rate: a third-party API with a strict per-second cap, an SMS gateway, a batch job writer. Avoid it on interactive request paths, where a request that waits 4 seconds in a queue has probably already timed out at the client.</p>
+
+<h2 id="implementation">Implementation</h2>
+<p>Three single-process limiters with an injected clock, so the behaviour is deterministic. The test replays the boundary burst from the fixed window figure: 100 requests during second 59 and 100 more during second 60, against a limit of 100 per minute.</p>
+<pre><code class="language-python">class TokenBucket:
+    """capacity = largest burst; rate = tokens added per second (the sustained limit)."""
+
+    def __init__(self, capacity, rate):
+        self.capacity, self.rate = capacity, rate
+        self.tokens, self.last = capacity, 0.0
+
+    def allow(self, now, cost=1):
+        # refill lazily: no timer, just credit the time since the last call
+        self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.rate)
+        self.last = now
+        if self.tokens &gt;= cost:
+            self.tokens -= cost
+            return True
+        return False
+
+
+class SlidingWindowCounter:
+    """limit requests per window seconds, estimated from two fixed-window counters."""
+
+    def __init__(self, limit, window):
+        self.limit, self.window = limit, window
+        self.idx, self.curr, self.prev = 0, 0, 0
+
+    def allow(self, now):
+        idx = int(now // self.window)
+        if idx != self.idx:                      # crossed into a new window
+            self.prev = self.curr if idx == self.idx + 1 else 0
+            self.curr, self.idx = 0, idx
+        elapsed = (now - idx * self.window) / self.window
+        estimate = self.prev * (1 - elapsed) + self.curr
+        if estimate + 1 &gt; self.limit:
+            return False
+        self.curr += 1                           # count only what we let through
+        return True
+
+
+class FixedWindow:
+    def __init__(self, limit, window):
+        self.limit, self.window, self.idx, self.count = limit, window, -1, 0
+
+    def allow(self, now):
+        idx = int(now // self.window)
+        if idx != self.idx:
+            self.idx, self.count = idx, 0
+        if self.count &lt; self.limit:
+            self.count += 1
+            return True
+        return False
+
+
+# Limit: 100 requests per minute. A client sends 100 requests spread over
+# 59.0-59.99 s, then 100 more over 60.0-60.99 s: 200 requests in two seconds.
+burst = [59 + i / 100 for i in range(100)] + [60 + i / 100 for i in range(100)]
+for limiter in (FixedWindow(100, 60), SlidingWindowCounter(100, 60), TokenBucket(100, 100 / 60)):
+    allowed = sum(limiter.allow(t) for t in burst)
+    print(f"{type(limiter).__name__:21} allowed {allowed} of 200")
+
+# FixedWindow           allowed 200 of 200
+# SlidingWindowCounter  allowed 101 of 200
+# TokenBucket           allowed 103 of 200</code></pre>
+<p>The fixed window lets the whole double burst through. The sliding counter allows one extra request near the end of second 60, as the previous window's weight starts to fall. The token bucket allows 100 from its full bucket plus the 3 tokens that refilled at 1.67 per second during the two seconds. All three are correct implementations; they encode different definitions of "100 per minute".</p>
+<p>Two choices in this code are policy, not mechanism. Counting only accepted requests lets a client that backs off recover quickly; counting rejected ones too punishes clients that keep hammering. And the token bucket's full initial state means a new client may burst immediately, which is usually what you want for a real user and not what you want for a brand new API key during a sign-up spam wave.</p>
+
+<h2 id="comparison">Comparing the algorithms</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Algorithm</th><th>State per client</th><th>Accuracy</th><th>Bursts</th><th>Best for</th></tr></thead>
+<tbody>
+<tr><th>Fixed window</th><td>1 counter</td><td class="no">Up to 2x at boundaries</td><td class="meh">Uncontrolled at edges</td><td>Coarse quotas (per day, per month), cheapest possible check</td></tr>
+<tr><th>Sliding log</th><td>1 timestamp per request</td><td class="yes">Exact</td><td class="yes">None beyond the limit</td><td>Small, security-sensitive limits such as login attempts</td></tr>
+<tr><th>Sliding counter</th><td>2 counters</td><td class="yes">Close, small estimation error</td><td class="yes">Smoothed</td><td>General API limits at large scale (Cloudflare)</td></tr>
+<tr><th>Token bucket</th><td>Tokens + timestamp</td><td class="yes">Exact for its definition</td><td class="yes">Explicit, tunable</td><td>Public APIs, per-user limits, weighted costs (Stripe, AWS)</td></tr>
+<tr><th>Leaky bucket (queue)</th><td>Queue of requests</td><td class="yes">Exact output rate</td><td class="meh">Smoothed by delaying</td><td>Shaping traffic into a fragile or strictly metered downstream</td></tr>
+</tbody></table></div>
+
+<h2 id="distributed">Rate limiting across many servers</h2>
+<p>Everything above assumes one process sees every request. In production, a client's requests are spread by the <a href="load-balancing.html">load balancer</a> across 50 gateway instances. If each instance enforces 100 per minute on its own, the client actually gets up to 5,000. The counters have to be shared.</p>
+
+<h3 id="central-store">A central store and atomic updates</h3>
+<p>The standard design keeps limiter state in Redis, keyed by client. Redis is fast enough (well under a millisecond per operation on a local network), supports TTLs so idle clients' keys disappear, and executes commands one at a time, which is what makes atomic updates possible.</p>
+<p>The trap is the read-modify-write race. If the gateway reads the counter, decides in its own code, and then writes back, two gateways can both read 99, both decide "allow", and both write 100.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 330" role="img" aria-label="Two gateways update a shared counter: with separate GET and SET both read 99 and both allow; with an atomic increment one gets 100 and the other 101 and is rejected">
+<rect class="n svc" x="65" y="16" width="110" height="36" rx="7"/><text class="t sm b mid" x="120" y="39">Gateway A</text>
+<rect class="n cache" x="305" y="16" width="110" height="36" rx="7"/><text class="t sm b mid" x="360" y="39">Redis</text>
+<rect class="n svc" x="545" y="16" width="110" height="36" rx="7"/><text class="t sm b mid" x="600" y="39">Gateway B</text>
+<path class="line faint" d="M120,52 V270 M360,52 V270 M600,52 V270" style="stroke-dasharray:3 4"/>
+<g data-show="1">
+<path class="e" d="M120,85 H356"/><text class="t mono mid" x="240" y="78">GET rl:key_42</text>
+<path class="e dash" d="M360,110 H124"/><text class="t mono mid" x="240" y="103">99</text>
+<path class="e" d="M600,135 H364"/><text class="t mono mid" x="480" y="128">GET rl:key_42</text>
+<path class="e dash" d="M360,160 H596"/><text class="t mono mid" x="480" y="153">99</text>
+<path class="e" d="M120,195 H356"/><text class="t mono mid" x="240" y="188">SET rl:key_42 100</text>
+<text class="t sm green end" x="112" y="199">allow</text>
+<path class="e" d="M600,230 H364"/><text class="t mono mid" x="480" y="223">SET rl:key_42 100</text>
+<text class="t sm red" x="608" y="234">allow (wrong)</text>
+<text class="t sm mid" x="360" y="300">Limit 100, counter at 99. Both read 99, both write 100, both allow:</text>
+<text class="t sm mid" x="360" y="318">request 101 got through and the counter undercounts.</text>
+</g>
+<g data-show="2">
+<path class="e" d="M120,85 H356"/><text class="t mono mid" x="240" y="78">INCR rl:key_42</text>
+<path class="e dash" d="M360,110 H124"/><text class="t mono mid" x="240" y="103">100</text>
+<text class="t sm green end" x="112" y="114">allow</text>
+<path class="e" d="M600,135 H364"/><text class="t mono mid" x="480" y="128">INCR rl:key_42</text>
+<path class="e dash" d="M360,160 H596"/><text class="t mono mid" x="480" y="153">101</text>
+<text class="t sm red" x="608" y="164">reject</text>
+<text class="t sm mid" x="360" y="215">Redis runs each command or script to completion,</text>
+<text class="t sm mid" x="360" y="233">one at a time, so the two increments cannot interleave.</text>
+<text class="t sm mid" x="360" y="300">The decision comes from the value Redis returns, not from a value read earlier.</text>
+</g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Read, then write</button><button type="button" data-step="2" aria-pressed="false">Atomic increment</button></div>
+</div>
+<figcaption><b>The lost update.</b> Under load, two gateways processing the same client's requests in the same millisecond is the normal case, not an edge case. The fix is to make the whole check-and-update a single atomic operation on the server.</figcaption>
+</figure>
+
+<p>For a fixed window, <code>INCR</code> is enough, but the expiry needs care. The common <code>INCR</code> followed by <code>EXPIRE</code> if the result was 1 has a gap: if the gateway crashes between the two commands, the key never expires and that client is blocked forever. Send both in a <code>MULTI</code>/<code>EXEC</code> transaction or a Lua script.</p>
+<p>For a token bucket the logic does not fit in one command, so put it in a <strong>Lua script</strong>. Redis runs the script atomically, and the gateway makes a single round trip:</p>
+<pre><code class="language-lua">-- KEYS[1] = bucket key, ARGV[1] = capacity, ARGV[2] = refill per second, ARGV[3] = cost
+local capacity, rate, cost = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
+local t = redis.call('TIME')                        -- Redis clock (Redis 5+): no skew between gateways
+local now = tonumber(t[1]) + tonumber(t[2]) / 1e6
+
+local b = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local tokens = tonumber(b[1]) or capacity
+local ts = tonumber(b[2]) or now
+tokens = math.min(capacity, tokens + (now - ts) * rate)
+
+local allowed = 0
+if tokens &gt;= cost then
+  tokens = tokens - cost
+  allowed = 1
+end
+redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', now)
+redis.call('EXPIRE', KEYS[1], math.ceil(capacity / rate) + 1)   -- idle bucket is full anyway
+return {allowed, tostring(tokens)}</code></pre>
+<p>Details that matter:</p>
+<ul>
+<li><strong>Whose clock.</strong> If each gateway passes its own timestamp, a gateway whose clock runs 2 seconds fast hands out 2 seconds of free tokens. Reading <code>TIME</code> inside the script uses one clock for everyone.</li>
+<li><strong>Expiry.</strong> A bucket idle for <code>capacity / rate</code> seconds is full, which is the same as not existing. Expiring it then keeps memory proportional to active clients.</li>
+<li><strong>Sharding.</strong> All state for one client lives under one key, so it lands on one Redis Cluster shard and the script never needs keys from two shards. Throughput scales by adding shards.</li>
+<li><strong>Return value.</strong> Lua numbers returned to Redis are truncated to integers, so the remaining tokens are returned as a string for the response headers.</li>
+</ul>
+
+<h3 id="hybrid">Local plus global</h3>
+<p>A central store puts a network round trip on every request and makes Redis a dependency of every API call. At 1 million requests per second that is 1 million Redis operations per second, plus about half a millisecond of added latency each. Large systems relax exactness to avoid both:</p>
+<ul>
+<li><strong>Local buckets with periodic sync.</strong> Each gateway counts locally and pushes its deltas to Redis every 100 ms, reading back the global total. Overshoot is bounded by how many requests the gateways can admit within one sync interval, and Redis load drops from once per request to once per interval per active client per gateway.</li>
+<li><strong>Static split.</strong> Give each of N gateways <code>limit / N</code>. It needs no coordination at all, but it only works when the load balancer spreads each client evenly. With sticky or skewed routing, a client whose traffic all hits one gateway gets one Nth of its quota.</li>
+<li><strong>Two tiers.</strong> A generous local limit in every instance (Envoy's local rate limit filter, an in-process token bucket) sheds floods without any network call, and a precise global limit in Redis enforces the actual quota. The local tier also keeps working if Redis is down.</li>
+</ul>
+
+<h3 id="fail-open">When the limiter fails</h3>
+<p>Decide in advance what happens when Redis times out. <strong>Fail open</strong> (allow the request) keeps the product working and is the usual choice for fairness and quota limits; a few minutes without rate limits rarely hurts. <strong>Fail closed</strong> (reject) is right when the limit protects money or safety, such as SMS sends or payouts. Either way, put a tight timeout of a few milliseconds on the limiter call and a <a href="fault-tolerance.html">circuit breaker</a> around it, so a slow Redis cannot add latency to every request.</p>
+
+<h2 id="where">Where to enforce limits</h2>
+<p>Limits belong at several layers, each catching what the one before cannot see.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Layer</th><th>Knows about</th><th>Good at</th><th>Typical limit</th></tr></thead>
+<tbody>
+<tr><th>Client / SDK</th><td>Its own traffic</td><td>Self-throttling, honouring <code>Retry-After</code>, backoff with jitter</td><td>Cooperative only; never a security boundary</td></tr>
+<tr><th>Edge / CDN / WAF</th><td>IP, path, TLS fingerprint</td><td>Volumetric floods, bots, before traffic reaches your network</td><td>Per IP, per path</td></tr>
+<tr><th>API gateway</th><td>Authenticated key or user, plan</td><td>Product quotas and fairness between tenants</td><td>Per API key, per user, per endpoint</td></tr>
+<tr><th>Service</th><td>Business context and real cost</td><td>Expensive operations, concurrency caps, load shedding</td><td>Per account action ("3 password resets per hour")</td></tr>
+</tbody></table></div>
+<p>The <a href="proxies-gateways.html">API gateway</a> is the default answer in an interview because it sees authenticated identity and sits in front of every service. Services still need their own protection, because internal callers bypass the gateway and only the service knows that one request scans a million rows.</p>
+
+<h3 id="dimensions">What to key on</h3>
+<ul>
+<li><strong>User or account.</strong> The fairest key once a request is authenticated.</li>
+<li><strong>API key.</strong> Maps directly to a billing plan: 1,000 requests per minute on the free tier, 10,000 on the paid one.</li>
+<li><strong>IP address.</strong> The only key before authentication, and a blunt one. Thousands of users behind a corporate NAT or a mobile carrier's NAT share one IPv4 address, while one IPv6 attacker controls billions of addresses, so IPv6 limits usually key on the /64 prefix.</li>
+<li><strong>Endpoint.</strong> <code>POST /exports</code> and <code>GET /users/me</code> do not cost the same. Separate limits per endpoint, or a token bucket where each request costs tokens in proportion to its expense.</li>
+<li><strong>Global.</strong> A ceiling across all clients that protects a dependency regardless of who is calling.</li>
+</ul>
+<p>Real systems combine several: a request passes only if every applicable limit allows it, for example 20 per second <em>and</em> 10,000 per day per key, plus 100 per minute per IP on the login page. Check the cheapest and most likely to reject first.</p>
+
+<h2 id="responses">Telling clients they were limited</h2>
+<p>A rejected request should fail fast, cheaply and clearly. HTTP has a dedicated status for it: <code>429 Too Many Requests</code> (RFC 6585). Use <code>503 Service Unavailable</code> instead when the server sheds load because it is overloaded, rather than because this client exceeded its quota; the client did nothing wrong.</p>
+<pre><code class="language-http">HTTP/1.1 429 Too Many Requests
+Retry-After: 12
+RateLimit-Policy: "per-minute";q=100;w=60
+RateLimit: "per-minute";r=0;t=12
+Content-Type: application/problem+json
+
+{ "type": "https://api.example.com/errors/rate-limited",
+  "title": "Rate limit exceeded",
+  "detail": "100 requests per minute allowed for key ak_live_7Hq2. Retry in 12 seconds." }</code></pre>
+<ul>
+<li><code>Retry-After</code> (seconds, or an HTTP date) tells the client exactly when to try again, so it does not guess and retry immediately.</li>
+<li>Many APIs send <code>X-RateLimit-Limit</code>, <code>X-RateLimit-Remaining</code> and <code>X-RateLimit-Reset</code> on <em>every</em> response, so well-behaved clients slow down before they hit the wall. GitHub's REST API is the best-known example.</li>
+<li>The IETF HTTPAPI working group is standardising this as the <code>RateLimit</code> and <code>RateLimit-Policy</code> fields. Earlier drafts used three separate <code>RateLimit-Limit</code>, <code>-Remaining</code> and <code>-Reset</code> headers, which some servers already emit; the draft is still changing, so check its current version before relying on the exact syntax.</li>
+</ul>
+<p>Clients receiving 429 should wait for <code>Retry-After</code>, then retry with exponential backoff and jitter. Without jitter, every client limited at the same moment retries at the same moment, and the burst repeats.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+<li><strong>Stripe</strong> runs token buckets in Redis for per-user request rate limits, and described three more limiters next to it: a concurrent-requests limiter (caps requests in flight, which catches slow expensive calls a rate limit misses), and two load shedders that reserve capacity for critical traffic such as charges when the fleet is under strain.</li>
+<li><strong>Cloudflare</strong> uses the sliding window counter for its rate limiting product, counting across its edge, and reported the 0.003% error figure above from production traffic.</li>
+<li><strong>NGINX</strong> implements <code>limit_req</code> with the leaky bucket method. The <code>burst</code> parameter sets the queue size, and <code>nodelay</code> forwards queued requests immediately, which turns the shaper into a meter.</li>
+<li><strong>GitHub</strong> allows 5,000 REST requests per hour for an authenticated user and 60 per hour per IP for unauthenticated ones, reported through <code>x-ratelimit-*</code> headers, plus secondary limits on concurrency and content creation.</li>
+<li><strong>Envoy</strong> offers a local rate limit filter (a token bucket per instance) and a global mode that calls an external gRPC rate limit service; Lyft's open source implementation of that service stores counters in Redis.</li>
+<li><strong>AWS API Gateway</strong> throttles with a token bucket per account and Region, with separate steady-state rate and burst settings that can be narrowed per stage, method and usage plan.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>In almost every design with a public API: one sentence such as "the gateway enforces per-key token buckets backed by Redis and returns 429 with Retry-After". It becomes central when the system sends costly messages (a <a href="notification-system.html">notification system</a>), accepts user content, or must survive abusive clients. If the question is "design a rate limiter", follow the <a href="rate-limiter-design.html">case study</a>.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>Why not a fixed window? Draw the boundary burst and give the 2x number.</li>
+<li>How does the sliding window counter estimate? Write the weighted formula and name its assumption.</li>
+<li>Token bucket vs leaky bucket? Bursts allowed and immediate decision, vs smoothed output with queueing delay.</li>
+<li>How do 50 gateways share a limit? Central Redis with atomic Lua scripts, then local-plus-global to cut latency and dependency.</li>
+<li>What if Redis is down? Fail open or closed, chosen per limit, with a short timeout and a local fallback tier.</li>
+<li>What do you key on before login? IP, with its NAT and IPv6 caveats.</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>Reading a counter, deciding in application code, then writing it back: the race lets limits leak under exactly the load they exist for.</li>
+<li>Per-instance limits with no mention that the real limit is multiplied by the number of instances.</li>
+<li>Rejecting with 500 or a silent drop instead of 429 and <code>Retry-After</code>.</li>
+<li>Treating a client-side limit as protection.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://stripe.com/blog/rate-limiters" target="_blank" rel="noopener">Scaling your API with rate limiters</a><span>Paul Tarjan, Stripe engineering blog, 2017. The four limiters Stripe runs, with token bucket code for Redis.</span></li>
+<li><a href="https://blog.cloudflare.com/counting-things-a-lot-of-different-things/" target="_blank" rel="noopener">How we built rate limiting capable of scaling to millions of domains</a><span>Cloudflare blog, 2017. The sliding window counter and its measured accuracy.</span></li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc6585#section-4" target="_blank" rel="noopener">RFC 6585, section 4: 429 Too Many Requests</a><span>The status code definition, including the optional Retry-After header.</span></li>
+<li><a href="https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers/" target="_blank" rel="noopener">RateLimit header fields for HTTP (IETF draft)</a><span>The work-in-progress standard for advertising quotas to clients.</span></li>
+<li><a href="https://nginx.org/en/docs/http/ngx_http_limit_req_module.html" target="_blank" rel="noopener">NGINX ngx_http_limit_req_module</a><span>A production leaky bucket, with burst and nodelay semantics explained.</span></li>
+</ul>

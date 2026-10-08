@@ -1,0 +1,420 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">A customer places order <code>ord_1002</code> for one unit of <code>sku-4471</code> at $29.99. Three things must happen: the order is recorded, a unit is reserved in inventory, and the card is charged. In a monolith with one database that is a single <code>BEGIN ... COMMIT</code>, and the database guarantees all three happen or none do. Split into an orders service, an inventory service and a payments service, each with its own database, and there is no longer any one system that can promise that.</p>
+<p>Without a plan, partial failures leak into the business: a card charged for an order that does not exist, stock reserved forever for an order nobody paid for, an order confirmed but never shipped. A <dfn>distributed transaction</dfn> is any mechanism that keeps a multi-step update across several services or databases consistent despite crashes, timeouts and retries. There are two families: protocols that make the update <strong>atomic</strong> (two-phase commit), and patterns that accept intermediate states and make the update <strong>eventually consistent</strong> (sagas, outbox, TCC). Knowing when each is appropriate is what interviewers look for.</p>
+
+<h2 id="dual-writes">The dual-write problem</h2>
+<p>The smallest version of the problem has only one service. The orders service must save the order in its database and publish an <code>OrderPlaced</code> event to Kafka so that inventory and email can react. That is a <dfn>dual write</dfn>: two systems updated by one piece of code, with no transaction spanning both.</p>
+<ul>
+<li><strong>Commit, then publish.</strong> If the process crashes between the two, the order exists but no event is ever sent. Inventory never reserves stock, and the customer never gets an email.</li>
+<li><strong>Publish, then commit.</strong> If the commit then fails (a constraint violation, a deadlock, a crash), consumers react to an order that does not exist.</li>
+<li><strong>Retry on failure.</strong> Retrying the publish helps with transient broker errors, but not with a crash: the retry loop dies with the process.</li>
+</ul>
+<p>No ordering of the two calls is safe, and the failure window is not theoretical. At 1,000 orders per second, a deploy that kills processes mid-request will hit it every time. Every pattern in this chapter is, at heart, a way to avoid relying on two independent writes both succeeding. The <a href="#outbox">transactional outbox</a> solves this specific case.</p>
+
+<h2 id="two-phase-commit">Two-phase commit</h2>
+<p><dfn>Two-phase commit</dfn> (2PC) makes a transaction across several databases atomic. One node acts as <dfn>coordinator</dfn>; the databases are <dfn>participants</dfn>. Each participant has already done its part of the work inside a local transaction that is still open, with its locks held.</p>
+<ol class="steps">
+<li><strong>Phase 1, prepare.</strong> The coordinator sends <code>PREPARE</code> to every participant. A participant that can commit writes everything needed to commit to its durable log, and replies <code>YES</code>. From that moment it has given up the right to abort on its own: it must commit if told to, even after a crash and restart. A participant that cannot commit replies <code>NO</code>.</li>
+<li><strong>Decision.</strong> If every vote is <code>YES</code>, the coordinator writes <code>COMMIT</code> to its own log. That log write is the moment the transaction commits. Any <code>NO</code> or a timeout means <code>ABORT</code>.</li>
+<li><strong>Phase 2, commit.</strong> The coordinator sends the decision to every participant, retrying until each one acknowledges. Participants apply it and release their locks.</li>
+</ol>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 340" role="img" aria-label="Two-phase commit sequence between a coordinator and two participants: all vote yes and commit; one votes no and all abort; the coordinator crashes after prepare and both participants block holding locks">
+<rect class="n svc" x="50" y="16" width="120" height="36" rx="7"/><text class="t sm b mid" x="110" y="39">orders-db</text>
+<rect class="n ext" x="295" y="16" width="130" height="36" rx="7"/><text class="t sm b mid" x="360" y="39">Coordinator</text>
+<rect class="n svc" x="550" y="16" width="120" height="36" rx="7"/><text class="t sm b mid" x="610" y="39">inventory-db</text>
+<path class="line faint" d="M110,52 V260 M360,52 V260 M610,52 V260" style="stroke-dasharray:3 4"/>
+
+<path class="e" d="M360,90 H114"/><text class="t mono mid" x="235" y="83">PREPARE</text>
+<path class="e" d="M360,90 H606"/><text class="t mono mid" x="485" y="83">PREPARE</text>
+<text class="t xs mute" x="118" y="110">prepared</text>
+<path class="e dash green" d="M110,125 H356"/><text class="t mono green mid" x="235" y="118">YES</text>
+<g data-show="1 3"><text class="t xs mute end" x="602" y="110">prepared</text>
+<path class="e dash green" d="M610,125 H364"/><text class="t mono green mid" x="485" y="118">YES</text></g>
+<g data-show="2"><text class="t xs red end" x="602" y="110">constraint failed</text>
+<path class="e dash red" d="M610,125 H364"/><text class="t mono red mid" x="485" y="118">NO</text></g>
+
+<g data-show="1"><rect class="n good" x="290" y="140" width="140" height="26" rx="5"/><text class="t xs mid" x="360" y="157">log COMMIT (fsync)</text>
+<path class="e green" d="M360,195 H114"/><text class="t mono green mid" x="235" y="188">COMMIT</text>
+<path class="e green" d="M360,195 H606"/><text class="t mono green mid" x="485" y="188">COMMIT</text>
+<path class="e dash" d="M110,228 H356"/><text class="t mono mute mid" x="235" y="221">ACK</text>
+<path class="e dash" d="M610,228 H364"/><text class="t mono mute mid" x="485" y="221">ACK</text>
+<text class="t sm mid" x="360" y="296">Every participant voted YES, so the coordinator logs COMMIT. That write is the commit point.</text>
+<text class="t sm mute mid" x="360" y="316">Two round trips and at least three fsyncs, with locks held throughout.</text></g>
+
+<g data-show="2"><rect class="n bad" x="290" y="140" width="140" height="26" rx="5"/><text class="t xs mid" x="360" y="157">log ABORT</text>
+<path class="e red" d="M360,195 H114"/><text class="t mono red mid" x="235" y="188">ABORT</text>
+<path class="e red" d="M360,195 H606"/><text class="t mono red mid" x="485" y="188">ABORT</text>
+<path class="e dash" d="M110,228 H356"/><text class="t mono mute mid" x="235" y="221">ACK</text>
+<path class="e dash" d="M610,228 H364"/><text class="t mono mute mid" x="485" y="221">ACK</text>
+<text class="t sm mid" x="360" y="296">One NO is enough: everyone rolls back, including orders-db, which had voted YES.</text>
+<text class="t sm mute mid" x="360" y="316">A timeout waiting for a vote is treated as NO.</text></g>
+
+<g data-show="3"><circle class="n bad" cx="360" cy="153" r="13"/><text class="t b red mid" x="360" y="158">×</text>
+<text class="t sm red" x="382" y="158">coordinator crashes</text>
+<rect class="n bad" x="40" y="180" width="160" height="50" rx="7"/><text class="t xs b mid" x="120" y="201">prepared, locks held</text><text class="t xs mid" x="120" y="217">cannot commit or abort</text>
+<rect class="n bad" x="520" y="180" width="160" height="50" rx="7"/><text class="t xs b mid" x="600" y="201">prepared, locks held</text><text class="t xs mid" x="600" y="217">cannot commit or abort</text>
+<text class="t sm mid" x="360" y="296">Both voted YES, so neither may abort alone, and neither knows the decision.</text>
+<text class="t sm red mid" x="360" y="316">They block, rows stay locked, until the coordinator recovers and reads its log.</text></g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">All vote yes</button><button type="button" data-step="2" aria-pressed="false">One votes no</button><button type="button" data-step="3" aria-pressed="false">Coordinator crashes</button></div>
+</div>
+<figcaption><b>Two-phase commit.</b> The protocol is correct in all three cases: nobody ever commits while someone else aborts. The third case shows its price. A participant that has voted YES is <em>in doubt</em> and must wait for the coordinator, however long that takes.</figcaption>
+</figure>
+
+<h3 id="2pc-costs">Why 2PC is rare between services</h3>
+<p>2PC is a blocking protocol: a coordinator failure at the wrong moment freezes every participant's locked rows until the coordinator comes back. Database vendors ship tooling for operators to resolve in-doubt transactions by hand for exactly this reason (PostgreSQL lists them in <code>pg_prepared_xacts</code>). Beyond blocking, the costs are:</p>
+<ul>
+<li><strong>Locks held across the network.</strong> Rows stay locked from the participant's local work until phase 2 arrives. Hot rows become a throughput ceiling.</li>
+<li><strong>Every participant must be up.</strong> Availability is the product of all participants and the coordinator, as with any synchronous chain.</li>
+<li><strong>Every participant must speak the protocol.</strong> Databases support XA (the X/Open standard for 2PC). Kafka, Stripe, an email provider and most HTTP APIs do not.</li>
+</ul>
+<p>Rough numbers for the time a hot row stays locked, assuming a 1 ms fsync:</p>
+<div class="calc">Local transaction           one commit fsync                       ≈ 1 ms   →  ~1,000 updates/s on one row
+2PC, one data centre        prepare RTT 0.5 + fsync 1 + coordinator log 1
+                            + commit RTT 0.5 + fsync 1             ≈ 4 ms   →  ~<span class="r">250 updates/s</span>
+2PC, across regions         70 + 1 + 1 + 70 + 1                    ≈ 143 ms →  ~<span class="r">7 updates/s</span></div>
+<p>Inside one database cluster, where the database owns both coordinator and participants, these costs are acceptable and 2PC is everywhere. Between independently owned microservices, it is almost never the right answer.</p>
+
+<h3 id="three-phase-commit">Three-phase commit</h3>
+<p><dfn>Three-phase commit</dfn> (3PC, Skeen 1981) adds a <code>PRE-COMMIT</code> round between voting and committing, so that a participant that times out waiting can work out the decision from its peers instead of blocking. It is non-blocking only under assumptions real networks break: no partitions and bounded message delays. During a partition, two sides can reach different decisions. It costs an extra round trip and is almost never used in practice. The modern fix for blocking is different: make the coordinator itself fault tolerant.</p>
+
+<h3 id="2pc-over-consensus">2PC over consensus</h3>
+<p>Google Spanner runs 2PC where every participant and the coordinator are not single machines but <strong>Paxos groups</strong>, each replicated across zones. If the coordinator's leader dies, another replica of the same group takes over with the log intact, so the in-doubt window shrinks to a leader election. CockroachDB and YugabyteDB use the same idea with Raft. This is how distributed SQL databases offer serializable transactions across shards, and it is covered in <a href="consensus.html">Consensus &amp; Leader Election</a>. It works because one system owns every participant; it does not help when the participants are a payments API and a warehouse service.</p>
+
+<h2 id="sagas">Sagas</h2>
+<p>A <dfn>saga</dfn> (Garcia-Molina and Salem, 1987) splits a long business transaction into a sequence of <strong>local</strong> transactions, each committed immediately in one service. For every step that might need undoing there is a <dfn>compensating transaction</dfn> that semantically reverses it. If step <em>k</em> fails, the saga runs the compensations for steps <em>k-1</em> down to 1.</p>
+<p>A compensation is not a rollback. The original step committed and other transactions may already have seen its effect. Refunding a charge leaves both the charge and the refund on the customer's statement; cancelling an order leaves a cancelled order, not a missing one. Some actions cannot be compensated at all: an email cannot be unsent, so you send it last or send a correction.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 270" role="img" aria-label="Order saga with four forward steps: create order, reserve stock, charge card, confirm order; compensations cancel order, release stock and refund card; when the charge fails, release stock and cancel order run in reverse order">
+<text class="t xs mute" x="20" y="44">forward steps (each a local transaction)</text>
+<text class="t xs accent mid" x="450" y="44">pivot</text>
+<g data-show="1"><rect class="n good" x="20" y="54" width="140" height="52" rx="8"/><rect class="n good" x="200" y="54" width="140" height="52" rx="8"/><rect class="n good" x="380" y="54" width="140" height="52" rx="8"/><rect class="n good" x="560" y="54" width="140" height="52" rx="8"/></g>
+<g data-show="2 3"><rect class="n good" x="20" y="54" width="140" height="52" rx="8"/><rect class="n good" x="200" y="54" width="140" height="52" rx="8"/><rect class="n bad" x="380" y="54" width="140" height="52" rx="8"/><rect class="n ghost" x="560" y="54" width="140" height="52" rx="8"/></g>
+<text class="t sm b mid" x="90" y="76">T1 Create order</text><text class="t xs mute mid" x="90" y="94">status PENDING</text>
+<text class="t sm b mid" x="270" y="76">T2 Reserve stock</text><text class="t xs mute mid" x="270" y="94">sku-4471 × 1</text>
+<text class="t sm b mid" x="450" y="76">T3 Charge card</text>
+<text class="t xs mute mid" x="450" y="94" data-show="1">$29.99 captured</text><text class="t xs red mid" x="450" y="94" data-show="2 3">card declined</text>
+<text class="t sm b mid" x="630" y="76">T4 Confirm order</text>
+<text class="t xs mute mid" x="630" y="94" data-show="1">status CONFIRMED</text><text class="t xs mute mid" x="630" y="94" data-show="2 3">never runs</text>
+<path class="e" d="M160,80 H196"/><path class="e" d="M340,80 H376"/><path class="e" d="M520,80 H556" data-show="1"/>
+
+<text class="t xs mute" x="20" y="150">compensations</text>
+<g data-show="1 2"><rect class="n ghost" x="20" y="160" width="140" height="44" rx="8"/><rect class="n ghost" x="200" y="160" width="140" height="44" rx="8"/></g>
+<g data-show="3"><rect class="n cache" x="20" y="160" width="140" height="44" rx="8"/><rect class="n cache" x="200" y="160" width="140" height="44" rx="8"/>
+<path class="e accent" d="M450,106 C450,182 400,182 344,182"/><path class="e accent" d="M200,182 H164"/>
+<text class="t xs accent" x="462" y="146">1st undo</text><text class="t xs accent mid" x="180" y="174">2nd</text></g>
+<rect class="n ghost" x="380" y="160" width="140" height="44" rx="8" data-show="1"/>
+<text class="t sm mid" x="90" y="187">C1 Cancel order</text>
+<text class="t sm mid" x="270" y="187">C2 Release stock</text>
+<text class="t sm mute mid" x="450" y="187" data-show="1">C3 Refund card</text>
+<text class="t xs mute mid" x="630" y="187">no compensation</text>
+
+<text class="t sm mid" x="360" y="240" data-show="1">Happy path: four local commits. Compensations exist but are never used.</text>
+<text class="t sm mid" x="360" y="240" data-show="2">The charge fails. Order 1002 is PENDING and one unit is reserved: a visible, in-between state.</text>
+<text class="t sm mid" x="360" y="240" data-show="3">Undo completed steps newest first. Each compensation is retried until it succeeds.</text>
+<text class="t xs mute mid" x="360" y="258" data-show="3">C3 is not needed: T3 never committed. Final state: order CANCELLED, stock back to where it was.</text>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Happy path</button><button type="button" data-step="2" aria-pressed="false">Charge declined</button><button type="button" data-step="3" aria-pressed="false">Compensate</button></div>
+</div>
+<figcaption><b>A saga with compensations.</b> The charge is the <em>pivot</em>: once it succeeds, the saga is committed to finishing, so the steps after it must be ones that can only fail transiently and are retried until they succeed.</figcaption>
+</figure>
+
+<p>Ordering the steps well removes most of the pain. Chris Richardson's classification is useful:</p>
+<ul>
+<li><dfn>Compensatable steps</dfn> come first. They can be undone (create a pending order, reserve stock).</li>
+<li>The <dfn>pivot step</dfn> is the go/no-go point (charge the card). If it succeeds the saga will complete.</li>
+<li><dfn>Retriable steps</dfn> come after the pivot. They cannot fail for business reasons, only transiently, so they are retried until they succeed (confirm the order, send the email).</li>
+</ul>
+
+<h3 id="choreography-orchestration">Choreography vs orchestration</h3>
+<p>There are two ways to drive a saga. In <dfn>choreography</dfn>, there is no central controller: each service listens for events and publishes its own. In <dfn>orchestration</dfn>, one component, the orchestrator, holds the saga's state machine and tells each service what to do next. The <a href="event-driven.html">Event-Driven Architecture</a> chapter discusses the same split more generally.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 280" role="img" aria-label="Left: choreography, three services publish and subscribe to events on a shared bus. Right: orchestration, a saga orchestrator sends commands to three services and receives replies">
+<path class="line faint" d="M360,12 V270" style="stroke-dasharray:4 4"/>
+<text class="t b mid" x="180" y="26">Choreography</text>
+<rect class="n svc" x="30" y="46" width="90" height="40" rx="7"/><text class="t sm b mid" x="75" y="71">Orders</text>
+<rect class="n svc" x="135" y="46" width="90" height="40" rx="7"/><text class="t sm b mid" x="180" y="71">Inventory</text>
+<rect class="n svc" x="240" y="46" width="90" height="40" rx="7"/><text class="t sm b mid" x="285" y="71">Payments</text>
+<path class="e" d="M62,86 V126"/><path class="e dash" d="M88,130 V90"/>
+<path class="e" d="M167,86 V126"/><path class="e dash" d="M193,130 V90"/>
+<path class="e" d="M272,86 V126"/><path class="e dash" d="M298,130 V90"/>
+<rect class="n queue" x="30" y="130" width="300" height="28" rx="6"/><text class="t sm mid" x="180" y="149">event bus</text>
+<text class="t mono" x="30" y="188">OrderCreated  → Inventory reserves</text>
+<text class="t mono" x="30" y="208">StockReserved → Payments charges</text>
+<text class="t mono red" x="30" y="228">PaymentFailed → Inventory, Orders undo</text>
+<text class="t xs mute mid" x="180" y="260">solid: publish, dashed: subscribe. No owner of the flow.</text>
+
+<text class="t b mid" x="540" y="26">Orchestration</text>
+<rect class="n ext" x="465" y="44" width="150" height="50" rx="8"/><text class="t sm b mid" x="540" y="66">Saga orchestrator</text><text class="t xs mute mid" x="540" y="82">state machine + log</text>
+<rect class="n svc" x="385" y="166" width="95" height="40" rx="7"/><text class="t sm b mid" x="432" y="191">Orders</text>
+<rect class="n svc" x="497" y="166" width="95" height="40" rx="7"/><text class="t sm b mid" x="544" y="191">Inventory</text>
+<rect class="n svc" x="609" y="166" width="95" height="40" rx="7"/><text class="t sm b mid" x="656" y="191">Payments</text>
+<path class="e both" d="M495,98 L440,162"/>
+<path class="e both" d="M544,98 V162"/>
+<path class="e both" d="M590,98 L648,162"/>
+<text class="t xs mute mid" x="432" y="224">create / cancel</text>
+<text class="t xs mute mid" x="544" y="224">reserve / release</text>
+<text class="t xs mute mid" x="656" y="224">charge / refund</text>
+<text class="t xs mute mid" x="540" y="260">commands out, replies back. One place holds the flow.</text>
+</svg>
+</div>
+<figcaption><b>Two ways to coordinate.</b> Choreography has no single point of control, and no single place to read the flow either. Orchestration centralises the logic in a component that persists the saga's progress.</figcaption>
+</figure>
+
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Choreography</th><th>Orchestration</th></tr></thead>
+<tbody>
+<tr><th>Where the flow lives</th><td>Spread across event handlers in every service</td><td>One state machine in one place</td></tr>
+<tr><th>Coupling</th><td class="yes">Services only know event types</td><td class="meh">Orchestrator knows every participant's API</td></tr>
+<tr><th>Adding a step</th><td class="meh">Change who listens to what, in several services</td><td class="yes">Change the orchestrator</td></tr>
+<tr><th>Answering "where is order 1002?"</th><td class="no">Reconstruct from events in several logs</td><td class="yes">Read the saga's state</td></tr>
+<tr><th>Risk</th><td>Cyclic event chains nobody understands</td><td>Orchestrator turns into a god service holding business logic</td></tr>
+<tr><th>Good fit</th><td>2 to 3 steps, loosely related reactions</td><td>4+ steps, ordering rules, timeouts, human approvals</td></tr>
+</tbody></table></div>
+
+<h3 id="saga-code">A minimal orchestrator</h3>
+<p>The core of an orchestrator is small: run steps in order, remember which ones completed, and on a business failure run their compensations in reverse, retrying each until it succeeds. The run below charges a test card that is always declined and injects one timeout into a compensation.</p>
+<pre><code class="language-python">import time
+
+# Three "services", each with its own local state (in reality: separate databases).
+orders = {}                       # order_id -&gt; status
+stock = {"sku-4471": 5}           # sku -&gt; units available
+reservations = {}                 # order_id -&gt; (sku, qty)
+charges = {}                      # order_id -&gt; amount in cents
+flaky = {"release_stock": 1}      # inject one transient failure into a compensation
+
+
+class Declined(Exception):
+    pass
+
+
+def create_order(o):   orders[o["id"]] = "PENDING"           # semantic lock: others see PENDING
+def cancel_order(o):   orders[o["id"]] = "CANCELLED"
+
+
+def reserve_stock(o):
+    if o["id"] in reservations:                              # idempotent: a retry is a no-op
+        return
+    if stock[o["sku"]] &lt; o["qty"]:
+        raise Declined("out of stock")
+    stock[o["sku"]] -= o["qty"]
+    reservations[o["id"]] = (o["sku"], o["qty"])
+
+
+def release_stock(o):
+    if flaky["release_stock"]:
+        flaky["release_stock"] -= 1
+        raise TimeoutError("inventory timed out")
+    sku, qty = reservations.pop(o["id"], (None, 0))          # idempotent: second call finds nothing
+    if sku:
+        stock[sku] += qty
+
+
+def charge_card(o):
+    if o["card"] == "4000-0000-0000-0002":                   # a test card that is always declined
+        raise Declined("card declined")
+    charges[o["id"]] = o["amount"]
+
+
+def refund_card(o):    charges.pop(o["id"], None)
+def confirm_order(o):  orders[o["id"]] = "CONFIRMED"
+
+
+SAGA = [  # (step, compensation). The charge is the pivot: steps after it must not fail for business reasons.
+    (create_order, cancel_order),
+    (reserve_stock, release_stock),
+    (charge_card, refund_card),
+    (confirm_order, None),
+]
+
+
+def run_saga(o, steps=SAGA, retries=5):
+    done = []   # a real orchestrator persists this log after every step, so it can resume after a crash
+    for action, compensate in steps:
+        try:
+            action(o)
+            print(f"  ok    {action.__name__}")
+            done.append(compensate)
+        except Declined as e:
+            print(f"  FAIL  {action.__name__}: {e}")
+            for comp in reversed(done):                      # undo completed steps, newest first
+                if comp is None:
+                    continue
+                for attempt in range(1, retries + 1):        # compensations must eventually succeed
+                    try:
+                        comp(o)
+                        break
+                    except TimeoutError as err:
+                        print(f"  retry {comp.__name__} (attempt {attempt}: {err})")
+                        time.sleep(0.01 * 2 ** attempt)      # exponential backoff
+                else:
+                    raise RuntimeError(f"{comp.__name__} keeps failing: park the saga for a human")
+                print(f"  undo  {comp.__name__}")
+            return "aborted"
+    return "committed"
+
+
+print("order 1001:", run_saga({"id": 1001, "sku": "sku-4471", "qty": 2, "amount": 5998, "card": "4242-4242-4242-4242"}))
+print("order 1002:", run_saga({"id": 1002, "sku": "sku-4471", "qty": 1, "amount": 2999, "card": "4000-0000-0000-0002"}))
+print("orders:", orders, "| stock:", stock, "| charges:", charges)
+
+#   ok    create_order
+#   ok    reserve_stock
+#   ok    charge_card
+#   ok    confirm_order
+# order 1001: committed
+#   ok    create_order
+#   ok    reserve_stock
+#   FAIL  charge_card: card declined
+#   retry release_stock (attempt 1: inventory timed out)
+#   undo  release_stock
+#   undo  cancel_order
+# order 1002: aborted
+# orders: {1001: 'CONFIRMED', 1002: 'CANCELLED'} | stock: {'sku-4471': 3} | charges: {1001: 5998}</code></pre>
+<p>Three properties carry over to every real implementation:</p>
+<ul>
+<li><strong>Durable progress.</strong> The <code>done</code> list lives in memory here. A real orchestrator writes the saga's state to a database after each step, so a crash halfway resumes instead of leaving the order PENDING forever. This is exactly what workflow engines such as Temporal provide.</li>
+<li><strong>Idempotent steps and compensations.</strong> After a crash, the orchestrator cannot know whether its last command was applied, so it sends it again. <code>reserve_stock</code> and <code>release_stock</code> must tolerate being called twice. See <a href="idempotency.html">Idempotency &amp; Delivery Semantics</a>.</li>
+<li><strong>Compensations must not fail for business reasons.</strong> "Refund declined" is not an acceptable outcome. If a compensation still fails after retries, the saga is parked and a human is paged.</li>
+</ul>
+
+<h3 id="isolation">Sagas have no isolation</h3>
+<p>A saga is atomic in the eventual sense (all steps or all compensations) and each step is durable, but it gives up the <strong>I in ACID</strong>. Other requests see the intermediate states. Between T2 and C2 in the figure, a reporting query counts one unit as reserved, and another customer may see "out of stock" for an order that is about to be cancelled. The anomalies are the classic ones from <a href="transactions.html">ACID &amp; Isolation Levels</a>: lost updates, dirty reads of uncommitted saga effects, and non-repeatable reads across steps.</p>
+<p>Countermeasures, in rough order of how often they are used:</p>
+<div class="defs">
+<div><h4>Semantic lock</h4><p>A step sets a status flag such as <code>PENDING</code> or <code>APPROVAL_PENDING</code>. Other operations check it and either refuse ("order is being processed"), wait, or treat it as tentative. The order's status field is a lock that lives in application data.</p></div>
+<div><h4>Commutative updates</h4><p>Design updates so order does not matter: <code>stock = stock - 1</code> and <code>stock = stock + 1</code> commute, while "set stock to 4" does not. Compensations become safe no matter what ran in between.</p></div>
+<div><h4>Pessimistic view</h4><p>Reorder steps so the riskiest dirty read cannot happen. For example, increase a credit limit only in a retriable step after the pivot, so nobody spends credit that might be rolled back.</p></div>
+<div><h4>Reread value</h4><p>Before overwriting a record, reread it and check it has not changed since the saga last read it (optimistic concurrency with a version number). If it has, abort and maybe restart.</p></div>
+<div><h4>Version file</h4><p>Record operations as they arrive so they can be reordered: if a cancel arrives before the create it cancels, remember the cancel and apply it when the create shows up.</p></div>
+<div><h4>By value</h4><p>Choose the mechanism per request based on risk: low-value orders use a saga, high-value transfers use a stronger protocol or manual review.</p></div>
+</div>
+
+<h2 id="outbox">The transactional outbox</h2>
+<p>Every step of a choreographed saga, and every service that publishes events, hits the dual-write problem from the start of the chapter. The <dfn>transactional outbox</dfn> removes it by turning two writes into one. The service writes the business row and the event row to an <code>outbox</code> table <strong>in the same local transaction</strong>. A separate relay reads committed outbox rows and publishes them to the broker.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 300" role="img" aria-label="Step one: the orders service commits to its database then crashes before publishing to Kafka. Step two: the service writes the order and an outbox row in one transaction, and a CDC relay reads the database log and publishes to Kafka, which feeds inventory and email consumers">
+<rect class="n svc" x="30" y="110" width="120" height="56" rx="8"/><text class="t b mid" x="90" y="135">Orders</text><text class="t xs mute mid" x="90" y="152">service</text>
+
+<g data-show="1">
+<rect class="n db" x="240" y="40" width="150" height="56" rx="8"/><text class="t b mid" x="315" y="65">orders DB</text><text class="t xs mute mid" x="315" y="82">row committed</text>
+<rect class="n queue" x="240" y="200" width="150" height="56" rx="8"/><text class="t b mid" x="315" y="225">Kafka</text><text class="t xs mute mid" x="315" y="242">nothing arrives</text>
+<path class="e green" d="M150,128 C190,128 200,68 236,68"/>
+<path class="e dash red" d="M150,150 C190,150 200,228 236,228"/>
+<circle class="n bad" cx="194.5" cy="189" r="10"/><text class="t b red mid" x="194.5" y="194">×</text>
+<text class="t sm green" x="408" y="72">1. INSERT order, COMMIT: ok</text>
+<text class="t sm red" x="408" y="232">2. publish OrderPlaced: never sent,</text>
+<text class="t sm red" x="408" y="250">the process was killed in a deploy</text>
+<text class="t sm mid" x="360" y="288">The order exists but nothing downstream hears about it. Swapping the two writes just flips the failure.</text>
+</g>
+
+<g data-show="2">
+<rect class="n db" x="200" y="34" width="210" height="200" rx="10"/><text class="t b mid" x="305" y="56">orders DB</text>
+<rect class="zone" x="215" y="68" width="180" height="152" rx="8"/><text class="t xs mute mid" x="305" y="86">one local transaction</text>
+<rect class="n" x="235" y="98" width="140" height="40" rx="6"/><text class="t mono mid" x="305" y="122">orders</text>
+<rect class="n" x="235" y="160" width="140" height="40" rx="6"/><text class="t mono mid" x="305" y="184">outbox</text>
+<path class="e" d="M150,128 C190,128 200,118 231,118"/>
+<path class="e" d="M150,150 C190,150 200,180 231,180"/>
+<text class="t xs mute mid" x="90" y="190">INSERT both,</text><text class="t xs mute mid" x="90" y="204">COMMIT once</text>
+<rect class="n ext" x="460" y="155" width="120" height="50" rx="8"/><text class="t sm b mid" x="520" y="177">CDC relay</text><text class="t xs mute mid" x="520" y="193">reads the WAL</text>
+<rect class="n queue" x="460" y="50" width="120" height="50" rx="8"/><text class="t sm b mid" x="520" y="72">Kafka</text><text class="t xs mute mid" x="520" y="88">order-events</text>
+<rect class="n svc" x="618" y="30" width="92" height="40" rx="7"/><text class="t sm mid" x="664" y="55">Inventory</text>
+<rect class="n svc" x="618" y="90" width="92" height="40" rx="7"/><text class="t sm mid" x="664" y="115">Email</text>
+<path class="e" d="M375,180 H456"/>
+<path class="e" d="M520,155 V104"/>
+<path class="e" d="M580,66 C598,66 598,50 614,50"/>
+<path class="e" d="M580,84 C598,84 598,110 614,110"/>
+<path class="flow" d="M375,180 H456"/><path class="flow" d="M520,155 V104"/>
+<text class="t sm mid" x="360" y="270">Both rows commit or neither does. The relay publishes every committed outbox row at least once,</text>
+<text class="t sm mid" x="360" y="288">so consumers must deduplicate by event id.</text>
+</g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Dual write fails</button><button type="button" data-step="2" aria-pressed="false">Outbox + CDC</button></div>
+</div>
+<figcaption><b>From two writes to one.</b> The outbox moves the "publish" into the database transaction. Delivery to Kafka becomes a separate, retryable job that reads only committed data.</figcaption>
+</figure>
+
+<pre><code class="language-sql">BEGIN;
+INSERT INTO orders (id, customer_id, status, total_cents)
+VALUES ('ord_1002', 'cus_88', 'PENDING', 2999);
+
+INSERT INTO outbox (event_id, aggregate_id, type, payload)
+VALUES ('9b2f6c1e-5d4a-4f0e-8a51-3f7d2c9e1b04', 'ord_1002', 'OrderPlaced',
+        '{"order_id":"ord_1002","sku":"sku-4471","qty":1,"total_cents":2999}');
+COMMIT;</code></pre>
+<p>There are two ways to build the relay:</p>
+<ul>
+<li><strong>Polling publisher.</strong> A job runs <code>SELECT ... FROM outbox WHERE published_at IS NULL ORDER BY id LIMIT 500</code>, publishes the batch, then marks the rows published. Simple and portable. Costs a polling query and adds up to one polling interval of latency. Multiple relay instances need either a single leader, which preserves order, or <code>FOR UPDATE SKIP LOCKED</code>, which avoids double work but lets events for the same aggregate publish out of order unless rows are partitioned by aggregate id.</li>
+<li><strong>Change data capture (CDC).</strong> A connector such as Debezium tails the database's replication log (PostgreSQL logical decoding, MySQL binlog) and turns each committed outbox insert into a Kafka message. No polling load, latency in milliseconds, and commit order is preserved. The cost is running Kafka Connect and depending on log retention and replication slots.</li>
+</ul>
+<p>Either way the relay can crash after publishing and before recording that it did, so it publishes some events twice. The outbox gives <strong>at-least-once</strong> delivery; consumers make it effectively-once by recording processed event ids, in the same transaction as their own writes. Clean up old outbox rows on a schedule, or with CDC delete them right after insert, since the log already captured them. The mirror image on the consuming side is the <dfn>inbox</dfn> pattern: a <code>processed_events</code> table with a unique key on <code>event_id</code>.</p>
+
+<h2 id="tcc">Try-Confirm-Cancel</h2>
+<p><dfn>Try-Confirm-Cancel</dfn> (TCC) is a reservation-based protocol that sits between 2PC and sagas. Each participant exposes three operations:</p>
+<ol class="steps">
+<li><strong>Try</strong> checks business rules and reserves resources without making them final: hold $29.99 on the card, mark one unit of <code>sku-4471</code> as reserved for <code>ord_1002</code> until 10:15:00.</li>
+<li><strong>Confirm</strong> turns every reservation into the real thing (capture the hold, decrement stock). Called only if every Try succeeded. Must be idempotent and must succeed if Try did.</li>
+<li><strong>Cancel</strong> releases the reservations if any Try failed. Reservations also expire on their own, so a crashed coordinator does not leave resources held forever.</li>
+</ol>
+<p>The structure is 2PC's prepare and commit, implemented in business logic instead of in the database. The differences that matter: participants never hold database locks between phases, only business-level reservations with timeouts, so nothing blocks; and the intermediate state is explicit ("reserved", "on hold") rather than invisible. Card networks already work this way (authorise, then capture or void), which is why TCC fits payments, ticket booking and inventory well. The cost is three APIs per participant instead of one, plus handling the awkward cases: a Cancel that arrives before its Try (record it and reject the late Try), and a Confirm retried after a timeout.</p>
+
+<h2 id="comparison">Choosing an approach</h2>
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>2PC / XA</th><th>2PC over consensus</th><th>Saga</th><th>TCC</th><th>Outbox</th></tr></thead>
+<tbody>
+<tr><th>Atomicity</th><td class="yes">Atomic</td><td class="yes">Atomic</td><td class="meh">Eventually, via compensation</td><td class="meh">Eventually, via cancel</td><td>Atomic DB write + event</td></tr>
+<tr><th>Isolation</th><td class="meh">Each participant's own isolation (locks held to commit)</td><td class="yes">Full</td><td class="no">None, needs countermeasures</td><td class="meh">Reservations are visible</td><td>Not applicable</td></tr>
+<tr><th>Blocks on failure</th><td class="no">Yes, coordinator crash</td><td class="yes">Only during leader election</td><td class="yes">No</td><td class="yes">No, reservations expire</td><td class="yes">No</td></tr>
+<tr><th>Latency</th><td class="meh">2 round trips + fsyncs, locks held</td><td class="meh">Same plus consensus</td><td class="yes">Each step local and short</td><td class="meh">2 round trips, no locks</td><td class="yes">One local commit</td></tr>
+<tr><th>Participants must</th><td>Speak XA</td><td>Be in the same database</td><td>Offer compensations</td><td>Offer try/confirm/cancel</td><td>Share a DB with the outbox</td></tr>
+<tr><th>Typical home</th><td>Within one DB vendor, legacy JTA apps</td><td>Spanner, CockroachDB</td><td>Order flows across microservices</td><td>Payments, bookings</td><td>Every service that publishes events</td></tr>
+</tbody></table></div>
+<p>The question to ask first is whether you need a distributed transaction at all. If two pieces of data must always change together, they may belong in the same service and the same database, where an ordinary transaction does the job. Redrawing a boundary is often cheaper than coordinating across it; see <a href="microservices.html">Monolith vs Microservices</a>.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+<li><strong>Google Spanner</strong>: 2PC across shards where every participant is a Paxos group, plus TrueTime timestamps for external consistency. CockroachDB and YugabyteDB follow the same model with Raft.</li>
+<li><strong>Uber Cadence and Temporal</strong>: Uber built Cadence to run long-lived workflows such as trips and payments as durable code; its creators later forked it as Temporal. Workflows are ordinary functions whose progress is persisted after every step, so a saga survives worker crashes and can wait days for a timer or signal. AWS Step Functions offers the same orchestration model as a managed service.</li>
+<li><strong>Debezium</strong>: the open-source CDC platform on Kafka Connect, with connectors for PostgreSQL, MySQL, SQL Server, MongoDB and others, and a built-in outbox event router that turns outbox rows into properly keyed Kafka messages.</li>
+<li><strong>PostgreSQL and MySQL</strong>: both support being a 2PC participant (<code>PREPARE TRANSACTION</code> and <code>XA PREPARE</code>). PostgreSQL disables it by default (<code>max_prepared_transactions = 0</code>) precisely because forgotten prepared transactions hold locks indefinitely.</li>
+<li><strong>Payment networks</strong>: card authorisation followed by capture or void is TCC in production at enormous scale. A hold that is never captured expires on its own after some days.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>Whenever one user action changes data owned by two services: checkout (order, payment, inventory), money transfer between accounts on different shards, booking a trip (flight, hotel, car). Name the pattern and its consistency model in one breath: "an orchestrated saga with compensations, events published through an outbox, idempotent consumers".</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>Why not 2PC? Blocking on coordinator failure, locks held across the network, participants that do not support it.</li>
+<li>What does the user see while the saga is running? A PENDING state, and what the UI shows for it.</li>
+<li>What if a compensation fails? Retry with backoff, compensations must be idempotent, park and alert as a last resort.</li>
+<li>How do you publish an event reliably after a DB write? Transactional outbox, polling or CDC relay, at-least-once delivery.</li>
+<li>How do you prevent double-charging if the orchestrator retries? Idempotency key per saga step.</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>"Write to the database and then publish to Kafka" with no answer for a crash in between.</li>
+<li>Calling a compensation a rollback and assuming nobody saw the intermediate state.</li>
+<li>Reaching for 2PC across HTTP microservices or third-party APIs.</li>
+<li>No idempotency anywhere in a design that retries.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://www.cs.cornell.edu/andru/cs711/2002fa/reading/sagas.pdf" target="_blank" rel="noopener">Sagas</a><span>Hector Garcia-Molina and Kenneth Salem, SIGMOD 1987. The original paper: long-lived transactions as sequences of local transactions with compensations.</span></li>
+<li><a href="https://www.usenix.org/conference/osdi12/technical-sessions/presentation/corbett" target="_blank" rel="noopener">Spanner: Google's Globally-Distributed Database</a><span>Corbett et al., OSDI 2012. Two-phase commit over Paxos groups, and TrueTime.</span></li>
+<li><a href="https://microservices.io/patterns/data/saga.html" target="_blank" rel="noopener">Pattern: Saga</a><span>Chris Richardson, microservices.io. Choreography vs orchestration, with links to the transactional outbox pattern and isolation countermeasures.</span></li>
+<li><a href="https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html" target="_blank" rel="noopener">Debezium Outbox Event Router</a><span>Debezium documentation. How a CDC connector turns outbox table inserts into Kafka events.</span></li>
+<li><a href="https://docs.temporal.io/" target="_blank" rel="noopener">Temporal documentation</a><span>Durable execution for long-running workflows; the practical way to run orchestrated sagas.</span></li>
+</ul>

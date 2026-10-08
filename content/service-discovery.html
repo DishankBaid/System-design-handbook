@@ -1,0 +1,373 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">The checkout service needs to call the payments service. Yesterday payments ran on three machines at <code>10.0.1.17</code>, <code>10.0.2.31</code> and <code>10.0.3.8</code>. This morning the autoscaler added two more, a deploy replaced all of them, and one host died at 04:12. Nobody edited a config file, yet checkout must keep finding a healthy payments instance on every request.</p>
+<p>In a data center of fixed servers, addresses lived in config files and changed a few times a year. In the cloud and on Kubernetes, instances are cattle: they get a fresh IP every time they start, they live for hours or minutes, and the number of them follows the traffic curve. A hard-coded address list is wrong within a day.</p>
+<p><dfn>Service discovery</dfn> is the mechanism that maps a logical service name (<code>payments</code>) to the current set of healthy network locations (<code>ip:port</code> pairs) and keeps that mapping fresh as instances come and go. Every system with more than a handful of services has one, whether it is a dedicated registry, DNS, or a platform feature such as Kubernetes Services. It is the plumbing under <a href="load-balancing.html">load balancing</a> and a prerequisite for <a href="microservices.html">microservices</a>.</p>
+<p>A discovery system has to do four jobs:</p>
+<ol class="steps">
+<li><strong>Register.</strong> Record that a new instance of <code>payments</code> exists at <code>10.0.4.22:8443</code>.</li>
+<li><strong>Track health.</strong> Notice when an instance crashes, hangs or is being shut down, and stop handing it out.</li>
+<li><strong>Answer lookups.</strong> Return the healthy instances for a name, fast, at the rate of every outgoing call (or every connection).</li>
+<li><strong>Propagate changes.</strong> Get updates to every caller quickly, because a caller with a stale list keeps sending traffic to a dead box.</li>
+</ol>
+
+<h2 id="patterns">Client-side vs server-side discovery</h2>
+<p>There are two places to put the lookup, and the choice shapes everything else.</p>
+<p>In <dfn>client-side discovery</dfn>, the caller asks the registry for the instance list, caches it, picks one instance itself (round robin, least requests, zone-aware) and connects directly. In <dfn>server-side discovery</dfn>, the caller sends the request to a stable address, a load balancer or proxy, and that component consults the registry and forwards the request.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 310" role="img" aria-label="Left: client-side discovery, the caller looks up the registry and calls an instance directly. Right: server-side discovery, the caller calls a load balancer that is fed endpoints by the registry and forwards to an instance.">
+<text class="t b" x="20" y="24">Client-side discovery</text>
+<rect class="n svc" x="20" y="50" width="130" height="60" rx="8"/><text class="t b mid" x="85" y="76">order-svc</text><text class="t xs mute mid" x="85" y="94">+ discovery library</text>
+<rect class="n db" x="200" y="50" width="130" height="56" rx="8"/><text class="t b mid" x="265" y="74">Registry</text><text class="t xs mute mid" x="265" y="92">Consul / Eureka</text>
+<rect class="n svc" x="200" y="140" width="130" height="36" rx="7"/><text class="t mono mid" x="265" y="162">10.0.1.17:8443</text>
+<rect class="n svc" x="200" y="190" width="130" height="36" rx="7"/><text class="t mono mid" x="265" y="212">10.0.2.31:8443</text>
+<rect class="n svc" x="200" y="240" width="130" height="36" rx="7"/><text class="t mono mid" x="265" y="262">10.0.3.8:8443</text>
+<path class="e" d="M150,72 H196"/><text class="t xs mute mid" x="174" y="64">1. find</text>
+<path class="e accent" d="M85,110 C85,190 130,208 196,208"/><text class="t xs accent" x="100" y="146">2. call directly</text>
+<path class="e dash" d="M330,158 C352,158 352,84 334,84"/><text class="t xs mute mid" x="358" y="124" transform="rotate(-90 358 124)">register</text>
+<text class="t xs mute" x="20" y="300">Pro: no extra hop, smart balancing. Con: a library per language.</text>
+
+<path class="line faint" d="M375,10 V300" style="stroke-dasharray:4 4"/>
+
+<text class="t b" x="395" y="24">Server-side discovery</text>
+<rect class="n svc" x="395" y="50" width="110" height="56" rx="8"/><text class="t b mid" x="450" y="74">order-svc</text><text class="t xs mute mid" x="450" y="92">plain HTTP client</text>
+<rect class="n ext" x="395" y="170" width="110" height="56" rx="8"/><text class="t b mid" x="450" y="194">Load balancer</text><text class="t xs mute mid" x="450" y="212">or proxy</text>
+<rect class="n svc" x="575" y="60" width="130" height="36" rx="7"/><text class="t mono mid" x="640" y="82">10.0.1.17:8443</text>
+<rect class="n svc" x="575" y="110" width="130" height="36" rx="7"/><text class="t mono mid" x="640" y="132">10.0.2.31:8443</text>
+<rect class="n svc" x="575" y="160" width="130" height="36" rx="7"/><text class="t mono mid" x="640" y="182">10.0.3.8:8443</text>
+<rect class="n db" x="575" y="230" width="130" height="50" rx="8"/><text class="t b mid" x="640" y="252">Registry</text><text class="t xs mute mid" x="640" y="268">or platform API</text>
+<path class="e accent" d="M450,106 V166"/><text class="t xs accent" x="458" y="140">1. call</text>
+<path class="e accent" d="M505,190 C540,190 540,78 571,78"/>
+<path class="e" d="M505,196 C545,196 540,128 571,128"/>
+<path class="e" d="M505,202 C540,202 545,178 571,178"/>
+<text class="t xs mute" x="512" y="226">2. forward</text>
+<path class="e dash" d="M571,262 C520,262 480,262 480,230"/><text class="t xs mute" x="500" y="280">endpoints</text>
+<path class="e dash" d="M640,196 V226"/><text class="t xs mute" x="648" y="216">register</text>
+<text class="t xs mute" x="395" y="300">Pro: simple callers. Con: extra hop, LB must scale.</text>
+</svg>
+</div>
+<figcaption><b>Where the lookup happens.</b> On the left the caller holds the instance list and chooses. On the right the caller only knows one stable address, and the balancer does the choosing. Either way, instances still have to get into the registry.</figcaption>
+</figure>
+
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Client-side</th><th>Server-side</th></tr></thead>
+<tbody>
+<tr><th>Network hops per call</th><td class="yes">One: caller to instance</td><td class="meh">Two: caller to balancer to instance (except kernel-level ClusterIP, which adds no hop)</td></tr>
+<tr><th>Load balancing quality</th><td class="yes">Caller sees per-request latency and errors, can do least-requests or zone-aware routing</td><td class="meh">Good at L7, coarse at L4</td></tr>
+<tr><th>Polyglot cost</th><td class="no">A discovery library per language, all kept in sync</td><td class="yes">Any HTTP client works</td></tr>
+<tr><th>Failure blast radius</th><td class="yes">No central hop on the data path</td><td class="meh">Balancer must be redundant and scaled with traffic</td></tr>
+<tr><th>Examples</th><td>Netflix Eureka + Ribbon, gRPC name resolvers, Finagle</td><td>AWS ALB with target groups, Kubernetes ClusterIP, Nginx with Consul Template</td></tr>
+</tbody></table></div>
+<p>A <a href="#service-mesh">service mesh</a> blends the two: the lookup is client-side in the sense that it happens next to the caller, but it lives in a sidecar proxy, so the application code stays as simple as in the server-side model.</p>
+
+<h2 id="registry">The service registry</h2>
+<p>A <dfn>service registry</dfn> is a small, highly available database of service instances. Each entry holds the service name, address, port, metadata (version, zone, weight) and a health status. The interesting design questions are how entries get in, how dead entries get out, and how callers hear about changes.</p>
+
+<h3 id="registration">Registration: who writes the entry</h3>
+<div class="defs">
+<div><h4>Self-registration</h4><p>The instance calls the registry on startup and deregisters on shutdown. The Eureka client inside a Spring Boot app works this way. Simple, but every service in every language must embed the logic and get it right.</p></div>
+<div><h4>Third-party registration</h4><p>Something else watches the platform and writes entries: the Kubernetes endpoints controller, a Consul agent reading a service definition, AWS Cloud Map with ECS. The application knows nothing about discovery.</p></div>
+</div>
+<p>Graceful shutdown should always deregister explicitly. Most instance removals are planned (deploys, scale-in), and an explicit deregistration takes effect in milliseconds. The timeout machinery below exists for the unplanned cases: crashes, kernel panics, network cuts and hung processes.</p>
+
+<h3 id="liveness">Heartbeats, TTLs and health checks</h3>
+<p>The registry cannot see a crash directly. It learns about it from silence, using one of two models:</p>
+<ul>
+<li><strong>Leases with heartbeats (push).</strong> The instance holds a <dfn>lease</dfn> with a time to live (TTL) and renews it by sending a <dfn>heartbeat</dfn> every few seconds. If renewals stop, the lease expires and the entry is removed. etcd leases, ZooKeeper sessions (whose ephemeral znodes vanish when the session expires), Consul TTL checks and Eureka renewals all work this way.</li>
+<li><strong>Active health checks (pull).</strong> Something probes the instance, for example <code>GET /healthz</code> every 10 seconds, and marks it unhealthy after a few failures. Consul agents run HTTP, TCP and gRPC checks locally on each node; the Kubernetes kubelet runs readiness probes.</li>
+</ul>
+<p>A heartbeat proves the process can send packets. A probe of a real endpoint proves it can serve requests, which catches a deadlocked worker pool that still has a live heartbeat thread. Both are bounded by the same trade-off: detection time is roughly <code>interval × allowed misses</code>, and shortening it raises the rate of false removals during GC pauses and network blips.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 30 720 255" role="img" aria-label="Lifecycle of one instance: it registers with a 30 second lease, renews it with heartbeats, crashes so the client keeps sending it traffic, then the check fails and the registry removes it and pushes an update to the client">
+<g data-show="1 2"><rect class="n svc" x="20" y="60" width="140" height="64" rx="8"/></g>
+<g data-show="3 4"><rect class="n bad" x="20" y="60" width="140" height="64" rx="8"/></g>
+<text class="t b mid" x="90" y="86">payments</text><text class="t mono mid" x="90" y="106">10.0.1.17:8443</text>
+<text class="t xs red mid" x="90" y="142" data-show="3 4">process hung</text>
+
+<rect class="n db" x="230" y="40" width="220" height="150" rx="8"/>
+<text class="t b" x="246" y="64">Registry: payments</text>
+<path class="line faint" d="M246,76 H434"/>
+<text class="t mono" x="246" y="100">10.0.1.17</text>
+<text class="t sm accent" x="340" y="100" data-show="1">passing, new</text>
+<text class="t sm" x="340" y="100" data-show="2">passing, renewed</text>
+<text class="t sm" x="340" y="100" data-show="3">passing (stale)</text>
+<text class="t sm red" x="340" y="100" data-show="4">critical: removed</text>
+<text class="t mono" x="246" y="130">10.0.2.31</text><text class="t sm" x="340" y="130">passing</text>
+<text class="t mono" x="246" y="160">10.0.3.8</text><text class="t sm" x="340" y="160">passing</text>
+
+<rect class="n svc" x="560" y="60" width="140" height="110" rx="8"/>
+<text class="t b mid" x="630" y="82">order-svc</text><text class="t xs mute mid" x="630" y="100">cached endpoints</text>
+<text class="t mono" x="584" y="122" data-show="1 2">10.0.1.17</text>
+<text class="t mono red" x="584" y="122" data-show="3">10.0.1.17 ✗</text>
+<text class="t mono" x="584" y="122" data-show="4">10.0.2.31</text>
+<text class="t mono" x="584" y="140" data-show="1 2 3">10.0.2.31</text>
+<text class="t mono" x="584" y="140" data-show="4">10.0.3.8</text>
+<text class="t mono" x="584" y="158" data-show="1 2 3">10.0.3.8</text>
+
+<g data-show="1"><path class="e accent" d="M160,85 H226"/><text class="t xs accent mid" x="193" y="77">register</text></g>
+<g data-show="2"><path class="e" d="M160,85 H226"/><text class="t xs mid" x="193" y="77">heartbeat</text></g>
+<g data-show="3"><path class="e dash red" d="M160,85 H226"/><text class="t xs red mid" x="193" y="77">silence</text></g>
+<g data-show="4"><path class="e red" d="M230,110 H164"/><text class="t xs red mid" x="197" y="128">check fails</text></g>
+<g data-show="1"><path class="e accent" d="M450,100 H556"/><text class="t xs accent mid" x="503" y="92">push: 3 instances</text></g>
+<g data-show="2 3"><path class="e dash" d="M450,100 H556"/><text class="t xs mute mid" x="503" y="92">no change</text></g>
+<g data-show="4"><path class="e accent" d="M450,100 H556"/><text class="t xs accent mid" x="503" y="92">push: 2 instances</text></g>
+
+<path class="line faint" d="M20,215 H700"/>
+<g data-show="1"><text class="t b mono" x="20" y="242">t = 0 s</text>
+<text class="t sm" x="140" y="242">The instance starts and registers itself with a 30 s lease.</text>
+<text class="t sm" x="140" y="264">The registry stores it and pushes the new list to every watcher.</text></g>
+<g data-show="2"><text class="t b mono" x="20" y="242">t = 10..90 s</text>
+<text class="t sm" x="140" y="242">A heartbeat every 10 s renews the lease.</text>
+<text class="t sm" x="140" y="264">Callers spread requests across all three instances.</text></g>
+<g data-show="3"><text class="t b mono red" x="20" y="242">t = 100 s</text>
+<text class="t sm" x="140" y="242">The process hangs. Heartbeats stop, but the lease is still valid until t = 120 s.</text>
+<text class="t sm" x="140" y="264">Callers keep sending a third of their requests to a dead box.</text></g>
+<g data-show="4"><text class="t b mono" x="20" y="242">t = 121 s</text>
+<text class="t sm" x="140" y="242">The lease expires, the check goes critical, and the entry is removed.</text>
+<text class="t sm" x="140" y="264">Watchers get the new list at once. Detection took 21 s after the crash.</text></g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Register</button><button type="button" data-step="2" aria-pressed="false">Heartbeats</button><button type="button" data-step="3" aria-pressed="false">Crash</button><button type="button" data-step="4" aria-pressed="false">Check fails, removed</button></div>
+</div>
+<figcaption><b>One instance's life in the registry.</b> The dangerous window is step 3: the instance is dead but still advertised. Its length is the lease TTL minus the time since the last heartbeat, plus however long callers take to hear about the removal.</figcaption>
+</figure>
+
+<h3 id="watch-vs-poll">Getting changes to callers: poll or watch</h3>
+<p>Removing the entry from the registry is half the job. Callers cache the instance list, because asking the registry on every request would make it the busiest service in the company. The question is how fast the cache learns about changes.</p>
+<ul>
+<li><strong>Polling.</strong> The client re-fetches the list every N seconds. Simple and robust, but adds up to N seconds of staleness to every change. Eureka clients poll every 30 seconds by default.</li>
+<li><strong>Watches.</strong> The client holds a long-lived request and the registry answers when something changes: etcd watches on a key prefix, ZooKeeper watches (classically one-shot and re-armed after each event; persistent watches since 3.6), Consul blocking queries, the Kubernetes watch API. Changes arrive in milliseconds.</li>
+</ul>
+<p>The simulation below makes the difference concrete. Three payments instances heartbeat every 10 seconds with a 30 second TTL, a caller sends 300 requests per second round robin, and <code>10.0.1.17</code> hangs at t = 100 s.</p>
+<pre><code class="language-python">INSTANCES = ["10.0.1.17", "10.0.2.31", "10.0.3.8"]
+DEAD = "10.0.1.17"
+
+
+def simulate(heartbeat, ttl, client_refresh, crash_at=100, rps=300, end=400):
+    """One-second ticks. DEAD stops heartbeating at crash_at.
+    Returns (removed_from_registry_at, client_stopped_at, failed_requests)."""
+    last_beat, registry, view = {}, set(), []
+    removed_at = stopped_at = None
+    failed = 0
+    for t in range(end):
+        for ip in INSTANCES:
+            if t % heartbeat == 0 and not (ip == DEAD and t &gt;= crash_at):
+                last_beat[ip] = t
+                registry.add(ip)
+        for ip in list(registry):
+            if t - last_beat[ip] &gt; ttl:          # lease expired
+                registry.discard(ip)
+                removed_at = t
+        if t % client_refresh == 0:              # client re-reads the registry
+            view = sorted(registry)
+        if t &gt;= crash_at and DEAD in view:
+            failed += rps // len(view)           # round-robin share sent to the dead box
+        elif t &gt;= crash_at and stopped_at is None:
+            stopped_at = t
+    return removed_at, stopped_at, failed
+
+
+for name, hb, ttl, refresh in [
+    ("poll every 30 s, TTL 30 s", 10, 30, 30),
+    ("watch (push),   TTL 30 s", 10, 30, 1),
+    ("watch (push),   TTL 15 s", 5, 15, 1),
+]:
+    removed, stopped, failed = simulate(hb, ttl, refresh)
+    print(f"{name}: removed t={removed}s, client stops t={stopped}s, failed requests={failed:,}")
+
+# poll every 30 s, TTL 30 s: removed t=121s, client stops t=150s, failed requests=5,000
+# watch (push),   TTL 30 s: removed t=121s, client stops t=121s, failed requests=2,100
+# watch (push),   TTL 15 s: removed t=111s, client stops t=111s, failed requests=1,100</code></pre>
+<p>Polling more than doubles the damage here, because the client only re-read the list 29 seconds after the registry already knew. Shrinking the TTL halves it again. In practice the failed requests are not all user-visible: a caller with <a href="fault-tolerance.html">retries and outlier detection</a> re-sends a failed call to another instance and ejects a host after a few consecutive errors, which shrinks the window from seconds to a handful of requests. Discovery and client-side resilience work together; neither is enough alone.</p>
+
+<h2 id="worked-example">Worked example: how stale can a caller be?</h2>
+<p>Every cache layer between the registry and the caller adds delay. Netflix's Eureka stack is the classic illustration because it has several layers, each with a sensible-looking default. Worst case for a caller to stop using a crashed instance:</p>
+<div class="calc">Lease expiry          90 s lease, doubled by renew() bug = 180 s
+Eviction task         runs every 60 s, just missed      + 60 s
+Server response cache read-only cache refresh           + 30 s
+Client registry fetch poll every 30 s                   + 30 s
+Ribbon server list    load balancer refresh every 30 s  + 30 s
+                                                         ------
+Worst case                                              ≈ <span class="r">330 s, 5.5 minutes</span></div>
+<p>The lease line surprises people: the documented lease is 90 seconds, but <code>Lease.java</code> itself notes that <code>renew()</code> sets the timestamp one duration ahead, so real expiry is 2 × 90 s. The bug is deliberately left unfixed. Many write-ups quote 240 seconds because they miss it.</p>
+<p>Five and a half minutes of a third of the traffic hitting a dead instance is why Eureka users lean so hard on client retries, and why newer systems prefer push. The equivalent path in Kubernetes is much shorter:</p>
+<div class="calc">Readiness probe       periodSeconds 10 × failureThreshold 3  ≈ 30 s
+EndpointSlice update  controller writes, watchers notified     ≈ 1 s
+kube-proxy            reprograms iptables / IPVS on each node  ≈ 1 s
+                                                                ------
+Worst case                                                    ≈ <span class="r">30 to 35 s</span></div>
+<p>Tuning either stack is a trade between detection speed and false positives. A 1 second heartbeat with a 3 second TTL detects crashes fast, and also removes every instance that hits a 4 second garbage collection pause.</p>
+
+<h2 id="dns">DNS-based discovery</h2>
+<p>The oldest registry in the world is <a href="dns.html">DNS</a>, and every language already has a client for it. A name such as <code>payments.service.consul</code> or <code>payments.shop.svc.cluster.local</code> resolves to the A records of current instances. <dfn>SRV records</dfn> (RFC 2782) carry port, priority and weight as well, so instances need not share a port.</p>
+<p>DNS works well as the interface and badly as the whole system:</p>
+<ul>
+<li><strong>Caching ignores your TTL.</strong> Stub resolvers, sidecar caches and language runtimes cache answers on their own terms. The JVM caches successful lookups for 30 seconds by default, and forever when a security manager is installed, unless <code>networkaddress.cache.ttl</code> is set.</li>
+<li><strong>Connection pools resolve once.</strong> Many HTTP and database clients look up the name when they open a connection and reuse it for hours. A perfect DNS answer does nothing for a connection that already exists.</li>
+<li><strong>No health or load information.</strong> Plain DNS cannot say which instance is overloaded. Clients usually take the first address, so ordering matters, and a response is capped in size, so you cannot return hundreds of instances.</li>
+</ul>
+<p>Registries that offer a DNS interface (Consul, CoreDNS in Kubernetes) fix the health part by answering only with instances whose checks pass, and by setting a low TTL. The caching problems stay on the client side, which is why the data-plane approaches below exist.</p>
+
+<h2 id="kubernetes">Kubernetes Services</h2>
+<p>Kubernetes builds discovery into the platform, so most teams on it never run a separate registry. Pods get new IPs on every restart; a <dfn>Service</dfn> gives a set of pods (selected by labels such as <code>app=payments</code>) one stable name and one stable virtual IP.</p>
+<ul>
+<li><strong>Endpoints.</strong> The control plane watches pods matching the selector and writes their IPs into <dfn>EndpointSlice</dfn> objects (up to 100 endpoints each by default). A pod is listed as ready only while its readiness probe passes, so the kubelet's probe is the health check.</li>
+<li><strong>ClusterIP.</strong> The default Service type gets a virtual IP, for example <code>10.96.12.7</code>. No process listens on it. <dfn>kube-proxy</dfn> on every node watches EndpointSlices and programs kernel rules (iptables, IPVS, or nftables in recent versions) that rewrite packets for <code>10.96.12.7:80</code> to a randomly chosen ready pod.</li>
+<li><strong>DNS.</strong> CoreDNS serves <code>payments.shop.svc.cluster.local</code> as an A record pointing at the ClusterIP. Because the IP never changes, client-side DNS caching stops being a problem.</li>
+<li><strong>Headless Services.</strong> With <code>clusterIP: None</code> there is no virtual IP; DNS returns the IPs of every ready pod. Use it when the client must pick pods itself: databases with a primary, StatefulSets with stable per-pod names like <code>kafka-0.kafka.data.svc.cluster.local</code>, or gRPC clients doing their own balancing.</li>
+</ul>
+
+<figure class="fig wide">
+<div class="fig-frame">
+<svg viewBox="0 0 720 340" role="img" aria-label="Kubernetes Service: the checkout pod resolves the service name through CoreDNS to a ClusterIP, connects, and kernel rules programmed by kube-proxy rewrite the connection to a ready payments pod. The EndpointSlice controller tracks readiness and writes slices to the API server, which kube-proxy and CoreDNS watch.">
+<rect class="zone" x="10" y="10" width="700" height="90" rx="10"/>
+<text class="t xs mute" x="22" y="27">Control plane</text>
+<rect class="n ext" x="40" y="35" width="140" height="48" rx="8"/><text class="t b mid" x="110" y="56">CoreDNS</text><text class="t xs mute mid" x="110" y="72">name → ClusterIP</text>
+<rect class="n ext" x="280" y="35" width="160" height="48" rx="8"/><text class="t b mid" x="360" y="56">kube-apiserver</text><text class="t xs mute mid" x="360" y="72">EndpointSlices in etcd</text>
+<rect class="n svc" x="540" y="35" width="160" height="48" rx="8"/><text class="t b mid" x="620" y="56">EndpointSlice</text><text class="t b mid" x="620" y="72">controller</text>
+<path class="e" d="M276,59 H184"/><text class="t xs mute mid" x="230" y="52">watch</text>
+<path class="e" d="M536,59 H444"/><text class="t xs mute mid" x="490" y="52">write</text>
+
+<rect class="zone" x="10" y="115" width="700" height="215" rx="10"/>
+<text class="t xs mute" x="22" y="132">Nodes (data plane)</text>
+<rect class="n svc" x="30" y="160" width="120" height="56" rx="8"/><text class="t b mid" x="90" y="184">checkout pod</text><text class="t mono mid" x="90" y="202">10.244.4.2</text>
+<rect class="n ext" x="280" y="160" width="160" height="56" rx="8"/><text class="t b mid" x="360" y="184">kube-proxy rules</text><text class="t xs mute mid" x="360" y="202">iptables / IPVS in kernel</text>
+<rect class="n svc" x="540" y="140" width="160" height="44" rx="8"/><text class="t sm b mid" x="620" y="158">payments-a</text><text class="t mono mid" x="620" y="175">10.244.1.5</text>
+<rect class="n svc" x="540" y="196" width="160" height="44" rx="8"/><text class="t sm b mid" x="620" y="214">payments-b</text><text class="t mono mid" x="620" y="231">10.244.2.9</text>
+<rect class="n ghost" x="540" y="252" width="160" height="44" rx="8"/><text class="t sm mute mid" x="620" y="270">payments-c</text><text class="t xs red mid" x="620" y="287">not ready: no traffic</text>
+
+<path class="e dash both" d="M130,156 V87"/><text class="t xs mute" x="138" y="138">1. resolve</text><text class="t xs mute" x="138" y="151">payments.shop</text>
+<path class="e accent" d="M150,188 H276"/><text class="t xs mid" x="213" y="168">2. connect</text><text class="t mono mid" x="213" y="181">10.96.12.7:80</text>
+<path class="e dash" d="M360,87 V156"/><text class="t xs mute" x="368" y="140">watch slices</text>
+<path class="e accent" d="M440,182 C490,182 490,162 536,162"/>
+<path class="e" d="M440,194 C490,194 490,218 536,218"/>
+<text class="t xs mid" x="360" y="236">3. DNAT to a random ready pod</text>
+<path class="e dash" d="M640,136 V87"/><text class="t xs mute end" x="632" y="128">readiness</text>
+<text class="t xs mute" x="30" y="318">The ClusterIP is virtual: nothing listens on it, the kernel rewrites the destination of each new connection.</text>
+
+<path class="flow" d="M150,188 H276"/>
+<path class="flow" d="M440,182 C490,182 490,162 536,162"/>
+</svg>
+</div>
+<figcaption><b>A Kubernetes Service.</b> The animated path is a request: one DNS lookup (cached safely, since the ClusterIP never changes), then a connection that the kernel rewrites to a ready pod. The control plane never touches the request; it only keeps the rules on every node current.</figcaption>
+</figure>
+
+<div class="callout warn">
+<div class="callout-title">Common mistake: gRPC behind a ClusterIP</div>
+<p>kube-proxy balances <em>connections</em>, not requests. HTTP/2 and gRPC clients open one long-lived connection and multiplex every request over it, so all traffic from a checkout pod lands on one payments pod while the others sit idle, and new pods added by the autoscaler get nothing. Fix it with a headless Service plus client-side balancing (gRPC's DNS resolver with <code>round_robin</code>), a periodic maximum connection age on the server, or an L7 proxy or mesh that balances per request.</p>
+</div>
+<p>A second Kubernetes-specific trap is shutdown. When a pod is deleted, the kubelet sends SIGTERM and the endpoint removal propagates to every node <em>in parallel</em>. For a second or two, other nodes still route new connections to a pod that is already exiting. The standard fix is a <code>preStop</code> hook that sleeps a few seconds before the app starts shutting down, so it keeps serving until every node has dropped it.</p>
+
+<h2 id="service-mesh">Service mesh: discovery in the data plane</h2>
+<p>A <dfn>service mesh</dfn> moves discovery, load balancing, retries, timeouts and mutual TLS out of application libraries and into a proxy that runs next to every instance, usually as a sidecar container in the same pod. The application calls <code>http://payments</code> on localhost; the sidecar knows the real endpoints.</p>
+<p>A mesh has two halves, and the split is the key idea:</p>
+<div class="defs">
+<div><h4>Data plane</h4><p>The proxies that carry every request, typically <dfn>Envoy</dfn>. Each holds the full endpoint list for the services it calls and balances per request using live latency and error data. Fast path, no central hop.</p></div>
+<div><h4>Control plane</h4><p>The component that watches the platform (Kubernetes API, Consul catalog) and pushes configuration to every proxy. In Istio this is <code>istiod</code>. It is off the request path: if it goes down, proxies keep routing with their last configuration.</p></div>
+</div>
+<p>The control plane talks to Envoy over <dfn>xDS</dfn>, a family of gRPC streaming APIs: LDS for listeners, RDS for HTTP routes, CDS for upstream clusters, EDS for the endpoints in each cluster, and SDS for certificates. Discovery proper is EDS: when a payments pod becomes ready, istiod pushes an updated endpoint list to every proxy that calls payments, typically within a second.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 280" role="img" aria-label="Service mesh: istiod in the control plane pushes xDS configuration to Envoy sidecars; requests flow from the checkout app through its sidecar to the payments sidecar and app">
+<rect class="n ext" x="260" y="20" width="200" height="56" rx="8"/><text class="t b mid" x="360" y="44">istiod</text><text class="t xs mute mid" x="360" y="62">control plane</text>
+<text class="t xs accent" x="475" y="40">pushes listeners, routes,</text><text class="t xs accent" x="475" y="54">clusters, endpoints, certs</text><text class="t xs accent" x="475" y="68">over xDS streams</text>
+
+<rect class="zone" x="30" y="130" width="290" height="110" rx="10"/><text class="t xs mute" x="42" y="147">pod: checkout</text>
+<rect class="n svc" x="50" y="160" width="110" height="56" rx="8"/><text class="t b mid" x="105" y="184">checkout</text><text class="t xs mute mid" x="105" y="202">app</text>
+<rect class="n cache" x="190" y="160" width="110" height="56" rx="8"/><text class="t b mid" x="245" y="184">Envoy</text><text class="t xs mute mid" x="245" y="202">sidecar</text>
+
+<rect class="zone" x="400" y="130" width="290" height="110" rx="10"/><text class="t xs mute end" x="678" y="147">pod: payments</text>
+<rect class="n cache" x="420" y="160" width="110" height="56" rx="8"/><text class="t b mid" x="475" y="184">Envoy</text><text class="t xs mute mid" x="475" y="202">sidecar</text>
+<rect class="n svc" x="560" y="160" width="110" height="56" rx="8"/><text class="t b mid" x="615" y="184">payments</text><text class="t xs mute mid" x="615" y="202">app</text>
+
+<path class="e dash accent" d="M320,76 C320,120 245,110 245,156"/>
+<path class="e dash accent" d="M400,76 C400,120 475,110 475,156"/>
+<path class="e" d="M160,188 H186"/>
+<path class="e" d="M300,188 H416"/><text class="t xs mid" x="358" y="180">mTLS</text><text class="t xs mid" x="358" y="206">retries, LB</text>
+<path class="e" d="M530,188 H556"/>
+<path class="flow" d="M160,188 H186"/><path class="flow" d="M300,188 H416"/><path class="flow" d="M530,188 H556"/>
+
+<text class="t xs mute" x="30" y="264">Data plane: every request passes through two proxies; the control plane never sees requests.</text>
+</svg>
+</div>
+<figcaption><b>Control plane vs data plane.</b> The dashed lines are configuration, pushed only when something changes. The animated line is traffic. Losing istiod freezes configuration but does not stop traffic.</figcaption>
+</figure>
+
+<p>The mesh costs a proxy per pod (memory, CPU, and a fraction of a millisecond per hop) and a complex control plane to operate. Two newer variants reduce that: Istio's ambient mode replaces sidecars with a per-node proxy for L4 and optional per-service proxies for L7, and <strong>proxyless gRPC</strong> lets gRPC clients speak xDS directly, getting mesh discovery with no proxy at all.</p>
+
+<h2 id="consistency">CP or AP: how consistent must the registry be?</h2>
+<p>A registry is a replicated database, so the <a href="cap-pacelc.html">CAP</a> question applies: during a network partition, does it refuse to answer (CP) or answer with possibly stale data (AP)?</p>
+<ul>
+<li><strong>CP registries.</strong> ZooKeeper (ZAB), etcd (Raft) and Consul's servers (Raft) replicate writes through a <a href="consensus.html">consensus</a> quorum. A minority partition cannot register instances, and linearizable reads fail there too. This is exactly what you want for leader election and locks.</li>
+<li><strong>AP registries.</strong> Eureka servers replicate to each other asynchronously and each answers from its own copy. During a partition both sides keep accepting registrations and serving reads, and they reconcile afterwards.</li>
+</ul>
+<p>For discovery, the AP argument is strong. The data is already stale by the time it reaches a caller, and callers can survive a wrong entry (a failed call gets retried elsewhere). What callers cannot survive is <em>no</em> answer: a service that cannot find payments at all is down. So even CP registries are used in an AP way. Consul offers <code>stale</code> reads that any server can answer, and every good discovery client caches its last known list and keeps using it when the registry is unreachable.</p>
+
+<h3 id="self-preservation">Eureka's self-preservation mode</h3>
+<p>Eureka adds one more guard. If a server receives fewer heartbeat renewals in the last minute than 85% of what it expects, it assumes the problem is the network between it and the instances, not mass death, and stops expiring leases. The reasoning: twenty instances failing at once is far less likely than one switch failing, and wrongly deleting healthy instances is worse than keeping some dead ones, because callers can retry past a dead one but cannot call an instance they do not know about. The cost is that during a real mass failure, the registry keeps advertising dead instances until renewals recover.</p>
+
+<h2 id="failure-modes">Failure modes</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Failure</th><th>What callers see</th><th>Mitigation</th></tr></thead>
+<tbody>
+<tr><th>Stale entry (dead but listed)</th><td>Timeouts and connection errors to one instance</td><td>Short TTLs, push updates, client retries on another instance, outlier ejection</td></tr>
+<tr><th>False removal (healthy but delisted)</th><td>Capacity drops; remaining instances overload</td><td>Tolerate several missed checks, Eureka-style self-preservation, Envoy's panic threshold (balance across all hosts when under 50% look healthy)</td></tr>
+<tr><th>Deep health check cascade</th><td>Every instance fails its check because a shared database blipped, so the service vanishes</td><td>Readiness checks test the instance itself, not its dependencies; dependency failures belong in circuit breakers</td></tr>
+<tr><th>Registry outage</th><td>No new registrations; lookups fail if not cached</td><td>Clients keep the last known list; 3 or 5 node quorum across zones; data plane independent of control plane</td></tr>
+<tr><th>Thundering herd on recovery</th><td>Thousands of clients re-fetch and re-watch at once and knock the registry over again</td><td>Jittered reconnects, incremental (delta) updates, caching agents per node</td></tr>
+<tr><th>IP reuse</th><td>A stale entry now points to a different service that got the recycled IP</td><td>mTLS with service identity, so the caller rejects a server that is not <code>payments</code></td></tr>
+</tbody></table></div>
+
+<h2 id="comparison">Choosing a registry</h2>
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Consistency</th><th>Liveness</th><th>How callers read</th><th>Typical home</th></tr></thead>
+<tbody>
+<tr><th>ZooKeeper</th><td>CP (ZAB)</td><td>Session timeout deletes ephemeral znodes</td><td>Reads plus watches</td><td>Hadoop, HBase, older Kafka, Finagle serversets</td></tr>
+<tr><th>etcd</th><td>CP (Raft)</td><td>Lease TTL with keep-alives</td><td>Watch on a key prefix</td><td>Kubernetes' backing store, custom platforms</td></tr>
+<tr><th>Consul</th><td>CP servers, gossip between agents</td><td>Agent-run HTTP, TCP, gRPC and TTL checks</td><td>DNS, HTTP blocking queries, Envoy via xDS</td><td>Multi-platform and VM fleets, multi-datacenter</td></tr>
+<tr><th>Eureka</th><td>AP (peer replication)</td><td>30 s renewals, 90 s lease</td><td>Client polls every 30 s</td><td>Netflix OSS, Spring Cloud</td></tr>
+<tr><th>Kubernetes</th><td>CP store, derived endpoints</td><td>Kubelet readiness probes</td><td>DNS, ClusterIP, watch API</td><td>Anything running on Kubernetes</td></tr>
+</tbody></table></div>
+<p>The practical rule: on Kubernetes, use Services and add a mesh only when you need per-request balancing, mTLS or traffic shifting. Across VMs, several clusters or several platforms, Consul is the common choice. Use ZooKeeper or etcd directly when you already run them for coordination and want discovery from the same system.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+<li><strong>Netflix</strong> built Eureka for AWS, where instances churn constantly and partitions between availability zones happen. Paired with the Ribbon client-side balancer, it was the reference for client-side discovery and became the default in Spring Cloud.</li>
+<li><strong>Airbnb SmartStack</strong> (2013) ran two small daemons per host: Nerve health-checked local services and registered them in ZooKeeper, and Synapse watched ZooKeeper and rewrote a local HAProxy config. Applications called <code>localhost</code>, an early form of the sidecar pattern.</li>
+<li><strong>Lyft</strong> built Envoy to replace a similar setup. Its first discovery service was a simple eventually consistent REST endpoint, because Lyft argued that discovery data does not need strong consistency, and xDS grew out of that API.</li>
+<li><strong>Kubernetes</strong> made discovery a platform primitive: every Service gets a DNS name and a stable virtual IP, with readiness probes as the health check.</li>
+<li><strong>Twitter's Finagle</strong> used ZooKeeper serversets: each instance creates an ephemeral znode, and clients watch the parent node and balance across children.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>As soon as you draw two services talking to each other and say they autoscale. One sentence usually suffices: "Instances register in the platform's registry (Kubernetes Services, or Consul elsewhere); callers resolve by name and balance client-side or through the mesh." Go deeper if the interviewer asks how failures are detected or what happens when the registry is down.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>Client-side or server-side discovery? Give the hop count, the polyglot cost, and where a mesh fits.</li>
+<li>How fast is a dead instance removed? Interval times misses, plus propagation; mention push vs poll and client retries.</li>
+<li>What happens if the registry goes down? Cached lists keep traffic flowing; only changes stop.</li>
+<li>Should the registry be CP or AP? Discovery tolerates stale data far better than no data.</li>
+<li>Why does gRPC traffic not balance on Kubernetes? Connection-level balancing; use headless Services or an L7 proxy.</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>Hard-coding instance IPs or relying on DNS with a long TTL for autoscaled services.</li>
+<li>Putting a registry query on the path of every request with no client cache.</li>
+<li>Health checks that call the database, so one dependency failure delists the whole fleet.</li>
+<li>Treating the registry as the source of truth for correctness (for example leader election) while running it in an AP mode.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://kubernetes.io/docs/concepts/services-networking/service/" target="_blank" rel="noopener">Kubernetes: Service</a><span>Official documentation for ClusterIP, headless Services, EndpointSlices and kube-proxy modes.</span></li>
+<li><a href="https://www.envoyproxy.io/docs/envoy/latest/api-docs/xds_protocol" target="_blank" rel="noopener">Envoy: xDS REST and gRPC protocol</a><span>How a control plane streams listeners, routes, clusters and endpoints to proxies.</span></li>
+<li><a href="https://developer.hashicorp.com/consul/docs" target="_blank" rel="noopener">Consul documentation</a><span>HashiCorp. Service registration, health checks, DNS interface, blocking queries and consistency modes.</span></li>
+<li><a href="https://github.com/Netflix/eureka/wiki" target="_blank" rel="noopener">Netflix Eureka wiki</a><span>Lease renewal, eviction, client caching and self-preservation in an AP registry.</span></li>
+<li><a href="https://www.usenix.org/legacy/event/atc10/tech/full_papers/Hunt.pdf" target="_blank" rel="noopener">ZooKeeper: Wait-free Coordination for Internet-scale Systems</a><span>Hunt et al., USENIX ATC 2010. Sessions, ephemeral znodes and watches, the building blocks of CP discovery.</span></li>
+</ul>
