@@ -1,0 +1,541 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">An online shop emits an <code>OrderPlaced</code> event. Billing needs it to charge the card, the warehouse needs it to pick items, the recommendation team wants it for training data, and a new fraud team starting next month wants every order from the last 30 days. A queue cannot serve all of them: it deletes each message once one consumer has handled it, and it has nothing left to give a team that arrives late.</p>
+<p><dfn>Event streaming</dfn> keeps the events instead. Producers append records to a durable, ordered <dfn>log</dfn>. Consumers read the log at their own pace and remember how far they got. Reading does not remove anything, so any number of independent consumers can read the same events, and a new consumer can start from the beginning. Records expire by a retention policy (seven days, a terabyte, or never), not by being consumed.</p>
+<p>Apache Kafka is the system that made this model mainstream, and its vocabulary (topics, partitions, offsets, consumer groups) is what interviewers expect. This chapter uses Kafka as the reference and compares the alternatives at the end.</p>
+
+<h2 id="log-vs-queue">Log-based messaging vs queues</h2>
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Queue (SQS, RabbitMQ classic queues)</th><th>Log (Kafka, Kinesis, Pulsar)</th></tr></thead>
+<tbody>
+<tr><th>What consuming does</th><td>Removes the message after ack</td><td>Advances the reader's offset; data stays</td></tr>
+<tr><th>Multiple readers</th><td>Compete for messages, or need a copy per reader</td><td class="yes">Each consumer group reads everything independently</td></tr>
+<tr><th>Replay</th><td class="no">Not possible once acked</td><td class="yes">Rewind the offset, within retention</td></tr>
+<tr><th>Progress tracking</th><td>Per message (ack, in flight, redelivered)</td><td>One number per partition per group</td></tr>
+<tr><th>Ordering</th><td class="meh">Weak with many consumers</td><td class="yes">Strict within a partition</td></tr>
+<tr><th>Parallelism</th><td class="yes">Any number of consumers</td><td class="meh">At most one consumer per partition per consumer group (Kafka 4.2 share groups lift this)</td></tr>
+<tr><th>One slow message</th><td class="yes">Others overtake it</td><td class="no">Blocks the rest of its partition</td></tr>
+</tbody></table></div>
+<p>The log trades per-message flexibility for cheap, ordered, replayable fan-out. Tracking a single offset per partition instead of the state of every message is also what lets one Kafka broker handle hundreds of megabytes per second: the broker writes sequentially to disk and serves reads from the page cache, and consumers fetch large batches of contiguous records.</p>
+
+<figure class="fig wide">
+<div class="fig-frame">
+<svg viewBox="0 0 760 340" role="img" aria-label="Producers append to the tail of three partitions of the orders topic; the billing group reads near the tail and the analytics group lags behind, each at its own offsets">
+<rect class="zone" x="160" y="14" width="430" height="282" rx="10"/>
+<text class="t b" x="176" y="34">topic: orders</text>
+<rect class="n svc" x="10" y="135" width="100" height="56" rx="8"/><text class="t b mid" x="60" y="158">Producers</text><text class="t xs mono mute mid" x="60" y="176">hash(key) % 3</text>
+<text class="t b" x="174" y="84">P0</text>
+<rect class="n queue" x="210" y="64" width="32" height="30" rx="4"/><text class="t xs mono mid" x="226" y="83">0</text>
+<rect class="n queue" x="246" y="64" width="32" height="30" rx="4"/><text class="t xs mono mid" x="262" y="83">1</text>
+<rect class="n queue" x="282" y="64" width="32" height="30" rx="4"/><text class="t xs mono mid" x="298" y="83">2</text>
+<rect class="n queue" x="318" y="64" width="32" height="30" rx="4"/><text class="t xs mono mid" x="334" y="83">3</text>
+<rect class="n queue" x="354" y="64" width="32" height="30" rx="4"/><text class="t xs mono mid" x="370" y="83">4</text>
+<rect class="n queue" x="390" y="64" width="32" height="30" rx="4"/><text class="t xs mono mid" x="406" y="83">5</text>
+<rect class="n queue" x="426" y="64" width="32" height="30" rx="4"/><text class="t xs mono mid" x="442" y="83">6</text>
+<rect class="n queue" x="462" y="64" width="32" height="30" rx="4"/><text class="t xs mono mid" x="478" y="83">7</text>
+<rect class="n queue" x="498" y="64" width="32" height="30" rx="4"/><text class="t xs mono mid" x="514" y="83">8</text>
+<rect class="n ghost" x="534" y="64" width="32" height="30" rx="4"/>
+<path class="e" d="M110,150 C135,150 135,50 165,50 H550 V60"/>
+<path d="M478,97 l-5,7 h10 z" class="fill-accent"/>
+<text class="t xs mid accent" x="478" y="115">billing</text>
+<path d="M298,97 l-5,7 h10 z" class="dot"/>
+<text class="t xs mid " x="298" y="115">analytics</text>
+<text class="t b" x="174" y="174">P1</text>
+<rect class="n queue" x="210" y="154" width="32" height="30" rx="4"/><text class="t xs mono mid" x="226" y="173">0</text>
+<rect class="n queue" x="246" y="154" width="32" height="30" rx="4"/><text class="t xs mono mid" x="262" y="173">1</text>
+<rect class="n queue" x="282" y="154" width="32" height="30" rx="4"/><text class="t xs mono mid" x="298" y="173">2</text>
+<rect class="n queue" x="318" y="154" width="32" height="30" rx="4"/><text class="t xs mono mid" x="334" y="173">3</text>
+<rect class="n queue" x="354" y="154" width="32" height="30" rx="4"/><text class="t xs mono mid" x="370" y="173">4</text>
+<rect class="n queue" x="390" y="154" width="32" height="30" rx="4"/><text class="t xs mono mid" x="406" y="173">5</text>
+<rect class="n queue" x="426" y="154" width="32" height="30" rx="4"/><text class="t xs mono mid" x="442" y="173">6</text>
+<rect class="n ghost" x="462" y="154" width="32" height="30" rx="4"/>
+<path class="e" d="M110,162 C135,162 135,140 165,140 H478 V150"/>
+<path d="M442,187 l-5,7 h10 z" class="fill-accent"/>
+<text class="t xs mid accent" x="442" y="205">billing</text>
+<path d="M334,187 l-5,7 h10 z" class="dot"/>
+<text class="t xs mid " x="334" y="205">analytics</text>
+<text class="t b" x="174" y="264">P2</text>
+<rect class="n queue" x="210" y="244" width="32" height="30" rx="4"/><text class="t xs mono mid" x="226" y="263">0</text>
+<rect class="n queue" x="246" y="244" width="32" height="30" rx="4"/><text class="t xs mono mid" x="262" y="263">1</text>
+<rect class="n queue" x="282" y="244" width="32" height="30" rx="4"/><text class="t xs mono mid" x="298" y="263">2</text>
+<rect class="n queue" x="318" y="244" width="32" height="30" rx="4"/><text class="t xs mono mid" x="334" y="263">3</text>
+<rect class="n queue" x="354" y="244" width="32" height="30" rx="4"/><text class="t xs mono mid" x="370" y="263">4</text>
+<rect class="n queue" x="390" y="244" width="32" height="30" rx="4"/><text class="t xs mono mid" x="406" y="263">5</text>
+<rect class="n queue" x="426" y="244" width="32" height="30" rx="4"/><text class="t xs mono mid" x="442" y="263">6</text>
+<rect class="n queue" x="462" y="244" width="32" height="30" rx="4"/><text class="t xs mono mid" x="478" y="263">7</text>
+<rect class="n ghost" x="498" y="244" width="32" height="30" rx="4"/>
+<path class="e" d="M110,174 C135,174 135,230 165,230 H514 V240"/>
+<path d="M478,277 l-5,7 h10 z" class="fill-accent"/>
+<text class="t xs mid accent" x="478" y="295">billing</text>
+<path d="M262,277 l-5,7 h10 z" class="dot"/>
+<text class="t xs mid " x="262" y="295">analytics</text>
+<path class="flow" d="M110,150 C135,150 135,50 165,50 H550 V60"/>
+<path class="flow" d="M110,162 C135,162 135,140 165,140 H478 V150"/>
+<path class="flow" d="M110,174 C135,174 135,230 165,230 H514 V240"/>
+<rect class="n svc" x="612" y="60" width="138" height="56" rx="8"/><text class="t b mid" x="681" y="83">billing group</text><text class="t xs mute mid" x="681" y="100">lag: 4 messages</text>
+<rect class="n svc" x="612" y="200" width="138" height="56" rx="8"/><text class="t b mid" x="681" y="223">analytics group</text><text class="t xs mute mid" x="681" y="240">lag: 18 messages</text>
+<path class="e" d="M590,88 H608"/><path class="flow" d="M590,88 H608"/>
+<path class="e" d="M590,228 H608"/><path class="flow" d="M590,228 H608"/>
+<text class="t sm mute mid" x="375" y="324">new records go to the dashed tail slot; reading moves a group's marker, it never removes data</text>
+</svg>
+</div>
+<figcaption><b>One log, many readers.</b> Producers choose a partition by hashing the key and append at the tail. The billing group is nearly caught up; the analytics group is 18 records behind across the three partitions. Neither affects the other, and both can rewind.</figcaption>
+</figure>
+
+<h2 id="anatomy">Kafka anatomy</h2>
+<h3 id="topics-partitions">Topics, partitions and offsets</h3>
+<p>A <dfn>topic</dfn> is a named stream of records, such as <code>orders</code> or <code>page-views</code>. Each topic is split into <dfn>partitions</dfn>, and each partition is an independent, append-only, totally ordered log stored on one leader broker (plus replicas). Every record in a partition gets a sequential <dfn>offset</dfn>: 0, 1, 2, and so on. An offset identifies a record only within its partition, so "offset 4,812" means nothing without "partition 7".</p>
+<p>Partitions are the unit of everything that matters at scale: parallelism (one consumer per partition per group), ordering (guaranteed only within a partition), placement (partitions spread across brokers) and throughput (a topic's capacity is roughly the sum of its partitions').</p>
+
+<h3 id="segments-retention">Segments and retention</h3>
+<p>On disk, a partition is a directory of <dfn>segment</dfn> files. Records are appended to the active segment until it reaches <code>segment.bytes</code> (1 GiB by default) or <code>segment.ms</code>, then a new one is rolled. Each segment has a sparse offset index and a time index, so seeking to an offset or a timestamp is a binary search plus a short scan. Retention deletes whole closed segments once they are older than <code>retention.ms</code> (7 days by default) or the partition exceeds <code>retention.bytes</code>. Deleting a file is cheap, which is why retention costs almost nothing compared with deleting individual messages.</p>
+<p>Recent Kafka versions add <strong>tiered storage</strong>: closed segments are copied to object storage like S3 and deleted locally, so retention can be months without buying broker disks for it.</p>
+
+<h3 id="compaction">Log compaction</h3>
+<p>Some topics represent current state rather than history: the latest address for each customer, the latest price for each product. For these, set <code>cleanup.policy=compact</code>. A background cleaner rewrites old segments, keeping only the most recent record for each key. A record with a <code>null</code> value is a <dfn>tombstone</dfn>: it marks the key as deleted, and is itself removed after <code>delete.retention.ms</code>.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 242" role="img" aria-label="Log compaction keeps only the latest record per key; offsets are preserved, older values are removed, and a null value is a tombstone that deletes the key">
+<text class="t sm b" x="0" y="72">before</text>
+<text class="t sm b" x="0" y="167">after</text>
+<text class="t xs mono mute mid" x="109.0" y="34">0</text>
+<rect class="n" x="80" y="46" width="58" height="42" rx="5"/><text class="t sm mono mid" x="109.0" y="64">u1</text><text class="t xs mono mid mute" x="109.0" y="80">A</text>
+<text class="t xs mono mute mid" x="173.0" y="34">1</text>
+<rect class="n" x="144" y="46" width="58" height="42" rx="5"/><text class="t sm mono mid" x="173.0" y="64">u2</text><text class="t xs mono mid mute" x="173.0" y="80">B</text>
+<text class="t xs mono mute mid" x="237.0" y="34">2</text>
+<rect class="n" x="208" y="46" width="58" height="42" rx="5"/><text class="t sm mono mid" x="237.0" y="64">u1</text><text class="t xs mono mid mute" x="237.0" y="80">C</text>
+<text class="t xs mono mute mid" x="301.0" y="34">3</text>
+<rect class="n" x="272" y="46" width="58" height="42" rx="5"/><text class="t sm mono mid" x="301.0" y="64">u3</text><text class="t xs mono mid mute" x="301.0" y="80">D</text>
+<text class="t xs mono mute mid" x="365.0" y="34">4</text>
+<rect class="n" x="336" y="46" width="58" height="42" rx="5"/><text class="t sm mono mid" x="365.0" y="64">u2</text><text class="t xs mono mid mute" x="365.0" y="80">E</text>
+<text class="t xs mono mute mid" x="429.0" y="34">5</text>
+<rect class="n queue" x="400" y="46" width="58" height="42" rx="5"/><text class="t sm mono mid" x="429.0" y="64">u1</text><text class="t xs mono mid mute" x="429.0" y="80">F</text>
+<rect class="n queue" x="400" y="141" width="58" height="42" rx="5"/><text class="t sm mono mid" x="429.0" y="159">u1</text><text class="t xs mono mid mute" x="429.0" y="175">F</text>
+<path class="e" d="M429.0,92 V137"/>
+<text class="t xs mono mute mid" x="493.0" y="34">6</text>
+<rect class="n queue" x="464" y="46" width="58" height="42" rx="5"/><text class="t sm mono mid" x="493.0" y="64">u3</text><text class="t xs mono mid red" x="493.0" y="80">null</text>
+<rect class="n queue" x="464" y="141" width="58" height="42" rx="5"/><text class="t sm mono mid" x="493.0" y="159">u3</text><text class="t xs mono mid red" x="493.0" y="175">null</text>
+<path class="e" d="M493.0,92 V137"/>
+<text class="t xs mono mute mid" x="557.0" y="34">7</text>
+<rect class="n" x="528" y="46" width="58" height="42" rx="5"/><text class="t sm mono mid" x="557.0" y="64">u4</text><text class="t xs mono mid mute" x="557.0" y="80">G</text>
+<text class="t xs mono mute mid" x="621.0" y="34">8</text>
+<rect class="n queue" x="592" y="46" width="58" height="42" rx="5"/><text class="t sm mono mid" x="621.0" y="64">u2</text><text class="t xs mono mid mute" x="621.0" y="80">H</text>
+<rect class="n queue" x="592" y="141" width="58" height="42" rx="5"/><text class="t sm mono mid" x="621.0" y="159">u2</text><text class="t xs mono mid mute" x="621.0" y="175">H</text>
+<path class="e" d="M621.0,92 V137"/>
+<text class="t xs mono mute mid" x="685.0" y="34">9</text>
+<rect class="n queue" x="656" y="46" width="58" height="42" rx="5"/><text class="t sm mono mid" x="685.0" y="64">u4</text><text class="t xs mono mid mute" x="685.0" y="80">I</text>
+<rect class="n queue" x="656" y="141" width="58" height="42" rx="5"/><text class="t sm mono mid" x="685.0" y="159">u4</text><text class="t xs mono mid mute" x="685.0" y="175">I</text>
+<path class="e" d="M685.0,92 V137"/>
+<text class="t xs mute mid" x="493.0" y="200">tombstone: kept for</text><text class="t xs mute mid" x="493.0" y="213">delete.retention.ms</text>
+<text class="t xs mute" x="80" y="20">offset</text>
+<text class="t xs mute" x="80" y="234">offsets 0-4 and 7 are gone; surviving records keep their original offsets</text>
+</svg>
+</div>
+<figcaption><b>Compaction.</b> Highlighted records are the latest for their key and survive. A consumer reading the compacted log from offset 0 still ends with the correct final state for every key, which is how Kafka Streams restores state stores and how Kafka Connect stores its offsets.</figcaption>
+</figure>
+
+<h3 id="replication">Brokers and replication</h3>
+<p>A Kafka cluster is a set of <dfn>brokers</dfn>. Each partition has a <dfn>replication factor</dfn> (3 is standard): one replica is the <dfn>leader</dfn>, which handles all writes and by default all reads, and the others are <dfn>followers</dfn> that continuously fetch from the leader. The leader tracks the <dfn>in-sync replica set</dfn> (ISR): followers that have caught up within <code>replica.lag.time.max.ms</code> (30 seconds by default). A record is <em>committed</em> once every replica in the ISR has it, and consumers can only read committed records; the boundary is called the <dfn>high watermark</dfn>.</p>
+<p>Two settings decide durability:</p>
+<ul>
+<li><strong><code>acks</code></strong> on the producer. <code>acks=0</code>: do not wait at all. <code>acks=1</code>: wait for the leader only, so a leader crash right after the ack loses the record. <code>acks=all</code> (the default since Kafka 3.0): wait until every in-sync replica has it.</li>
+<li><strong><code>min.insync.replicas</code></strong> on the topic. With <code>acks=all</code>, the leader refuses writes if the ISR has shrunk below this number. Without it, <code>acks=all</code> silently degrades to <code>acks=1</code> when followers drop out, because "all in-sync replicas" is then just the leader.</li>
+</ul>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 740 320" role="img" aria-label="Replication of one partition across three brokers with acks=all and min.insync.replicas=2: a lagging follower leaves the ISR, then the leader fails and an in-sync follower takes over">
+<rect class="n svc" x="20" y="125" width="110" height="50" rx="8"/><text class="t b mid" x="75" y="147">Producer</text><text class="t xs mono mute mid" x="75" y="163">acks=all</text>
+<g data-show="1">
+<text class="t sm b mid" x="450" y="24">partition orders-0 · ISR = {1, 2, 3} · min.insync.replicas = 2</text>
+<rect class="n db" x="180" y="70" width="150" height="150" rx="10"/>
+<text class="t b mid" x="255" y="94">broker 1</text>
+<text class="t xs mid mute" x="255" y="112">leader</text>
+<rect class="n queue" x="190" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="200" y="149">0</text>
+<rect class="n queue" x="212" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="222" y="149">1</text>
+<rect class="n queue" x="234" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="244" y="149">2</text>
+<rect class="n queue" x="256" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="266" y="149">3</text>
+<rect class="n queue" x="278" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="288" y="149">4</text>
+<rect class="n queue" x="300" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="310" y="149">5</text>
+<text class="t xs mute mid" x="255" y="184">has offsets 0-5</text>
+<rect class="n" x="375" y="70" width="150" height="150" rx="10"/>
+<text class="t b mid" x="450" y="94">broker 2</text>
+<text class="t xs mid mute" x="450" y="112">follower, in ISR</text>
+<rect class="n queue" x="385" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="395" y="149">0</text>
+<rect class="n queue" x="407" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="417" y="149">1</text>
+<rect class="n queue" x="429" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="439" y="149">2</text>
+<rect class="n queue" x="451" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="461" y="149">3</text>
+<rect class="n queue" x="473" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="483" y="149">4</text>
+<rect class="n queue" x="495" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="505" y="149">5</text>
+<text class="t xs mute mid" x="450" y="184">has offsets 0-5</text>
+<rect class="n" x="570" y="70" width="150" height="150" rx="10"/>
+<text class="t b mid" x="645" y="94">broker 3</text>
+<text class="t xs mid mute" x="645" y="112">follower, in ISR</text>
+<rect class="n queue" x="580" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="590" y="149">0</text>
+<rect class="n queue" x="602" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="612" y="149">1</text>
+<rect class="n queue" x="624" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="634" y="149">2</text>
+<rect class="n queue" x="646" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="656" y="149">3</text>
+<rect class="n queue" x="668" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="678" y="149">4</text>
+<rect class="n queue" x="690" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="700" y="149">5</text>
+<text class="t xs mute mid" x="645" y="184">has offsets 0-5</text>
+</g>
+<g data-show="2">
+<text class="t sm b mid" x="450" y="24">partition orders-0 · ISR = {1, 2} · min.insync.replicas = 2</text>
+<rect class="n db" x="180" y="70" width="150" height="150" rx="10"/>
+<text class="t b mid" x="255" y="94">broker 1</text>
+<text class="t xs mid mute" x="255" y="112">leader</text>
+<rect class="n queue" x="190" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="200" y="149">0</text>
+<rect class="n queue" x="212" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="222" y="149">1</text>
+<rect class="n queue" x="234" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="244" y="149">2</text>
+<rect class="n queue" x="256" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="266" y="149">3</text>
+<rect class="n queue" x="278" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="288" y="149">4</text>
+<rect class="n queue" x="300" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="310" y="149">5</text>
+<text class="t xs mute mid" x="255" y="184">has offsets 0-5</text>
+<rect class="n" x="375" y="70" width="150" height="150" rx="10"/>
+<text class="t b mid" x="450" y="94">broker 2</text>
+<text class="t xs mid mute" x="450" y="112">follower, in ISR</text>
+<rect class="n queue" x="385" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="395" y="149">0</text>
+<rect class="n queue" x="407" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="417" y="149">1</text>
+<rect class="n queue" x="429" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="439" y="149">2</text>
+<rect class="n queue" x="451" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="461" y="149">3</text>
+<rect class="n queue" x="473" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="483" y="149">4</text>
+<rect class="n queue" x="495" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="505" y="149">5</text>
+<text class="t xs mute mid" x="450" y="184">has offsets 0-5</text>
+<rect class="n cache" x="570" y="70" width="150" height="150" rx="10"/>
+<text class="t b mid" x="645" y="94">broker 3</text>
+<text class="t xs mid " x="645" y="112">lagging: out of ISR</text>
+<rect class="n queue" x="580" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="590" y="149">0</text>
+<rect class="n queue" x="602" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="612" y="149">1</text>
+<rect class="n queue" x="624" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="634" y="149">2</text>
+<rect class="n queue" x="646" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="656" y="149">3</text>
+<rect class="n ghost" x="668" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid mute" x="678" y="149">4</text>
+<rect class="n ghost" x="690" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid mute" x="700" y="149">5</text>
+<text class="t xs mute mid" x="645" y="184">has offsets 0-3</text>
+</g>
+<g data-show="3">
+<text class="t sm b mid" x="450" y="24">partition orders-0 · ISR = {2} · min.insync.replicas = 2</text>
+<rect class="n bad" x="180" y="70" width="150" height="150" rx="10"/>
+<text class="t b mid" x="255" y="94">broker 1</text>
+<text class="t xs mid red" x="255" y="112">down</text>
+<rect class="n queue" x="190" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="200" y="149">0</text>
+<rect class="n queue" x="212" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="222" y="149">1</text>
+<rect class="n queue" x="234" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="244" y="149">2</text>
+<rect class="n queue" x="256" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="266" y="149">3</text>
+<rect class="n queue" x="278" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="288" y="149">4</text>
+<rect class="n queue" x="300" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="310" y="149">5</text>
+<text class="t xs mute mid" x="255" y="184">has offsets 0-5</text>
+<rect class="n db" x="375" y="70" width="150" height="150" rx="10"/>
+<text class="t b mid" x="450" y="94">broker 2</text>
+<text class="t xs mid mute" x="450" y="112">new leader</text>
+<rect class="n queue" x="385" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="395" y="149">0</text>
+<rect class="n queue" x="407" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="417" y="149">1</text>
+<rect class="n queue" x="429" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="439" y="149">2</text>
+<rect class="n queue" x="451" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="461" y="149">3</text>
+<rect class="n queue" x="473" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="483" y="149">4</text>
+<rect class="n queue" x="495" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="505" y="149">5</text>
+<text class="t xs mute mid" x="450" y="184">has offsets 0-5</text>
+<rect class="n cache" x="570" y="70" width="150" height="150" rx="10"/>
+<text class="t b mid" x="645" y="94">broker 3</text>
+<text class="t xs mid " x="645" y="112">lagging: out of ISR</text>
+<rect class="n queue" x="580" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="590" y="149">0</text>
+<rect class="n queue" x="602" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="612" y="149">1</text>
+<rect class="n queue" x="624" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="634" y="149">2</text>
+<rect class="n queue" x="646" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid" x="656" y="149">3</text>
+<rect class="n ghost" x="668" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid mute" x="678" y="149">4</text>
+<rect class="n ghost" x="690" y="132" width="20" height="26" rx="3"/><text class="t xs mono mid mute" x="700" y="149">5</text>
+<text class="t xs mute mid" x="645" y="184">has offsets 0-3</text>
+</g>
+<g data-show="1 2"><path class="e" d="M130,142 H176"/><path class="e dash green" d="M176,160 H134"/><path class="e" d="M450,220 V240 H262 V224"/><path class="e" d="M645,220 V256 H248 V224"/><text class="t xs mute mid" x="450" y="272">followers fetch from the leader</text></g>
+<g data-show="3"><path class="e red" d="M130,140 C152,140 148,56 172,56 H450 V66"/><text class="t xs red" x="205" y="48">rejected: NotEnoughReplicas</text><path class="e" d="M645,220 V244 H450 V224"/><text class="t xs mute mid" x="548" y="260">broker 3 now fetches from broker 2</text></g>
+<text class="t sm mid" x="370" y="304" data-show="1">Offset 5 is acknowledged only after all three in-sync replicas have it.</text>
+<text class="t sm mid" x="370" y="304" data-show="2">Broker 3 stalls and is dropped from the ISR. Writes still succeed: 2 in-sync copies meet the minimum.</text>
+<text class="t sm mid" x="370" y="304" data-show="3">Broker 1 dies. Broker 2 was in sync, so it leads with every acked write. With ISR = 1, writes are refused.</text>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">All in sync</button><button type="button" data-step="2" aria-pressed="false">Follower lags</button><button type="button" data-step="3" aria-pressed="false">Leader fails</button></div>
+</div>
+<figcaption><b>Replication factor 3, <code>acks=all</code>, <code>min.insync.replicas=2</code>.</b> The cluster tolerates one broker failure with no data loss and no write outage. On a second failure it chooses consistency: writes stop rather than being acknowledged by a single copy. Only ISR members may become leader unless <code>unclean.leader.election.enable</code> is turned on, which trades possible data loss for availability.</figcaption>
+</figure>
+<p>Cluster metadata (which broker leads which partition, the ISR of each) lives in a controller quorum. Kafka 4.0 completed the move from ZooKeeper to <strong>KRaft</strong>, a Raft-based quorum of controller nodes inside Kafka itself. See <a href="replication.html">Replication</a> and <a href="consensus.html">Consensus</a> for the general mechanisms.</p>
+
+<h2 id="producers">Producers</h2>
+<h3 id="keyed-partitioning">Keyed partitioning</h3>
+<p>Each record has an optional key. The Java client's default partitioner hashes the key with murmur2 and takes it modulo the partition count, so all records with the same key land in the same partition, in the order they were sent. Choose the key as the entity whose events must stay ordered: <code>order_id</code>, <code>account_id</code>, <code>device_id</code>. Records without a key are spread across partitions; since Kafka 2.4 the client uses a <dfn>sticky partitioner</dfn> that fills a batch for one partition before switching, which gives larger batches than strict round-robin.</p>
+<p>Key choice is also where hot partitions come from. If 30% of traffic belongs to one tenant and the key is <code>tenant_id</code>, one partition gets 30% of the load no matter how many partitions exist. The fixes are the same as for <a href="sharding.html">hot shards</a>: a finer key, or a salted key for that tenant at the cost of its ordering.</p>
+
+<h3 id="batching">Batching and compression</h3>
+<p>The producer never sends records one at a time. It accumulates them per partition into batches, sending a batch when it reaches <code>batch.size</code> bytes (16 KiB by default) or when <code>linger.ms</code> expires. A few milliseconds of linger can multiply throughput, because one request carries hundreds of records and compression (<code>lz4</code>, <code>zstd</code>) works much better on a batch than on a single record. The broker stores the compressed batch as is and consumers decompress it, so compression saves network and disk, and the broker avoids recompressing.</p>
+
+<h3 id="idempotent-producer">The idempotent producer</h3>
+<p>A producer that sends a batch, loses the response and retries could write the batch twice. With <code>enable.idempotence=true</code> (the default since 3.0), the broker assigns each producer a <dfn>producer id</dfn>, and the producer numbers every batch per partition. The leader remembers the last sequence numbers per producer and partition, drops a retried batch it has already written, and rejects one that arrives out of order. Retries can then never create duplicates or reorder records within a partition, for the lifetime of that producer session.</p>
+
+<h2 id="consumer-groups">Consumer groups and rebalancing</h2>
+<p>A <dfn>consumer group</dfn> is a set of consumers sharing a <code>group.id</code> that together read a topic. Kafka assigns each partition to exactly one consumer in the group, so the group processes every record once while the work is split. Different groups are completely independent: billing and analytics each get all records.</p>
+<ul>
+<li>With 6 partitions and 3 consumers, each consumer gets 2 partitions.</li>
+<li>With 6 partitions and 8 consumers, 2 consumers sit idle. <strong>The partition count is the ceiling on a group's parallelism.</strong></li>
+</ul>
+<p>When a consumer joins, leaves or stops sending heartbeats, the group <dfn>rebalances</dfn>: a group coordinator on one of the brokers collects the members, and in the classic protocol one consumer, the group leader, computes the new assignment with the configured assignor. A consumer is declared dead if it misses heartbeats for <code>session.timeout.ms</code> (45 seconds by default) or does not call <code>poll()</code> within <code>max.poll.interval.ms</code> (5 minutes), which catches consumers that are alive but stuck processing.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 320" role="img" aria-label="Consumer group rebalancing: six partitions over two consumers, a third consumer joins and takes two partitions, then consumer 2 fails and its partitions move to the others">
+<text class="t sm b" x="40" y="18">topic: orders, 6 partitions</text>
+<text class="t sm b" x="480" y="18">group: billing</text>
+<rect class="n queue" x="40" y="30" width="110" height="32" rx="6"/><text class="t sm mono mid" x="95" y="50">orders-0</text>
+<rect class="n queue" x="40" y="72" width="110" height="32" rx="6"/><text class="t sm mono mid" x="95" y="92">orders-1</text>
+<rect class="n queue" x="40" y="114" width="110" height="32" rx="6"/><text class="t sm mono mid" x="95" y="134">orders-2</text>
+<rect class="n queue" x="40" y="156" width="110" height="32" rx="6"/><text class="t sm mono mid" x="95" y="176">orders-3</text>
+<rect class="n queue" x="40" y="198" width="110" height="32" rx="6"/><text class="t sm mono mid" x="95" y="218">orders-4</text>
+<rect class="n queue" x="40" y="240" width="110" height="32" rx="6"/><text class="t sm mono mid" x="95" y="260">orders-5</text>
+<g data-show="1">
+<path class="e" d="M150,46 C320,46 310,56 476,56"/>
+<path class="e" d="M150,88 C320,88 310,68 476,68"/>
+<path class="e" d="M150,130 C320,130 310,80 476,80"/>
+<path class="e" d="M150,172 C320,172 310,141 476,141"/>
+<path class="e" d="M150,214 C320,214 310,153 476,153"/>
+<path class="e" d="M150,256 C320,256 310,165 476,165"/>
+</g>
+<g data-show="2">
+<path class="e" d="M150,46 C320,46 310,62 476,62"/>
+<path class="e" d="M150,88 C320,88 310,74 476,74"/>
+<path class="e" d="M150,172 C320,172 310,147 476,147"/>
+<path class="e" d="M150,214 C320,214 310,159 476,159"/>
+<path class="e accent" d="M150,130 C320,130 310,232 476,232"/>
+<path class="e accent" d="M150,256 C320,256 310,244 476,244"/>
+</g>
+<g data-show="3">
+<path class="e" d="M150,46 C320,46 310,56 476,56"/>
+<path class="e" d="M150,88 C320,88 310,68 476,68"/>
+<path class="e accent" d="M150,172 C320,172 310,80 476,80"/>
+<path class="e" d="M150,130 C320,130 310,226 476,226"/>
+<path class="e" d="M150,256 C320,256 310,238 476,238"/>
+<path class="e accent" d="M150,214 C320,214 310,250 476,250"/>
+</g>
+<g data-show="1"><rect class="n svc" x="480" y="40" width="150" height="56" rx="8"/><text class="t b mid" x="555" y="63">consumer 1</text><text class="t xs mono mute mid" x="555" y="81">p0, p1, p2</text></g>
+<g data-show="2"><rect class="n svc" x="480" y="40" width="150" height="56" rx="8"/><text class="t b mid" x="555" y="63">consumer 1</text><text class="t xs mono mute mid" x="555" y="81">p0, p1</text></g>
+<g data-show="3"><rect class="n svc" x="480" y="40" width="150" height="56" rx="8"/><text class="t b mid" x="555" y="63">consumer 1</text><text class="t xs mono mute mid" x="555" y="81">p0, p1, p3</text></g>
+<g data-show="1"><rect class="n svc" x="480" y="125" width="150" height="56" rx="8"/><text class="t b mid" x="555" y="148">consumer 2</text><text class="t xs mono mute mid" x="555" y="166">p3, p4, p5</text></g>
+<g data-show="2"><rect class="n svc" x="480" y="125" width="150" height="56" rx="8"/><text class="t b mid" x="555" y="148">consumer 2</text><text class="t xs mono mute mid" x="555" y="166">p3, p4</text></g>
+<g data-show="3"><rect class="n bad" x="480" y="125" width="150" height="56" rx="8"/><text class="t b mid" x="555" y="148">consumer 2</text><text class="t xs red mid" x="555" y="166">missed heartbeats</text></g>
+<g data-show="1"><rect class="n ghost" x="480" y="210" width="150" height="56" rx="8"/><text class="t b mute mid" x="555" y="233">consumer 3</text><text class="t xs mute mid" x="555" y="251">not started</text></g>
+<g data-show="2"><rect class="n svc" x="480" y="210" width="150" height="56" rx="8"/><text class="t b mid" x="555" y="233">consumer 3</text><text class="t xs mono mute mid" x="555" y="251">p2, p5</text></g>
+<g data-show="3"><rect class="n svc" x="480" y="210" width="150" height="56" rx="8"/><text class="t b mid" x="555" y="233">consumer 3</text><text class="t xs mono mute mid" x="555" y="251">p2, p4, p5</text></g>
+<text class="t sm mid" x="360" y="306" data-show="1">Two consumers, three partitions each. Each partition has exactly one owner in the group.</text>
+<text class="t sm mid" x="360" y="306" data-show="2">consumer 3 joins. With cooperative-sticky assignment only orders-2 and orders-5 move.</text>
+<text class="t sm mid" x="360" y="306" data-show="3">consumer 2 dies. After the session timeout its partitions move to the survivors.</text>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Two consumers</button><button type="button" data-step="2" aria-pressed="false">Consumer 3 joins</button><button type="button" data-step="3" aria-pressed="false">Consumer 2 fails</button></div>
+</div>
+<figcaption><b>Rebalancing.</b> Highlighted lines are partitions that changed owner. Each move means the new owner resumes from the last committed offset, so anything the old owner processed but had not committed is processed again.</figcaption>
+</figure>
+
+<p>Rebalances used to be the main operational pain of Kafka consumers. The original <em>eager</em> protocol revoked every partition from every consumer, then reassigned them all, so the whole group stopped for each change and a rolling deploy of 20 consumers caused 20 stop-the-world pauses. Three improvements matter:</p>
+<ul>
+<li><strong>Cooperative (incremental) rebalancing</strong>, via the <code>CooperativeStickyAssignor</code>: only the partitions that actually move are revoked; everyone else keeps consuming.</li>
+<li><strong>Static membership</strong> (<code>group.instance.id</code>): a consumer that restarts within the session timeout gets its old partitions back with no rebalance at all, which makes rolling restarts cheap.</li>
+<li><strong>The new consumer group protocol</strong> (KIP-848, generally available in Kafka 4.0) moves assignment logic to the broker-side coordinator and makes rebalances incremental by default.</li>
+</ul>
+
+<h2 id="ordering">Ordering: per partition only</h2>
+<p>Kafka guarantees that records in one partition are read in the order they were written. It makes no promise across partitions: if <code>OrderPlaced</code> for order 81723 goes to partition 3 and <code>PaymentCaptured</code> for the same order goes to partition 5, a consumer may see the payment first. The rule follows directly: <strong>events that must be ordered relative to each other must share a key</strong>, and therefore a partition. Keying both events by <code>order_id</code> fixes the example.</p>
+<p>Three things break per-key ordering in practice:</p>
+<ul>
+<li><strong>Adding partitions.</strong> <code>hash(key) % 6</code> and <code>hash(key) % 8</code> disagree for most keys (75% of them, measured below), so for a while a key's old records are in one partition and its new records in another. Over-provision partitions up front instead of adding them later.</li>
+<li><strong>Producer retries without idempotence</strong>, if more than one batch is in flight per connection.</li>
+<li><strong>Parallel processing inside a consumer.</strong> A consumer that hands records from one partition to a thread pool has thrown the ordering away. Parallelise by key (one worker per key hash) if you need both.</li>
+</ul>
+
+<h2 id="delivery-semantics">Delivery semantics and offset commits</h2>
+<p>A consumer records progress by <dfn>committing</dfn> offsets to an internal topic, <code>__consumer_offsets</code>. The committed offset is the next record to read. When a partition moves to another consumer, or a consumer restarts, reading resumes there. The timing of the commit relative to processing sets the delivery guarantee:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Commit timing</th><th>Crash between the two steps</th><th>Result</th></tr></thead>
+<tbody>
+<tr><th>Commit, then process</th><td>Records committed but not processed are skipped</td><td class="no">At-most-once: possible loss</td></tr>
+<tr><th>Process, then commit</th><td>Records processed but not committed are processed again</td><td class="meh">At-least-once: possible duplicates</td></tr>
+<tr><th>Process and commit atomically</th><td>Both happen or neither does</td><td class="yes">Effectively once, if the output and the offset share a transaction</td></tr>
+</tbody></table></div>
+<p>The default (<code>enable.auto.commit=true</code>, every 5 seconds) commits the offsets returned by the previous <code>poll()</code> during the next one, which is at-least-once as long as you finish processing a batch before polling again. Hand records to another thread and it quietly becomes at-most-once. Most production consumers disable auto-commit and commit explicitly after processing. Either way, design consumers to tolerate duplicates: see <a href="idempotency.html">Idempotency &amp; Delivery Semantics</a>.</p>
+
+<h2 id="exactly-once">Exactly-once and its scope</h2>
+<p>Kafka's <dfn>exactly-once semantics</dfn> (EOS) combine the idempotent producer with <strong>transactions</strong>. A producer configured with a <code>transactional.id</code> can write to several partitions and commit consumer offsets as one atomic unit:</p>
+<pre><code class="language-java">producer.initTransactions();
+while (true) {
+    ConsumerRecords&lt;String, Order&gt; records = consumer.poll(Duration.ofMillis(100));
+    producer.beginTransaction();
+    for (ConsumerRecord&lt;String, Order&gt; r : records)
+        producer.send(new ProducerRecord&lt;&gt;("orders-enriched", r.key(), enrich(r.value())));
+    producer.sendOffsetsToTransaction(offsetsOf(records), consumer.groupMetadata());
+    producer.commitTransaction();   // outputs and input offsets become visible together, or not at all
+}</code></pre>
+<p>Downstream consumers set <code>isolation.level=read_committed</code> so they never see records from aborted transactions. The <code>transactional.id</code> also fences "zombies": if a stalled instance wakes up after its replacement has started, its writes are rejected. Kafka Streams wraps all of this behind <code>processing.guarantee=exactly_once_v2</code>.</p>
+<div class="callout warn">
+<div class="callout-title">Know the scope</div>
+<p>Kafka transactions cover <strong>read from Kafka, write to Kafka</strong>. The moment a consumer sends an email, calls a payment API or writes to PostgreSQL, those side effects are outside the transaction and can happen twice after a crash. For external sinks, either make the write idempotent (upsert by a unique key), or store the consumed offset in the same database transaction as the result and seek to it on startup. "Exactly-once" in an interview answer should always come with "within Kafka" or "via idempotent sinks".</p>
+</div>
+
+<h2 id="implementation">Partitioning and assignment in code</h2>
+<p>The code below reimplements Kafka's default key partitioner (murmur2, checked against the test vectors in Kafka's own test suite) and the two classic group assignors. <code>RangeAssignor</code> works topic by topic, giving each consumer a contiguous block; <code>RoundRobinAssignor</code> deals all partitions of all subscribed topics across consumers like cards.</p>
+<pre><code class="language-python">def murmur2(data: bytes) -&gt; int:
+    """Kafka's murmur2 (the Java client's default partitioner hash), as a signed 32-bit int."""
+    m, r, mask = 0x5BD1E995, 24, 0xFFFFFFFF
+    h = (0x9747B28C ^ len(data)) &amp; mask
+    n4 = len(data) // 4
+    for i in range(n4):
+        k = int.from_bytes(data[4 * i:4 * i + 4], "little")
+        k = (k * m) &amp; mask
+        k ^= k &gt;&gt; r
+        k = (k * m) &amp; mask
+        h = ((h * m) &amp; mask) ^ k
+    tail = data[4 * n4:]
+    if len(tail) &gt;= 3: h ^= tail[2] &lt;&lt; 16
+    if len(tail) &gt;= 2: h ^= tail[1] &lt;&lt; 8
+    if len(tail) &gt;= 1:
+        h ^= tail[0]
+        h = (h * m) &amp; mask
+    h ^= h &gt;&gt; 13
+    h = (h * m) &amp; mask
+    h ^= h &gt;&gt; 15
+    return h - (1 &lt;&lt; 32) if h &amp; 0x80000000 else h
+
+
+def partition_for(key: str, num_partitions: int) -&gt; int:
+    return (murmur2(key.encode()) &amp; 0x7FFFFFFF) % num_partitions
+
+
+def range_assign(partitions: int, consumers: list) -&gt; dict:
+    """RangeAssignor for one topic: contiguous blocks, the first (P % C) consumers get one extra."""
+    consumers = sorted(consumers)
+    per, extra = divmod(partitions, len(consumers))
+    out, start = {}, 0
+    for i, c in enumerate(consumers):
+        n = per + (1 if i &lt; extra else 0)
+        out[c] = list(range(start, start + n))
+        start += n
+    return out
+
+
+def round_robin_assign(topic_partitions: list, consumers: list) -&gt; dict:
+    """RoundRobinAssignor: deal all (topic, partition) pairs across consumers like cards."""
+    consumers = sorted(consumers)
+    out = {c: [] for c in consumers}
+    for i, tp in enumerate(sorted(topic_partitions)):
+        out[consumers[i % len(consumers)]].append(tp)
+    return out
+
+
+# Test vectors from Kafka's UtilsTest: this matches the Java client byte for byte
+assert murmur2(b"21") == -973932308
+assert murmur2(b"foobar") == -790332482
+assert murmur2(b"abc") == 479470107
+
+# Same key, same partition, every time: per-user ordering for free
+for key in ["user-1001", "user-1002", "user-1003", "user-1001"]:
+    print(key, "-&gt; partition", partition_for(key, 6))
+
+# Adding partitions remaps keys, so per-key ordering breaks across the change
+keys = [f"user-{i}" for i in range(100_000)]
+moved = sum(partition_for(k, 6) != partition_for(k, 8) for k in keys)
+print(f"6 -&gt; 8 partitions: {moved / len(keys):.0%} of keys change partition")
+
+# Two topics with 3 partitions each, two consumers in the group
+print("range:      ", {c: [f"{t}-{p}" for t in ("orders", "payments") for p in ps]
+                       for c, ps in range_assign(3, ["c1", "c2"]).items()})
+tps = [(t, p) for t in ("orders", "payments") for p in range(3)]
+print("round-robin:", {c: [f"{t}-{p}" for t, p in v]
+                       for c, v in round_robin_assign(tps, ["c1", "c2"]).items()})</code></pre>
+<p>Output:</p>
+<pre><code class="language-text">user-1001 -&gt; partition 4
+user-1002 -&gt; partition 5
+user-1003 -&gt; partition 2
+user-1001 -&gt; partition 4
+6 -&gt; 8 partitions: 75% of keys change partition
+range:       {'c1': ['orders-0', 'orders-1', 'payments-0', 'payments-1'], 'c2': ['orders-2', 'payments-2']}
+round-robin: {'c1': ['orders-0', 'orders-2', 'payments-1'], 'c2': ['orders-1', 'payments-0', 'payments-2']}</code></pre>
+<p>Two lessons are visible. Going from 6 to 8 partitions remaps three quarters of the keys, so per-key ordering breaks for any key with records in flight during the change. And the range assignor gives <code>c1</code> twice as many partitions as <code>c2</code>, because the same leftover lands on the first consumer for every topic. With many topics of the same size, that skew compounds; round-robin or sticky assignors avoid it.</p>
+
+<h2 id="sizing">Worked example: how many partitions?</h2>
+<p>A clickstream topic receives 1 million events per second at peak, averaging 300 bytes each. The consuming service enriches each event with a cache lookup and was benchmarked at 5 MB/s per consumer instance. A single partition can comfortably take 25 MB/s of produce traffic on this cluster's hardware. Plan for 2x growth over two years, because adding partitions later breaks key ordering.</p>
+<div class="calc">Peak ingress      1,000,000 events/s × 300 B          = <span class="r">300 MB/s</span>
+Produce-bound     300 / 25 MB/s per partition          = 12 partitions
+Consume-bound     300 / 5 MB/s per consumer            = <span class="r">60 partitions</span>  (one consumer each)
+Partitions        max(12, 60) × 2 growth               = 120
+Round to          120  (divisible by 2, 3, 4, 5, 6, 8, 10, 12, 15, 20, 24, 30, 40, 60)
+
+Retention         300 MB/s × 86,400 s × 7 days         ≈ 181 TB
+With RF = 3       181 × 3                              ≈ <span class="r">544 TB</span> of disk before compression
+Per broker        544 TB / 24 brokers                  ≈ 23 TB, 15 partition replicas each</div>
+<p>The consumer, not the broker, usually sets the partition count, which is why the formula takes the maximum of the two. Choosing a number with many divisors means most likely consumer counts (2, 3, 4, 5, 6, 8, 10, 12, 15, 20, 24, 30, 40, 60) divide the partitions evenly. The disk figure is the other surprise: it argues for compression, shorter retention, or tiered storage before buying 24 brokers.</p>
+<p>More partitions are not free. Each partition replica is a set of open files and a fetch session; each partition needs a producer batch buffer; a broker failure means a leader election for every partition it led. KRaft raised the practical limits a lot, but a topic with 10,000 partitions for 10 MB/s of traffic is still a mistake.</p>
+
+<h2 id="consumer-lag">Consumer lag</h2>
+<p><dfn>Consumer lag</dfn> is the distance between the newest record in a partition (the <em>log end offset</em>) and the group's committed offset, summed across partitions. It is the single most important health metric of a streaming pipeline, and the equivalent of queue depth for a queue.</p>
+<ul>
+<li><strong>Alert on time, not records.</strong> 50,000 records of lag is nothing for a topic doing 100,000 per second and a disaster for one doing 10 per second. Convert lag to seconds: lag divided by the consumption rate, or the age of the oldest unconsumed record.</li>
+<li><strong>Catch-up maths.</strong> A group that falls 1.8 million records behind during a deploy, and normally runs at 40,000 records/s against 20,000/s of input, catches up at a net 20,000/s: 90 seconds.</li>
+<li><strong>Lag that grows forever</strong> means the group's capacity is below the input rate. Add consumers (up to the partition count), make processing faster, or batch the downstream writes. Lag that grows on one partition only means a hot key or a stuck consumer.</li>
+<li><strong>Do not outrun retention.</strong> If lag in time exceeds <code>retention.ms</code>, unread records are deleted and the consumer jumps forward according to <code>auto.offset.reset</code>. That is silent data loss.</li>
+</ul>
+<p>Tools: <code>kafka-consumer-groups.sh --describe</code>, LinkedIn's Burrow, and lag exporters for Prometheus. KEDA can autoscale consumers on lag the same way it scales queue workers on depth.</p>
+
+<h2 id="comparison">Kafka and its alternatives</h2>
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Kafka</th><th>Apache Pulsar</th><th>Amazon Kinesis Data Streams</th><th>RabbitMQ Streams</th><th>Google Cloud Pub/Sub</th></tr></thead>
+<tbody>
+<tr><th>Unit of parallelism</th><td>Partition</td><td>Partition (topic can be partitioned)</td><td>Shard: 1 MB/s or 1,000 records/s in, 2 MB/s out</td><td>Stream; super streams for partitioning</td><td>None exposed; scales automatically</td></tr>
+<tr><th>Storage</th><td>Broker disks, optional tiered storage</td><td>Separate BookKeeper storage layer, stateless brokers, tiered storage</td><td>Managed; 24 h retention by default, up to 365 days</td><td>Replicated log files in RabbitMQ nodes</td><td>Managed; replay by seeking to a time or snapshot</td></tr>
+<tr><th>Consumption model</th><td>Offsets per partition per group</td><td>Subscriptions: exclusive, failover, shared, key-shared, with per-message acks</td><td>Per-shard iterators; KCL tracks checkpoints in DynamoDB</td><td>Offsets; non-destructive reads</td><td>Per-message ack deadlines, push or pull</td></tr>
+<tr><th>Ordering</th><td>Per partition</td><td>Per partition, or per key with key-shared</td><td>Per shard</td><td>Per stream</td><td>Per ordering key, opt-in</td></tr>
+<tr><th>Strength</th><td>Throughput, ecosystem (Connect, Streams, Flink)</td><td>Multi-tenancy, geo-replication, queue and stream in one</td><td>Zero operations on AWS</td><td>Adds replay to an existing RabbitMQ estate</td><td>Zero operations, global, simple fan-out</td></tr>
+<tr><th>Weakness</th><td>Operating it; partition count is hard to change</td><td>More moving parts to run</td><td>Shard limits and per-shard costs; shorter default retention</td><td>Smaller ecosystem</td><td>Less control over ordering and throughput tuning</td></tr>
+</tbody></table></div>
+<p>The decision is usually not technical purity but surroundings: Kinesis or Pub/Sub if you live in that cloud and want zero operations, Kafka (self-run, MSK, or Confluent Cloud) if you want the ecosystem and the highest throughput, Pulsar if you need strong multi-tenancy or both queue and stream semantics in one system.</p>
+
+<h2 id="tradeoffs">Trade-offs at a glance</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>You gain</th><th>You pay</th></tr></thead>
+<tbody>
+<tr><td>Many independent consumers of the same events</td><td>Parallelism capped by partition count, chosen up front</td></tr>
+<tr><td>Replay: rebuild a service, backfill a new one, recover from a bug</td><td>Storage for the whole retention window, times the replication factor</td></tr>
+<tr><td>Strict ordering per key</td><td>Head-of-line blocking: one slow record holds up its partition</td></tr>
+<tr><td>Very high throughput from sequential I/O and batching</td><td>No per-message retry, delay or DLQ built in; you build them with extra topics</td></tr>
+<tr><td>Exactly-once within Kafka via transactions</td><td>Duplicates still possible at every external boundary</td></tr>
+</tbody></table></div>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+<li><strong>LinkedIn</strong> built Kafka around 2010 to replace a tangle of point-to-point data pipelines with one log that every system publishes to and reads from. Jay Kreps' essay "The Log" explains the reasoning, and LinkedIn still runs it at trillions of records per day.</li>
+<li><strong>Uber, Netflix and most large consumer companies</strong> use Kafka as the backbone between online services and analytics: trip and playback events flow through Kafka into stream processors and data lakes.</li>
+<li><strong>Kafka Connect and Debezium</strong> turn database changes into topics (change data capture) and push topics into sinks like Elasticsearch and S3. See <a href="event-driven.html">Event-Driven Architecture</a>.</li>
+<li><strong>Kafka Streams and Apache Flink</strong> consume topics, keep local state backed by compacted changelog topics, and write results back to Kafka with exactly-once guarantees. See <a href="batch-stream.html">Batch vs Stream Processing</a>.</li>
+<li><strong>Managed offerings</strong> (Confluent Cloud, Amazon MSK, Aiven, Redpanda's Kafka-compatible engine) exist because running brokers, rebalancing partitions and upgrading clusters is the main cost of Kafka.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>When several services or analytics pipelines need the same stream of events, when you need replay, or when the event rate is very high (click tracking, location updates, logs, metrics). Typical phrasing: "Click events go to a Kafka topic keyed by <code>link_id</code> with replication factor 3 and <code>acks=all</code>; the aggregator is a consumer group, and we size partitions for consumer throughput." It appears in the <a href="url-shortener.html">URL shortener</a>, <a href="news-feed.html">news feed</a> and <a href="ride-sharing.html">ride-sharing</a> case studies.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>How do you guarantee ordering for one user's events? (Key by user id; ordering is per partition only.)</li>
+<li>What happens when a consumer crashes? (Rebalance after the session timeout; the new owner resumes from the committed offset and reprocesses anything uncommitted.)</li>
+<li>How many partitions, and why? (Max of produce-bound and consume-bound counts, plus headroom; hard to change later.)</li>
+<li>Can you lose data? (Not with RF 3, <code>acks=all</code>, <code>min.insync.replicas=2</code> and unclean election off, short of losing two brokers' disks or a correlated power loss, since Kafka acks before fsync.)</li>
+<li>Is it exactly-once? (Within Kafka with transactions; at external sinks only through idempotence.)</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>Expecting global ordering across a multi-partition topic.</li>
+<li>Adding consumers beyond the partition count and expecting more throughput.</li>
+<li>Using Kafka as a task queue that needs per-message retries and delays without explaining how (retry topics, a DLQ topic).</li>
+<li><code>acks=all</code> with <code>min.insync.replicas=1</code>, presented as durable.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://www.linkedin.com/blog/engineering/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying" target="_blank" rel="noopener">The Log: What every software engineer should know about real-time data's unifying abstraction</a><span>Jay Kreps, LinkedIn Engineering, 2013. The case for the log as the backbone of data systems.</span></li>
+<li><a href="https://kafka.apache.org/documentation/" target="_blank" rel="noopener">Apache Kafka documentation</a><span>Design chapter (persistence, replication, ISR, compaction) and the producer, consumer and topic configuration references.</span></li>
+<li><a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging" target="_blank" rel="noopener">KIP-98: Exactly Once Delivery and Transactional Messaging</a><span>The design of the idempotent producer, transactions and zombie fencing.</span></li>
+<li><a href="https://www.confluent.io/blog/how-choose-number-topics-partitions-kafka-cluster/" target="_blank" rel="noopener">How to choose the number of topics/partitions in a Kafka cluster?</a><span>Jun Rao, Confluent blog. The max(produce, consume) sizing rule and the costs of too many partitions.</span></li>
+<li><a href="https://pulsar.apache.org/docs/" target="_blank" rel="noopener">Apache Pulsar documentation</a><span>Architecture with BookKeeper, subscription types and tiered storage, for comparison with Kafka.</span></li>
+</ul>

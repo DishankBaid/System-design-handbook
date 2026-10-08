@@ -1,0 +1,394 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">A bank account table with a <code>balance</code> column answers "how much money is in account 42?" and nothing else. It cannot say what the balance was on 3 March, why it dropped by $90 on Tuesday, or whether a bug last month double-charged anyone. Accountants solved this centuries ago: they never overwrite a balance, they append entries to a ledger and derive the balance by adding them up.</p>
+<p>Two related patterns bring that idea into software. <dfn>Event sourcing</dfn> stores every change to an entity as an immutable event and derives current state by replaying them. <dfn>CQRS</dfn> (Command Query Responsibility Segregation) splits the model that handles writes from the models that serve reads, so each can have the shape its job needs. They are often used together, because an event log is a natural way to feed many read models, but each is useful on its own.</p>
+<p>Both are powerful and both are expensive. Interviewers bring them up to see whether you know what they buy, what they cost, and when a plain table with an audit log is the better answer.</p>
+
+<h2 id="cqrs">CQRS: separate models for writing and reading</h2>
+<p>In a typical CRUD service, one model (one set of tables, one ORM entity) handles both the commands that change data and the queries that read it. That works until the two pull in opposite directions. Writes want normalised data and strict invariants ("a withdrawal may not overdraw the account"). Reads want denormalised, pre-joined data in many shapes: the account page wants balance plus last 20 transactions, the fraud team wants spend per merchant per hour, search wants full-text over payees.</p>
+<p>CQRS gives each side its own model:</p>
+<ul>
+<li>The <dfn>write model</dfn> receives commands (<code>Withdraw(acc-42, 9000)</code>), loads the relevant entity, checks business rules, and records the change. In domain-driven design terms, the unit of consistency is an <dfn>aggregate</dfn>: one account, one order, one cart. A command touches exactly one aggregate, inside one transaction.</li>
+<li>One or more <dfn>read models</dfn> are built from the changes, each optimised for specific queries and stored wherever fits best: a SQL table, an Elasticsearch index, a Redis hash, a data warehouse.</li>
+<li><dfn>Projections</dfn> (or projectors) are the code that turns changes into read-model updates: on <code>Withdrawn</code>, subtract from <code>account_summary.balance</code> and insert into <code>recent_transactions</code>.</li>
+</ul>
+
+<figure class="fig wide">
+<div class="fig-frame">
+<svg viewBox="0 0 760 290" role="img" aria-label="CQRS architecture: commands go through a command API to the account aggregate, which appends events to an event store; projectors consume events asynchronously and update three read models; queries are served by a query API from the read models">
+<text class="t xs mute" x="140" y="20">write side</text>
+<text class="t xs mute" x="140" y="284">read side</text>
+<rect class="n client" x="10" y="130" width="90" height="56" rx="8"/><text class="t b mid" x="55" y="155">Client</text><text class="t xs mute mid" x="55" y="171">web / app</text>
+<rect class="n svc" x="140" y="30" width="120" height="50" rx="8"/><text class="t b mid" x="200" y="52">Command API</text><text class="t xs mono mute mid" x="200" y="68">POST /withdraw</text>
+<rect class="n svc" x="300" y="30" width="130" height="50" rx="8"/><text class="t b mid" x="365" y="52">Aggregate</text><text class="t xs mute mid" x="365" y="68">acc-42: no overdraft</text>
+<rect class="n db" x="470" y="30" width="130" height="50" rx="8"/><text class="t b mid" x="535" y="52">Event store</text><text class="t xs mute mid" x="535" y="68">append-only</text>
+<rect class="n svc" x="470" y="110" width="130" height="46" rx="8"/><text class="t b mid" x="535" y="131">Projectors</text><text class="t xs mute mid" x="535" y="147">subscribe, update</text>
+<text class="t xs mute mid" x="535" y="174">async: read-model lag</text>
+<rect class="n db" x="640" y="30" width="112" height="46" rx="8"/><text class="t sm b mid" x="696" y="50">account_summary</text><text class="t xs mute mid" x="696" y="66">PostgreSQL</text>
+<rect class="n db" x="640" y="95" width="112" height="46" rx="8"/><text class="t sm b mid" x="696" y="115">payee search</text><text class="t xs mute mid" x="696" y="131">Elasticsearch</text>
+<rect class="n db" x="640" y="160" width="112" height="46" rx="8"/><text class="t sm b mid" x="696" y="180">spend by month</text><text class="t xs mute mid" x="696" y="196">warehouse</text>
+<rect class="n svc" x="140" y="225" width="120" height="50" rx="8"/><text class="t b mid" x="200" y="247">Query API</text><text class="t xs mono mute mid" x="200" y="263">GET /accounts/42</text>
+<path class="e" d="M100,145 C120,145 116,55 136,55"/>
+<path class="e" d="M100,172 C120,172 116,250 136,250"/>
+<path class="e" d="M260,55 H296"/>
+<path class="e" d="M430,55 H466"/>
+<path class="e" d="M535,80 V106"/>
+<path class="e" d="M600,126 C620,126 618,53 636,53"/>
+<path class="e" d="M600,133 C618,133 618,118 636,118"/>
+<path class="e" d="M600,140 C620,140 618,183 636,183"/>
+<path class="e" d="M696,206 V250 H264"/>
+<path class="flow" d="M535,80 V106"/>
+<path class="flow" d="M600,126 C620,126 618,53 636,53"/>
+<path class="flow" d="M600,133 C618,133 618,118 636,118"/>
+<path class="flow" d="M600,140 C620,140 618,183 636,183"/>
+<text class="t xs mute mid" x="480" y="244">queries read only from read models</text>
+</svg>
+</div>
+<figcaption><b>CQRS with event sourcing.</b> The write side stores events and nothing else. Projectors (animated) fan the same events out into three read models with three different storage engines. Each read model can be dropped and rebuilt from the event store at any time.</figcaption>
+</figure>
+
+<h3 id="read-model-lag">Read-model lag</h3>
+<p>Projections run asynchronously, so a read model is always slightly behind the write model: typically tens of milliseconds, seconds under load, and arbitrarily long if a projector is down. The classic bug: a user withdraws $50, the page reloads from <code>account_summary</code>, and the old balance is still there. Ways to handle it:</p>
+<ul>
+<li><strong>Return the new state from the command.</strong> The write side knows the new balance; send it back and let the client render it.</li>
+<li><strong>Version tokens.</strong> The command returns the aggregate version it produced (v1002). The query passes it along, and the query API waits briefly until the projection has processed v1002, or reads from the write side if it has not.</li>
+<li><strong>Design the UI for it</strong>: show the transaction as "pending" until the read model confirms it, as banking apps commonly do.</li>
+<li><strong>Monitor it.</strong> Projection lag (newest event position minus the projector's checkpoint) is the key health metric, exactly like consumer lag in <a href="event-streaming.html">event streaming</a>.</li>
+</ul>
+
+<h3 id="cqrs-without-es">CQRS without event sourcing</h3>
+<p>CQRS does not require events as the source of truth. A service can write to normalised PostgreSQL tables and maintain read models from them via change data capture, an outbox, or simply a materialised view. Shipping product data from a relational database to Elasticsearch for search is CQRS in everything but name. This lighter form captures most of the benefit (read models shaped for queries, scaled independently) with far less machinery, and it is the version worth proposing first in an interview.</p>
+
+<h2 id="event-sourcing">Event sourcing: state as a fold over events</h2>
+<p>In an event-sourced system the events are the database. The account table does not exist; there is only the stream for <code>acc-42</code>: <code>Opened</code>, <code>Deposited</code>, <code>Withdrawn</code>, and so on. Current state is computed by starting from an empty state and applying each event in order. In functional terms, state is a <dfn>left fold</dfn> over the event stream: <code>state = reduce(apply, events, initial)</code>.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 270" role="img" aria-label="Rebuilding account state by folding five events one at a time into a state object">
+<text class="t xs mute" x="14" y="20">event stream acc-42, oldest first</text>
+<rect class="n db" x="230" y="168" width="260" height="60" rx="8"/>
+<text class="t xs mono mute" x="500" y="204">state = apply(state, event)</text>
+<g data-show="1">
+<rect class="n cache" x="14" y="30" width="124" height="50" rx="7"/><text class="t sm b mid" x="76" y="51">Opened</text><text class="t xs mono mid mute" x="76" y="68">owner: Ana</text>
+<rect class="n ghost" x="152" y="30" width="124" height="50" rx="7"/><text class="t sm b mid mute" x="214" y="51">Deposited</text><text class="t xs mono mid mute" x="214" y="68">v1: 120.50</text>
+<rect class="n ghost" x="290" y="30" width="124" height="50" rx="7"/><text class="t sm b mid mute" x="352" y="51">Withdrawn</text><text class="t xs mono mid mute" x="352" y="68">9000 cents</text>
+<rect class="n ghost" x="428" y="30" width="124" height="50" rx="7"/><text class="t sm b mid mute" x="490" y="51">Deposited</text><text class="t xs mono mid mute" x="490" y="68">10000 cents</text>
+<rect class="n ghost" x="566" y="30" width="124" height="50" rx="7"/><text class="t sm b mid mute" x="628" y="51">Withdrawn</text><text class="t xs mono mid mute" x="628" y="68">9000 cents</text>
+<path class="e accent" d="M76,82 C76,128 360,124 360,164"/>
+<text class="t mono mid" x="360" y="193">acc-42 · owner Ana</text>
+<text class="t b mid" x="360" y="214">balance $0.00 · version 1</text>
+<text class="t sm mid" x="360" y="258">State starts empty. Opened sets the account id and owner.</text>
+</g>
+<g data-show="2">
+<rect class="n" x="14" y="30" width="124" height="50" rx="7"/><text class="t sm b mid" x="76" y="51">Opened</text><text class="t xs mono mid mute" x="76" y="68">owner: Ana</text>
+<rect class="n cache" x="152" y="30" width="124" height="50" rx="7"/><text class="t sm b mid" x="214" y="51">Deposited</text><text class="t xs mono mid mute" x="214" y="68">v1: 120.50</text>
+<rect class="n ghost" x="290" y="30" width="124" height="50" rx="7"/><text class="t sm b mid mute" x="352" y="51">Withdrawn</text><text class="t xs mono mid mute" x="352" y="68">9000 cents</text>
+<rect class="n ghost" x="428" y="30" width="124" height="50" rx="7"/><text class="t sm b mid mute" x="490" y="51">Deposited</text><text class="t xs mono mid mute" x="490" y="68">10000 cents</text>
+<rect class="n ghost" x="566" y="30" width="124" height="50" rx="7"/><text class="t sm b mid mute" x="628" y="51">Withdrawn</text><text class="t xs mono mid mute" x="628" y="68">9000 cents</text>
+<path class="e accent" d="M214,82 C214,128 360,124 360,164"/>
+<text class="t mono mid" x="360" y="193">acc-42 · owner Ana</text>
+<text class="t b mid" x="360" y="214">balance $120.50 · version 2</text>
+<text class="t sm mid" x="360" y="258">A v1 event stored a float in dollars. The upcaster turns it into 12050 cents before apply().</text>
+</g>
+<g data-show="3">
+<rect class="n" x="14" y="30" width="124" height="50" rx="7"/><text class="t sm b mid" x="76" y="51">Opened</text><text class="t xs mono mid mute" x="76" y="68">owner: Ana</text>
+<rect class="n" x="152" y="30" width="124" height="50" rx="7"/><text class="t sm b mid" x="214" y="51">Deposited</text><text class="t xs mono mid mute" x="214" y="68">v1: 120.50</text>
+<rect class="n cache" x="290" y="30" width="124" height="50" rx="7"/><text class="t sm b mid" x="352" y="51">Withdrawn</text><text class="t xs mono mid mute" x="352" y="68">9000 cents</text>
+<rect class="n ghost" x="428" y="30" width="124" height="50" rx="7"/><text class="t sm b mid mute" x="490" y="51">Deposited</text><text class="t xs mono mid mute" x="490" y="68">10000 cents</text>
+<rect class="n ghost" x="566" y="30" width="124" height="50" rx="7"/><text class="t sm b mid mute" x="628" y="51">Withdrawn</text><text class="t xs mono mid mute" x="628" y="68">9000 cents</text>
+<path class="e accent" d="M352,82 C352,128 360,124 360,164"/>
+<text class="t mono mid" x="360" y="193">acc-42 · owner Ana</text>
+<text class="t b mid" x="360" y="214">balance $30.50 · version 3</text>
+<text class="t sm mid" x="360" y="258">Withdrawn subtracts. apply() never validates: the event is a fact that already happened.</text>
+</g>
+<g data-show="4">
+<rect class="n" x="14" y="30" width="124" height="50" rx="7"/><text class="t sm b mid" x="76" y="51">Opened</text><text class="t xs mono mid mute" x="76" y="68">owner: Ana</text>
+<rect class="n" x="152" y="30" width="124" height="50" rx="7"/><text class="t sm b mid" x="214" y="51">Deposited</text><text class="t xs mono mid mute" x="214" y="68">v1: 120.50</text>
+<rect class="n" x="290" y="30" width="124" height="50" rx="7"/><text class="t sm b mid" x="352" y="51">Withdrawn</text><text class="t xs mono mid mute" x="352" y="68">9000 cents</text>
+<rect class="n cache" x="428" y="30" width="124" height="50" rx="7"/><text class="t sm b mid" x="490" y="51">Deposited</text><text class="t xs mono mid mute" x="490" y="68">10000 cents</text>
+<rect class="n ghost" x="566" y="30" width="124" height="50" rx="7"/><text class="t sm b mid mute" x="628" y="51">Withdrawn</text><text class="t xs mono mid mute" x="628" y="68">9000 cents</text>
+<path class="e accent" d="M490,82 C490,128 360,124 360,164"/>
+<text class="t mono mid" x="360" y="193">acc-42 · owner Ana</text>
+<text class="t b mid" x="360" y="214">balance $130.50 · version 4</text>
+<text class="t sm mid" x="360" y="258">Each event moves the state forward by exactly one version.</text>
+</g>
+<g data-show="5">
+<rect class="n" x="14" y="30" width="124" height="50" rx="7"/><text class="t sm b mid" x="76" y="51">Opened</text><text class="t xs mono mid mute" x="76" y="68">owner: Ana</text>
+<rect class="n" x="152" y="30" width="124" height="50" rx="7"/><text class="t sm b mid" x="214" y="51">Deposited</text><text class="t xs mono mid mute" x="214" y="68">v1: 120.50</text>
+<rect class="n" x="290" y="30" width="124" height="50" rx="7"/><text class="t sm b mid" x="352" y="51">Withdrawn</text><text class="t xs mono mid mute" x="352" y="68">9000 cents</text>
+<rect class="n" x="428" y="30" width="124" height="50" rx="7"/><text class="t sm b mid" x="490" y="51">Deposited</text><text class="t xs mono mid mute" x="490" y="68">10000 cents</text>
+<rect class="n cache" x="566" y="30" width="124" height="50" rx="7"/><text class="t sm b mid" x="628" y="51">Withdrawn</text><text class="t xs mono mid mute" x="628" y="68">9000 cents</text>
+<path class="e accent" d="M628,82 C628,128 360,124 360,164"/>
+<text class="t mono mid" x="360" y="193">acc-42 · owner Ana</text>
+<text class="t b mid" x="360" y="214">balance $40.50 · version 5</text>
+<text class="t sm mid" x="360" y="258">Current state is the fold of every event so far. Nothing else needs to be stored.</text>
+</g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">1</button><button type="button" data-step="2" aria-pressed="false">2</button><button type="button" data-step="3" aria-pressed="false">3</button><button type="button" data-step="4" aria-pressed="false">4</button><button type="button" data-step="5" aria-pressed="false">5</button></div>
+</div>
+<figcaption><b>Folding a stream.</b> Step through the first five events of the account used in the code below. The state object is disposable: it can be rebuilt from the stream at any time, with any logic, as many times as needed.</figcaption>
+</figure>
+
+<p>A command handler follows the same three steps every time: load the aggregate by folding its stream, decide whether the command is allowed given that state, and append the resulting events. The <code>apply</code> function never validates or fails, because the events it applies already happened; all business rules live in the decision step.</p>
+
+<h3 id="event-store">The event store</h3>
+<p>An <dfn>event store</dfn> is a database optimised for this access pattern. Its core operations are small:</p>
+<ul>
+<li><strong>Append to a stream with an expected version.</strong> <code>append("acc-42", events, expected_version=1002)</code> fails if another writer appended first. This is <dfn>optimistic concurrency control</dfn>: two concurrent withdrawals both read version 1002, the first append succeeds, the second gets a conflict and retries against the new state, so the overdraft check cannot be bypassed by a race.</li>
+<li><strong>Read a stream</strong> in order, from a given version.</li>
+<li><strong>Subscribe to all events</strong> in a global order, from a checkpoint, which is what projectors use.</li>
+</ul>
+<p>Purpose-built stores (EventStoreDB, Axon Server) provide these directly. Many teams instead use PostgreSQL with an <code>events</code> table and a unique constraint on <code>(stream_id, version)</code>, which gives optimistic concurrency for free, or DynamoDB with a conditional put. Kafka is a poor primary event store: it has no per-entity streams to read efficiently and no way to append conditionally on an entity's version, though it is a fine transport for publishing events onward.</p>
+
+<h3 id="snapshots">Snapshots</h3>
+<p>Folding 30 events per load is free. Folding 2 million events for a busy corporate account on every command is not. A <dfn>snapshot</dfn> stores the folded state at some version; loading becomes "read the latest snapshot, then fold only the events after it". Snapshots are a cache: they can be deleted and recomputed at any time, and they must be discarded when the <code>apply</code> logic changes in a way that would produce a different state.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 245" role="img" aria-label="An event stream of 10,437 events with a snapshot every 1,000; loading uses the latest snapshot plus 437 events; a new read model replays all events from the start and then follows live">
+<text class="t sm b" x="40" y="22">Event stream for one busy aggregate: 10,437 events</text>
+<rect class="n queue" x="40" y="34" width="640" height="26" rx="4"/>
+<path d="M101.3,30 V64" style="stroke:var(--d-db-s);stroke-width:2"/>
+<path d="M162.6,30 V64" style="stroke:var(--d-db-s);stroke-width:2"/>
+<path d="M224.0,30 V64" style="stroke:var(--d-db-s);stroke-width:2"/>
+<path d="M285.3,30 V64" style="stroke:var(--d-db-s);stroke-width:2"/>
+<path d="M346.6,30 V64" style="stroke:var(--d-db-s);stroke-width:2"/>
+<path d="M407.9,30 V64" style="stroke:var(--d-db-s);stroke-width:2"/>
+<path d="M469.2,30 V64" style="stroke:var(--d-db-s);stroke-width:2"/>
+<path d="M530.6,30 V64" style="stroke:var(--d-db-s);stroke-width:2"/>
+<path d="M591.9,30 V64" style="stroke:var(--d-db-s);stroke-width:2"/>
+<path d="M653.2,30 V64" style="stroke:var(--d-db-s);stroke-width:2"/>
+<text class="t xs mute" x="40" y="80">v0</text><text class="t xs mute end" x="680" y="80">v10,437</text>
+<text class="t xs mid" x="346.6" y="80" style="fill:var(--d-db-s)">snapshot every 1,000 events</text>
+<text class="t sm b" x="40" y="112">Load for a command</text>
+<rect class="n db" x="619.2" y="124" width="68" height="26" rx="4"/><text class="t xs mono mid" x="653.2" y="141">v10,000</text>
+<rect x="653.2" y="32" width="28.8" height="30" rx="3" style="fill:none;stroke:var(--accent);stroke-width:2"/>
+<path class="e accent" d="M653.2,122 V90"/>
+<text class="t xs mute end" x="609.2" y="141">latest snapshot, then fold only the 437 newer events (outlined)</text>
+<text class="t sm b" x="40" y="186">Build a new read model</text>
+<path class="e accent" d="M40,210 H680"/>
+<path class="flow" d="M40,210 H680"/>
+<text class="t xs mute" x="40" y="232">replay from v0 through the projector (ignores snapshots), then keep following new events live</text>
+</svg>
+</div>
+<figcaption><b>Snapshot plus replay.</b> Command handling uses snapshots to bound load time. Projections ignore them and replay the full history, because a new read model needs every event, not just the final state.</figcaption>
+</figure>
+<p>Take snapshots only where the numbers demand it. Most aggregates in a well-designed model have short streams (an order rarely exceeds 50 events), and adding snapshots everywhere adds a second representation of state to keep correct.</p>
+
+<h3 id="upcasting">Versioning events: upcasting</h3>
+<p>Events are immutable and kept forever, but the code that reads them changes. When <code>Deposited</code> moves from a float in dollars to integer cents, the old events are not rewritten. Instead an <dfn>upcaster</dfn> converts old versions to the current shape as they are read, so <code>apply</code> only ever handles the latest version. Rules that keep this manageable: version every event type from day one, make only additive changes where possible, write an upcaster for each breaking change, and keep a test suite of real historical events that must still load. For changes too large to upcast, the last resort is to copy the stream into a new one with transformed events, which is a migration with all the usual risks.</p>
+
+<h3 id="replays">Replays and new read models</h3>
+<p>This is event sourcing's best feature. A new requirement arrives: "show customers their average monthly spend for the last two years". With a CRUD table, the history needed may not exist. With an event store, you write a new projection, start it at position zero, let it replay years of events into a new table, and switch the query API over when it has caught up. The same mechanism fixes bugs: if a projection had a bug for three weeks, fix the code, wipe the read model, and replay.</p>
+<p>Replays have operational cost. Projections must be idempotent and deterministic (no calling external APIs or reading the clock), replays need throughput (see the worked example), and a replay must not re-trigger side effects such as emails. Side-effecting handlers are kept separate from projections and track their own checkpoint so they never run against old events.</p>
+
+<h3 id="temporal-queries">Temporal queries</h3>
+<p>Because every change is recorded with its time, past state is a fold over a prefix of the stream: "what was the balance at the end of day 3?" means folding only the events up to day 3. This answers audit questions ("what did the system believe when it approved this loan?"), supports debugging by replaying the exact sequence that led to a bad state, and enables "as of" reports without designing history tables in advance.</p>
+
+<h2 id="implementation">Implementation: an event-sourced account</h2>
+<p>A complete, minimal event-sourced aggregate: pure <code>apply</code>, an upcaster for a legacy event version, an in-memory store with optimistic concurrency, snapshots, a command handler that enforces "no overdraft", and a temporal query.</p>
+<pre><code class="language-python">from dataclasses import dataclass, replace
+from functools import reduce
+
+
+@dataclass(frozen=True)
+class Account:
+    id: str = ""
+    owner: str = ""
+    balance_cents: int = 0
+    version: int = 0          # number of events applied: used for optimistic concurrency
+
+
+def upcast(e: dict) -&gt; dict:
+    """v1 events stored dollars as a float; v2 uses integer cents. Old events are never rewritten."""
+    if e.get("v", 1) == 1 and e["type"] in ("Deposited", "Withdrawn"):
+        e = {**e, "v": 2, "amount_cents": round(e.pop("amount") * 100)}
+    return e
+
+
+def apply(state: Account, e: dict) -&gt; Account:
+    """Pure function: state + event -&gt; new state. No validation, no I/O: the event already happened."""
+    e = upcast(dict(e))
+    if e["type"] == "Opened":
+        state = replace(state, id=e["account"], owner=e["owner"])
+    elif e["type"] == "Deposited":
+        state = replace(state, balance_cents=state.balance_cents + e["amount_cents"])
+    elif e["type"] == "Withdrawn":
+        state = replace(state, balance_cents=state.balance_cents - e["amount_cents"])
+    return replace(state, version=state.version + 1)
+
+
+class ConcurrencyError(Exception):
+    pass
+
+
+class EventStore:
+    def __init__(self):
+        self.streams, self.snapshots = {}, {}
+
+    def append(self, stream, events, expected_version):
+        log = self.streams.setdefault(stream, [])
+        if len(log) != expected_version:          # someone else appended first
+            raise ConcurrencyError(f"{stream}: expected v{expected_version}, found v{len(log)}")
+        log.extend(events)
+
+    def load(self, stream, use_snapshot=True):
+        state, start = Account(), 0
+        if use_snapshot and stream in self.snapshots:
+            state = self.snapshots[stream]
+            start = state.version
+        tail = self.streams[stream][start:]
+        return reduce(apply, tail, state), len(tail)
+
+    def snapshot(self, stream):
+        self.snapshots[stream] = self.load(stream)[0]
+
+
+def withdraw(store, account_id, cents, day):
+    """Command handler: rebuild state, check the invariant, append the new fact."""
+    acct, _ = store.load(account_id)
+    if cents &gt; acct.balance_cents:
+        raise ValueError(f"insufficient funds: {acct.balance_cents} &lt; {cents}")
+    store.append(account_id, [{"type": "Withdrawn", "v": 2, "amount_cents": cents, "day": day}],
+                 expected_version=acct.version)
+
+
+store = EventStore()
+store.append("acc-42", [{"type": "Opened", "account": "acc-42", "owner": "Ana", "day": 1},
+                        {"type": "Deposited", "v": 1, "amount": 120.50, "day": 1}], 0)   # legacy v1
+for day in range(2, 1001):                       # 999 days: deposit $100 on odd days, spend $90 on even
+    kind, cents = ("Deposited", 10_000) if day % 2 else ("Withdrawn", 9_000)
+    store.append("acc-42", [{"type": kind, "v": 2, "amount_cents": cents, "day": day}], day)
+
+state, replayed = store.load("acc-42")
+print(f"balance ${state.balance_cents / 100:.2f} at v{state.version}, replayed {replayed} events")
+store.snapshot("acc-42")
+withdraw(store, "acc-42", 5_000, day=1001)
+state, replayed = store.load("acc-42")
+print(f"balance ${state.balance_cents / 100:.2f} at v{state.version}, replayed {replayed} after snapshot")
+
+# Temporal query: what was the balance at the end of day 3? Fold only the events up to then.
+as_of = reduce(apply, (e for e in store.streams["acc-42"] if e["day"] &lt;= 3), Account())
+print(f"balance at end of day 3: ${as_of.balance_cents / 100:.2f}")
+
+# Two concurrent withdrawals both read v1002; the second append is rejected.
+stale = store.load("acc-42")[0].version
+store.append("acc-42", [{"type": "Withdrawn", "v": 2, "amount_cents": 100, "day": 1002}], stale)
+try:
+    store.append("acc-42", [{"type": "Withdrawn", "v": 2, "amount_cents": 100, "day": 1002}], stale)
+except ConcurrencyError as err:
+    print("rejected:", err)</code></pre>
+<p>Output:</p>
+<pre><code class="language-text">balance $5020.50 at v1001, replayed 1001 events
+balance $4970.50 at v1002, replayed 1 after snapshot
+balance at end of day 3: $130.50
+rejected: acc-42: expected v1002, found v1003</code></pre>
+<p>The first load folds all 1,001 events, including the legacy v1 deposit, which the upcaster converts on the fly. After the snapshot, the next load folds a single event. The temporal query is just a fold with a filter. And the second of two concurrent appends at the same expected version is rejected, which is what makes the overdraft check safe without locks.</p>
+
+<h2 id="gdpr">Deletion, GDPR and crypto-shredding</h2>
+<p>An append-only store collides with the right to erasure. A customer asks to be forgotten, and their name, address and email are in hundreds of immutable events, in snapshots, in every read model, and in backups. Options:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Approach</th><th>How</th><th>Trade-off</th></tr></thead>
+<tbody>
+<tr><th>Keep personal data out of events</th><td>Events reference <code>customer_id</code>; the personal data lives in a separate, mutable store</td><td class="yes">Simplest; erasure is a normal delete. Events lose some self-containment</td></tr>
+<tr><th>Crypto-shredding</th><td>Encrypt personal fields in each event with a per-customer key held in a key store. To erase, delete the key</td><td class="meh">Events stay immutable, the data becomes unreadable everywhere, including backups (as long as key-store backups do not keep the key). Needs key management and a plan for projections that held decrypted copies</td></tr>
+<tr><th>Rewrite the stream</th><td>Copy the stream without the personal data and delete the original</td><td class="no">Breaks immutability and audit guarantees; operationally risky</td></tr>
+</tbody></table></div>
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 215" role="img" aria-label="Crypto-shredding: personal fields in events are encrypted with a per-customer key; deleting the key makes every copy unreadable while the events stay immutable">
+<text class="t xs mute" x="20" y="18">event stream (immutable)</text>
+<rect class="n queue" x="20" y="28" width="250" height="42" rx="6"/><text class="t xs mono" x="32" y="45">CustomerRegistered · cust-4411</text><text class="t xs mono mute" x="32" y="61">name: 8f3a91c2e7 (enc)</text>
+<rect class="n queue" x="20" y="80" width="250" height="42" rx="6"/><text class="t xs mono" x="32" y="97">AddressChanged · cust-4411</text><text class="t xs mono mute" x="32" y="113">street: 0b77d4e1aa (enc)</text>
+<rect class="n queue" x="20" y="132" width="250" height="42" rx="6"/><text class="t xs mono" x="32" y="149">Deposited · acc-42 · 9000</text><text class="t xs mono mute" x="32" y="165">no personal data</text>
+<path class="e" d="M270,49 C310,49 316,94 356,94"/>
+<path class="e" d="M270,101 H356"/>
+<path class="e" d="M270,153 C310,153 316,108 356,108"/>
+<g data-show="1"><rect class="n svc" x="360" y="72" width="160" height="58" rx="8"/><text class="t b mid" x="440" y="95">Reader / projector</text><text class="t xs mid" x="440" y="113">name: Ana Silva</text></g>
+<g data-show="2"><rect class="n svc" x="360" y="72" width="160" height="58" rx="8"/><text class="t b mid" x="440" y="95">Reader / projector</text><text class="t xs red mid" x="440" y="113">name: [erased]</text></g>
+<g data-show="1"><rect class="n cache" x="570" y="72" width="140" height="58" rx="8"/><text class="t b mid" x="640" y="95">Key store</text><text class="t xs mono mid" x="640" y="113">cust-4411 → K1</text>
+<path class="e both" d="M524,101 H566"/></g>
+<g data-show="2"><rect class="n bad" x="570" y="72" width="140" height="58" rx="8"/><text class="t b mid" x="640" y="95">Key store</text><text class="t xs mono red mid" x="640" y="113">cust-4411: deleted</text>
+<path class="e dash red" d="M566,101 H524"/></g>
+<text class="t sm mid" x="360" y="204" data-show="1">Personal fields are encrypted with a per-customer key. Readers fetch the key to decrypt.</text>
+<text class="t sm mid" x="360" y="204" data-show="2">Erasure deletes one key. Every event, backup and replica copy becomes unreadable at once, provided the key store's own backups also expire the key.</text>
+</svg>
+
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Normal read</button><button type="button" data-step="2" aria-pressed="false">Key deleted</button></div>
+</div>
+<figcaption><b>Crypto-shredding.</b> The events never change. Only the key does, which is why the technique also reaches backups that nobody could practically edit. Read models that stored decrypted values still need their own delete.</figcaption>
+</figure>
+<p>In practice teams combine the first two: personal data is stored separately where possible, and anything that must appear in events is encrypted with a per-subject key. Read models are ordinary mutable stores and must also delete the data, usually by reacting to a <code>CustomerForgotten</code> event.</p>
+
+<h2 id="when-not">When not to use them</h2>
+<p>Most systems should not be event-sourced, and most CQRS benefits are available without it. Warning signs that the patterns will cost more than they return:</p>
+<ul>
+<li><strong>The domain is CRUD.</strong> A product catalogue edited through forms, where nobody asks how a field reached its current value, gains nothing from an event history. An <code>updated_at</code> column and an audit table cover it.</li>
+<li><strong>Queries need current state across many entities, immediately.</strong> "Find all accounts with balance below zero" is easy in a table and needs a projection (with lag) in an event-sourced system.</li>
+<li><strong>The team is new to it.</strong> Upcasting, projections, replays, snapshots, idempotent handlers and eventual consistency are each manageable; learning all of them at once on a deadline is how event-sourced projects fail.</li>
+<li><strong>Applied to the whole system.</strong> Event sourcing is a per-aggregate or per-service decision. Use it where history is the product (ledgers, orders, inventory movements, workflows) and keep everything else as plain tables.</li>
+</ul>
+<div class="callout warn">
+<div class="callout-title">Common mistake</div>
+<p>Treating internal event-sourcing events as the integration contract for other services. Internal events are shaped by one aggregate's implementation and change with it. Publish separate, deliberately designed integration events (see <a href="event-driven.html">Event-Driven Architecture</a>), or every refactoring becomes a cross-team schema migration.</p>
+</div>
+
+<h2 id="worked-example">Worked example: a bank ledger</h2>
+<p>A digital bank has 10 million accounts averaging 50 transactions per month, and wants every balance change auditable for seven years. Each event is about 300 bytes. Ledgers are the textbook fit: history is the product, regulators ask "as of" questions, and the invariant (no unauthorised overdraft) is per account, which matches one aggregate per account.</p>
+<div class="calc">Events            10M accounts × 50 / month             = 500M events/month
+Write rate        500M / (30 × 86,400 s)                ≈ <span class="r">190 events/s</span> average (peaks of a few thousand on payday)
+Storage           500M × 300 B = 150 GB/month           ≈ <span class="r">1.8 TB/year</span>, ~12.6 TB for 7 years
+Typical stream    50 × 12 = 600 events/year             → ~4,200 after 7 years; folds in about a millisecond
+Busy accounts     a payroll account: 2M events/year      → snapshot every 1,000 events, fold ≤ 1,000
+New projection    7 years × 6B = 42B events at 50,000/s  ≈ 233 hours single-threaded
+                  partitioned by account over 20 workers ≈ <span class="r">11.7 hours</span></div>
+<p>The design that falls out: PostgreSQL as the event store, partitioned by month, with a unique <code>(account_id, version)</code> constraint for optimistic concurrency; snapshots for any stream above 1,000 events (most accounts within two years), or "closing the books" with one stream per account per year that opens with the carried-forward balance; three projections (balances and recent transactions in PostgreSQL, payee search in Elasticsearch, monthly statements in the warehouse); and a projection framework that can replay in parallel by account, because a projection that takes ten days to rebuild single-threaded is a projection nobody dares to fix. Personal data lives in a customer service; ledger events only carry account ids, so erasure never touches the ledger.</p>
+
+<h2 id="tradeoffs">Trade-offs at a glance</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>You gain</th><th>You pay</th></tr></thead>
+<tbody>
+<tr><td>A complete, immutable audit trail of every change</td><td>Event schemas are forever: upcasters and compatibility discipline</td></tr>
+<tr><td>Read models shaped exactly for each query, scaled independently</td><td>Read-model lag and the UX work to hide it</td></tr>
+<tr><td>New read models and bug fixes by replaying history</td><td>Replay infrastructure, idempotent and deterministic projections</td></tr>
+<tr><td>Temporal queries and exact reproduction of past states</td><td>Ad hoc queries over current state need a projection first</td></tr>
+<tr><td>Optimistic concurrency per aggregate, no locks</td><td>Erasure is hard; needs crypto-shredding or data separation</td></tr>
+<tr><td>Append-only writes are simple and fast</td><td>More moving parts and concepts than CRUD, for the whole team</td></tr>
+</tbody></table></div>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+<li><strong>Banking and accounting ledgers</strong> are event-sourced by nature: double-entry bookkeeping appends entries and never edits a posted one. Modern ledger databases and core banking systems keep the same model.</li>
+<li><strong>EventStoreDB</strong> (since renamed KurrentDB) is a database built for event sourcing, with streams, expected-version appends and persistent subscriptions for projections.</li>
+<li><strong>Axon Framework</strong> and <strong>Axon Server</strong> provide aggregates, command and event buses, sagas and an event store for Java applications.</li>
+<li><strong>LMAX</strong>, a retail foreign-exchange exchange, runs its business logic single-threaded in memory and recovers by replaying its journal of input events; Martin Fowler's write-up describes it handling 6 million orders per second on one thread. It shows event sourcing as a performance tool, not just an audit one.</li>
+<li><strong>Git</strong> is a familiar analogy: commits are immutable events, the working tree is a projection, and checking out an old commit is a temporal query.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>When the problem involves money, inventory, or any domain where "how did we get here?" matters (ledgers, wallets, order lifecycles), or when reads and writes have very different shapes and scale (a write-light system with many read views, a <a href="news-feed.html">news feed</a> with precomputed timelines). Lead with the light version: "writes go to a normalised store, read models are projections updated asynchronously". Add event sourcing only when audit and history are requirements.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>A user updates something and does not see it. Why, and what do you do? (Read-model lag; return state from the command, version tokens, pending UI.)</li>
+<li>How do two concurrent commands on the same aggregate not violate an invariant? (Expected-version append, retry on conflict.)</li>
+<li>Loading an aggregate is slow. (Snapshots, or a smaller aggregate boundary.)</li>
+<li>The event format must change. (Version events, upcast on read, never rewrite history.)</li>
+<li>A user invokes the right to be forgotten. (Data separation, crypto-shredding, deleting from read models.)</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>Event sourcing the whole system, including simple CRUD entities.</li>
+<li>Using Kafka as the event store for aggregates and loading state by scanning a topic.</li>
+<li>Projections that send emails or call APIs, so a replay re-sends a year of notifications.</li>
+<li>Ignoring read-model lag, or claiming CQRS gives strongly consistent reads.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://martinfowler.com/eaaDev/EventSourcing.html" target="_blank" rel="noopener">Event Sourcing</a><span>Martin Fowler, 2005. The original description: complete rebuild, temporal queries and event replay.</span></li>
+<li><a href="https://martinfowler.com/bliki/CQRS.html" target="_blank" rel="noopener">CQRS</a><span>Martin Fowler, 2011. A concise explanation, with a clear warning about when the pattern adds risky complexity.</span></li>
+<li><a href="https://learn.microsoft.com/en-us/azure/architecture/patterns/event-sourcing" target="_blank" rel="noopener">Event Sourcing pattern</a><span>Microsoft Azure Architecture Center. Practical issues: versioning, snapshots, consistency and when not to use it.</span></li>
+<li><a href="https://martinfowler.com/articles/lmax.html" target="_blank" rel="noopener">The LMAX Architecture</a><span>Martin Fowler, 2011. An in-memory, event-sourced business logic processor at very high throughput.</span></li>
+</ul>

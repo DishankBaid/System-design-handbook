@@ -1,0 +1,549 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">A checkout service that sends the receipt email inside the request handler inherits every problem of the email provider. When the provider takes 2 seconds, checkout takes 2 seconds. When the provider is down, checkout fails, and a customer who has already been charged sees an error page. Nothing about the email needed to happen before the customer saw "order confirmed".</p>
+<p>A <dfn>message queue</dfn> fixes this by splitting the work in time. The checkout service writes a small message (<code>{"type": "send_receipt", "order_id": 81723}</code>) to a durable queue and returns in a few milliseconds. A separate pool of workers reads messages and does the slow part at its own pace. The service that produces work is the <dfn>producer</dfn>, the service that does it is the <dfn>consumer</dfn>, and the queue is a buffer that both trust to hold the message until it is handled.</p>
+<p>That buffer gives you three things at once:</p>
+<div class="defs">
+<div><h4>Decoupling</h4><p>The producer does not know how many consumers exist, where they run, or whether they are up right now. Either side can deploy, scale or fail independently.</p></div>
+<div><h4>Load levelling</h4><p>Bursts are absorbed as queue depth instead of overload. Consumers are sized for the average rate, not the peak.</p></div>
+<div><h4>Retries for free</h4><p>A message that fails is not lost. It stays in the queue and is delivered again, so transient errors heal themselves without the producer doing anything.</p></div>
+</div>
+
+<h2 id="point-to-point">Point-to-point delivery and competing consumers</h2>
+<p>A classic queue is <dfn>point-to-point</dfn>: each message is delivered to exactly one of the consumers reading the queue, and once that consumer confirms it, the message is gone. Add more consumers and they share the work, each taking the next available message. This pattern is called <dfn>competing consumers</dfn>, and it is how you scale a queue-backed worker pool: throughput grows roughly linearly with the number of consumers until something downstream (a database, a rate-limited API) becomes the bottleneck.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 270" role="img" aria-label="Two producers write messages into one queue; three competing workers each take different messages">
+<rect class="n svc" x="20" y="55" width="120" height="50" rx="8"/><text class="t b mid" x="80" y="77">Checkout</text><text class="t xs mute mid" x="80" y="93">producer</text>
+<rect class="n svc" x="20" y="165" width="120" height="50" rx="8"/><text class="t b mid" x="80" y="187">Refunds</text><text class="t xs mute mid" x="80" y="203">producer</text>
+<rect class="n queue" x="220" y="95" width="250" height="80" rx="10"/>
+<text class="t b mid" x="345" y="88">receipts queue</text>
+<rect class="n" x="236" y="115" width="44" height="40" rx="5"/><text class="t xs mono mid" x="258" y="139">m7</text>
+<rect class="n" x="290" y="115" width="44" height="40" rx="5"/><text class="t xs mono mid" x="312" y="139">m6</text>
+<rect class="n" x="344" y="115" width="44" height="40" rx="5"/><text class="t xs mono mid" x="366" y="139">m5</text>
+<rect class="n" x="398" y="115" width="44" height="40" rx="5"/><text class="t xs mono mid" x="420" y="139">m4</text>
+<text class="t xs mute mid" x="345" y="196">tail (new) on the left, head on the right</text>
+<rect class="n svc" x="570" y="20" width="130" height="50" rx="8"/><text class="t b mid" x="635" y="42">worker 1</text><text class="t xs mono mute mid" x="635" y="58">has m1</text>
+<rect class="n svc" x="570" y="110" width="130" height="50" rx="8"/><text class="t b mid" x="635" y="132">worker 2</text><text class="t xs mono mute mid" x="635" y="148">has m2</text>
+<rect class="n svc" x="570" y="200" width="130" height="50" rx="8"/><text class="t b mid" x="635" y="222">worker 3</text><text class="t xs mono mute mid" x="635" y="238">has m3</text>
+<path class="e" d="M140,80 C180,80 185,125 216,125"/>
+<path class="e" d="M140,190 C180,190 185,145 216,145"/>
+<path class="e" d="M470,120 C520,120 520,45 566,45"/>
+<path class="e" d="M470,135 H566"/>
+<path class="e" d="M470,150 C520,150 520,225 566,225"/>
+<path class="flow" d="M140,80 C180,80 185,125 216,125"/>
+<path class="flow" d="M470,135 H566"/>
+<path class="flow" d="M470,150 C520,150 520,225 566,225"/>
+<text class="t xs mute mid" x="345" y="212">each message goes to exactly one worker</text>
+</svg>
+</div>
+<figcaption><b>Competing consumers.</b> Producers append, workers take from the head. Workers never coordinate with each other; the queue hands each message to one of them. To double throughput, start more workers.</figcaption>
+</figure>
+
+<p>Contrast this with <strong>publish/subscribe</strong>, where every subscriber gets its own copy of every message. Queues answer "do this job once"; pub/sub answers "tell everyone who cares that this happened". Log-based systems like Kafka can do both, and are covered in <a href="event-streaming.html">Pub/Sub &amp; Event Streaming</a>. Many brokers combine the two: an SNS topic fanning out to several SQS queues, or a RabbitMQ fanout exchange bound to one queue per consuming service, gives each service its own point-to-point queue of the same events.</p>
+
+<h2 id="load-levelling">Load levelling, drawn to scale</h2>
+<p>Traffic is rarely flat. A marketing push, a cron job in a partner's system, or the top of the hour produces bursts far above the average. Without a queue you must provision for the peak or reject work during it. With a queue, work that arrives faster than consumers can handle simply waits.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 340" role="img" aria-label="Bursty arrivals of 400 per second for 10 seconds twice, against a steady consumer capacity of 120 per second; queue depth rises to 2,800 and drains in 35 seconds">
+<text class="t sm b" x="70" y="18">Arrivals per second</text>
+<text class="t sm b" x="70" y="188">Queue depth (messages waiting)</text>
+<path class="line faint" d="M70,105.0 H690" style="stroke-dasharray:2 4"/>
+<path class="line faint" d="M70,50.0 H690" style="stroke-dasharray:2 4"/>
+<text class="t xs mute end" x="62" y="164.0">0</text>
+<text class="t xs mute end" x="62" y="109.0">200</text>
+<text class="t xs mute end" x="62" y="54.0">400</text>
+<rect x="70.6" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="75.8" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="80.9" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="86.1" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="91.3" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="96.4" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="101.6" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="106.8" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="111.9" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="117.1" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="122.3" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="127.4" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="132.6" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="137.8" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="142.9" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="148.1" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="153.3" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="158.4" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="163.6" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="168.8" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="173.9" y="50.0" width="4.0" height="110.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="179.1" y="50.0" width="4.0" height="110.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="184.3" y="50.0" width="4.0" height="110.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="189.4" y="50.0" width="4.0" height="110.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="194.6" y="50.0" width="4.0" height="110.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="199.8" y="50.0" width="4.0" height="110.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="204.9" y="50.0" width="4.0" height="110.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="210.1" y="50.0" width="4.0" height="110.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="215.3" y="50.0" width="4.0" height="110.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="220.4" y="50.0" width="4.0" height="110.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="225.6" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="230.8" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="235.9" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="241.1" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="246.3" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="251.4" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="256.6" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="261.8" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="266.9" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="272.1" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="277.3" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="282.4" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="287.6" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="292.8" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="297.9" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="303.1" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="308.3" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="313.4" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="318.6" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="323.8" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="328.9" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="334.1" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="339.3" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="344.4" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="349.6" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="354.8" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="359.9" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="365.1" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="370.3" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="375.4" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="380.6" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="385.8" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="390.9" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="396.1" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="401.3" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="406.4" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="411.6" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="416.8" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="421.9" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="427.1" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="432.3" y="50.0" width="4.0" height="110.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="437.4" y="50.0" width="4.0" height="110.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="442.6" y="50.0" width="4.0" height="110.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="447.8" y="50.0" width="4.0" height="110.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="452.9" y="50.0" width="4.0" height="110.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="458.1" y="50.0" width="4.0" height="110.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="463.3" y="50.0" width="4.0" height="110.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="468.4" y="50.0" width="4.0" height="110.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="473.6" y="50.0" width="4.0" height="110.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="478.8" y="50.0" width="4.0" height="110.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="483.9" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="489.1" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="494.3" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="499.4" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="504.6" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="509.8" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="514.9" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="520.1" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="525.3" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="530.4" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="535.6" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="540.8" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="545.9" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="551.1" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="556.3" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="561.4" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="566.6" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="571.8" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="576.9" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="582.1" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="587.3" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="592.4" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="597.6" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="602.8" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="607.9" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="613.1" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="618.3" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="623.4" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="628.6" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="633.8" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="638.9" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="644.1" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="649.3" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="654.4" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="659.6" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="664.8" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="669.9" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="675.1" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="680.3" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="685.4" y="149.0" width="4.0" height="11.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<path class="line faint" d="M70,160 H690"/>
+<path d="M70,127.0 H690" style="fill:none;stroke:var(--d-svc-s);stroke-width:2"/>
+<text class="t xs end" x="690" y="121.0" style="fill:var(--d-svc-s)">consumers drain 120/s</text>
+<text class="t xs mute mid" x="199.2" y="43.0">burst: 400/s for 10 s</text>
+<text class="t xs mute mid" x="457.5" y="43.0">burst: 400/s for 10 s</text>
+<path class="line faint" d="M70,260.0 H690" style="stroke-dasharray:2 4"/>
+<text class="t xs mute end" x="62" y="314.0">0</text>
+<text class="t xs mute end" x="62" y="264.0">1,500</text>
+<text class="t xs mute end" x="62" y="214.0">3,000</text>
+<path d="M70.0,310.0 L75.2,310.0 L80.3,310.0 L85.5,310.0 L90.7,310.0 L95.8,310.0 L101.0,310.0 L106.2,310.0 L111.3,310.0 L116.5,310.0 L121.7,310.0 L126.8,310.0 L132.0,310.0 L137.2,310.0 L142.3,310.0 L147.5,310.0 L152.7,310.0 L157.8,310.0 L163.0,310.0 L168.2,310.0 L173.3,310.0 L178.5,300.7 L183.7,291.3 L188.8,282.0 L194.0,272.7 L199.2,263.3 L204.3,254.0 L209.5,244.7 L214.7,235.3 L219.8,226.0 L225.0,216.7 L230.2,219.3 L235.3,222.0 L240.5,224.7 L245.7,227.3 L250.8,230.0 L256.0,232.7 L261.2,235.3 L266.3,238.0 L271.5,240.7 L276.7,243.3 L281.8,246.0 L287.0,248.7 L292.2,251.3 L297.3,254.0 L302.5,256.7 L307.7,259.3 L312.8,262.0 L318.0,264.7 L323.2,267.3 L328.3,270.0 L333.5,272.7 L338.7,275.3 L343.8,278.0 L349.0,280.7 L354.2,283.3 L359.3,286.0 L364.5,288.7 L369.7,291.3 L374.8,294.0 L380.0,296.7 L385.2,299.3 L390.3,302.0 L395.5,304.7 L400.7,307.3 L405.8,310.0 L411.0,310.0 L416.2,310.0 L421.3,310.0 L426.5,310.0 L431.7,310.0 L436.8,300.7 L442.0,291.3 L447.2,282.0 L452.3,272.7 L457.5,263.3 L462.7,254.0 L467.8,244.7 L473.0,235.3 L478.2,226.0 L483.3,216.7 L488.5,219.3 L493.7,222.0 L498.8,224.7 L504.0,227.3 L509.2,230.0 L514.3,232.7 L519.5,235.3 L524.7,238.0 L529.8,240.7 L535.0,243.3 L540.2,246.0 L545.3,248.7 L550.5,251.3 L555.7,254.0 L560.8,256.7 L566.0,259.3 L571.2,262.0 L576.3,264.7 L581.5,267.3 L586.7,270.0 L591.8,272.7 L597.0,275.3 L602.2,278.0 L607.3,280.7 L612.5,283.3 L617.7,286.0 L622.8,288.7 L628.0,291.3 L633.2,294.0 L638.3,296.7 L643.5,299.3 L648.7,302.0 L653.8,304.7 L659.0,307.3 L664.2,310.0 L669.3,310.0 L674.5,310.0 L679.7,310.0 L684.8,310.0 L690.0,310.0 L690,310 Z" style="fill:var(--d-cache);stroke:none"/>
+<path d="M70.0,310.0 L75.2,310.0 L80.3,310.0 L85.5,310.0 L90.7,310.0 L95.8,310.0 L101.0,310.0 L106.2,310.0 L111.3,310.0 L116.5,310.0 L121.7,310.0 L126.8,310.0 L132.0,310.0 L137.2,310.0 L142.3,310.0 L147.5,310.0 L152.7,310.0 L157.8,310.0 L163.0,310.0 L168.2,310.0 L173.3,310.0 L178.5,300.7 L183.7,291.3 L188.8,282.0 L194.0,272.7 L199.2,263.3 L204.3,254.0 L209.5,244.7 L214.7,235.3 L219.8,226.0 L225.0,216.7 L230.2,219.3 L235.3,222.0 L240.5,224.7 L245.7,227.3 L250.8,230.0 L256.0,232.7 L261.2,235.3 L266.3,238.0 L271.5,240.7 L276.7,243.3 L281.8,246.0 L287.0,248.7 L292.2,251.3 L297.3,254.0 L302.5,256.7 L307.7,259.3 L312.8,262.0 L318.0,264.7 L323.2,267.3 L328.3,270.0 L333.5,272.7 L338.7,275.3 L343.8,278.0 L349.0,280.7 L354.2,283.3 L359.3,286.0 L364.5,288.7 L369.7,291.3 L374.8,294.0 L380.0,296.7 L385.2,299.3 L390.3,302.0 L395.5,304.7 L400.7,307.3 L405.8,310.0 L411.0,310.0 L416.2,310.0 L421.3,310.0 L426.5,310.0 L431.7,310.0 L436.8,300.7 L442.0,291.3 L447.2,282.0 L452.3,272.7 L457.5,263.3 L462.7,254.0 L467.8,244.7 L473.0,235.3 L478.2,226.0 L483.3,216.7 L488.5,219.3 L493.7,222.0 L498.8,224.7 L504.0,227.3 L509.2,230.0 L514.3,232.7 L519.5,235.3 L524.7,238.0 L529.8,240.7 L535.0,243.3 L540.2,246.0 L545.3,248.7 L550.5,251.3 L555.7,254.0 L560.8,256.7 L566.0,259.3 L571.2,262.0 L576.3,264.7 L581.5,267.3 L586.7,270.0 L591.8,272.7 L597.0,275.3 L602.2,278.0 L607.3,280.7 L612.5,283.3 L617.7,286.0 L622.8,288.7 L628.0,291.3 L633.2,294.0 L638.3,296.7 L643.5,299.3 L648.7,302.0 L653.8,304.7 L659.0,307.3 L664.2,310.0 L669.3,310.0 L674.5,310.0 L679.7,310.0 L684.8,310.0 L690.0,310.0" style="fill:none;stroke:var(--d-cache-s);stroke-width:2"/>
+<path class="line faint" d="M70,310 H690"/>
+<text class="t xs" x="232.0" y="213.7">peak 2,800</text>
+<text class="t xs" x="490.3" y="213.7">peak 2,800</text>
+<text class="t xs mute mid" x="70.0" y="328">0 s</text>
+<text class="t xs mute mid" x="173.3" y="328">20 s</text>
+<text class="t xs mute mid" x="276.7" y="328">40 s</text>
+<text class="t xs mute mid" x="380.0" y="328">60 s</text>
+<text class="t xs mute mid" x="483.3" y="328">80 s</text>
+<text class="t xs mute mid" x="586.7" y="328">100 s</text>
+<text class="t xs mute mid" x="690.0" y="328">120 s</text>
+</svg>
+</div>
+<figcaption><b>Bursts become backlog, not errors.</b> Baseline traffic is 40 messages/s with two 10-second bursts of 400/s. Consumers sized at 120/s, less than a third of the peak, fall behind by 280/s during each burst, queue up to 2,800 messages, and drain the backlog at 80/s in 35 seconds. Without the queue, the same consumers would have to reject 70% of requests during each burst.</figcaption>
+</figure>
+
+<p>The cost is latency. A message that arrives at the peak waits behind 2,800 others, which at 120/s is about 23 seconds. That is fine for receipts and thumbnails and unacceptable for a payment authorisation the user is staring at. <strong>Queues are for work whose result the caller does not need right now.</strong> If the caller needs the answer, a queue only hides the overload until the caller's timeout fires.</p>
+<p>The useful mental model is that a queue converts a <em>throughput</em> problem into a <em>latency</em> problem. It only works while the average arrival rate stays below the consumers' capacity. If arrivals exceed capacity for long enough, the backlog grows without bound and the age of the oldest message climbs until messages expire or the business notices.</p>
+
+<h2 id="acks">Acknowledgements: how a queue knows work is done</h2>
+<p>The hard question for any queue is when to forget a message. If it deletes a message the moment a consumer reads it, a consumer that crashes halfway through loses that message forever. So brokers wait for an explicit <dfn>acknowledgement</dfn> (ack) from the consumer, sent after the work is finished. Until the ack arrives, the message is <dfn>in flight</dfn>: handed out, not yet done. The two dominant designs differ in how they notice that an in-flight message has been abandoned.</p>
+
+<h3 id="visibility-timeout">Visibility timeout (SQS)</h3>
+<p>Amazon SQS has no long-lived consumer connections. A consumer calls <code>ReceiveMessage</code>, and SQS returns a message plus a <dfn>receipt handle</dfn>, then hides that message from other receivers for the <dfn>visibility timeout</dfn> (30 seconds by default, up to 12 hours). If the consumer calls <code>DeleteMessage</code> with the receipt handle before the timer runs out, the message is gone. If not, for any reason at all, the message becomes visible again and the next <code>ReceiveMessage</code> gets it with an incremented receive count.</p>
+<p>The broker never needs to know whether the consumer crashed, hung or is just slow. Silence is treated as failure. Step through what happens when a worker dies mid-job:</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 330" role="img" aria-label="Visibility timeout: worker-a receives order-1001 and crashes; after 30 seconds the message reappears and worker-b receives and deletes it">
+<text class="t b" x="20" y="30" data-show="1">t = 0 s</text>
+<text class="t b" x="20" y="30" data-show="2">t = 3 s</text>
+<text class="t b" x="20" y="30" data-show="3">t = 30 s</text>
+<text class="t b" x="20" y="30" data-show="4">t = 30 s</text>
+<text class="t b" x="20" y="30" data-show="5">t = 35 s</text>
+<rect class="n svc" x="20" y="130" width="110" height="50" rx="8"/><text class="t b mid" x="75" y="152">Checkout</text><text class="t xs mute mid" x="75" y="168">producer</text>
+<path class="e" d="M130,155 H246"/>
+<rect class="n queue" x="250" y="40" width="220" height="244" rx="10"/>
+<text class="t b mid" x="360" y="62">orders queue</text>
+<rect class="n" x="268" y="136" width="184" height="44" rx="6"/><text class="t mono" x="282" y="154">order-1002</text><text class="t xs mute" x="282" y="170">visible</text>
+<rect class="n" x="268" y="192" width="184" height="44" rx="6"/><text class="t mono" x="282" y="210">order-1003</text><text class="t xs mute" x="282" y="226">visible</text>
+<text class="t xs mute mid" x="360" y="264">visibility timeout = 30 s</text>
+
+<g data-show="1 2"><rect class="n ghost" x="268" y="80" width="184" height="44" rx="6"/><text class="t mono mute" x="282" y="98">order-1001</text><text class="t xs mute" x="282" y="114">in flight, hidden until t=30 s</text></g>
+<g data-show="3"><rect class="n cache" x="268" y="80" width="184" height="44" rx="6"/><text class="t mono" x="282" y="98">order-1001</text><text class="t xs" x="282" y="114">visible again, received 1 time</text></g>
+<g data-show="4"><rect class="n ghost" x="268" y="80" width="184" height="44" rx="6"/><text class="t mono mute" x="282" y="98">order-1001</text><text class="t xs mute" x="282" y="114">in flight, hidden until t=60 s</text></g>
+<g data-show="5"><rect class="n good" x="268" y="80" width="184" height="44" rx="6"/><text class="t mono" x="282" y="98">order-1001</text><text class="t xs green" x="282" y="114">deleted, gone for good</text></g>
+
+<g data-show="1"><rect class="n svc" x="570" y="77" width="130" height="50" rx="8"/><text class="t b mid" x="635" y="99">worker-a</text><text class="t xs mute mid" x="635" y="115">processing</text></g>
+<g data-show="2 3 4 5"><rect class="n bad" x="570" y="77" width="130" height="50" rx="8"/><text class="t b mid" x="635" y="99">worker-a</text><text class="t xs red mid" x="635" y="115">crashed at t=3 s</text></g>
+<g data-show="1 2 3"><rect class="n svc" x="570" y="187" width="130" height="50" rx="8"/><text class="t b mid" x="635" y="209">worker-b</text><text class="t xs mute mid" x="635" y="225">polling</text></g>
+<g data-show="4 5"><rect class="n svc" x="570" y="187" width="130" height="50" rx="8"/><text class="t b mid" x="635" y="209">worker-b</text><text class="t xs mute mid" x="635" y="225">has order-1001</text></g>
+
+<g data-show="1"><path class="e" d="M452,102 H566"/><text class="t xs mid" x="509" y="94">receipt #1</text></g>
+<g data-show="4"><path class="e" d="M452,108 C510,108 510,206 566,206"/><text class="t xs" x="520" y="164">receipt #2</text></g>
+<g data-show="5"><path class="e dash green" d="M566,218 C500,218 500,118 456,118"/><text class="t xs green" x="514" y="164">Delete(#2)</text></g>
+
+<text class="t sm mid" x="360" y="312" data-show="1">worker-a receives order-1001. The message is hidden, not removed.</text>
+<text class="t sm mid" x="360" y="312" data-show="2">worker-a dies before deleting. The queue notices nothing yet; it just waits.</text>
+<text class="t sm mid" x="360" y="312" data-show="3">The timeout expires with no delete, so the message becomes visible again.</text>
+<text class="t sm mid" x="360" y="312" data-show="4">worker-b receives it with a new receipt handle. Receive count is now 2.</text>
+<text class="t sm mid" x="360" y="312" data-show="5">worker-b finishes and deletes with receipt #2. Only now is the message gone.</text>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Receive</button><button type="button" data-step="2" aria-pressed="false">Crash</button><button type="button" data-step="3" aria-pressed="false">Timeout</button><button type="button" data-step="4" aria-pressed="false">Redeliver</button><button type="button" data-step="5" aria-pressed="false">Delete</button></div>
+</div>
+<figcaption><b>Crash and redelivery.</b> The 27 seconds between the crash and the redelivery are dead time: nobody is working on order-1001. A shorter timeout recovers faster but risks redelivering messages that are still being processed.</figcaption>
+</figure>
+
+<p>Choosing the timeout is a real trade-off. Too short, and a job that takes 40 seconds is redelivered at 30 and runs twice in parallel. Too long, and a crash leaves a message stranded for the whole period. The usual answer is a timeout a few times longer than the typical job, plus a heartbeat for long jobs: the worker calls <code>ChangeMessageVisibility</code> every so often to push the deadline out while it is still making progress.</p>
+
+<h3 id="prefetch-ack">Prefetch and ack (RabbitMQ)</h3>
+<p>RabbitMQ (AMQP 0-9-1) keeps a TCP connection open to each consumer and pushes messages to it. Each delivery carries a <dfn>delivery tag</dfn>. The consumer sends <code>basic.ack</code> with that tag when it is done, <code>basic.nack</code> or <code>basic.reject</code> to give it back. Failure detection is tied to the connection instead of a timer: if the channel or TCP connection closes with messages unacked, the broker requeues them immediately and marks them <code>redelivered</code>. Recent versions also enforce a consumer delivery timeout (30 minutes by default) to catch consumers that are alive but stuck.</p>
+<p>Because messages are pushed, the consumer must limit how many it holds at once. The <dfn>prefetch count</dfn> (<code>basic.qos</code>) caps unacked deliveries per consumer. With prefetch 1, a consumer gets the next message only after acking the previous one, which is fair but wastes a network round trip per message. With an unlimited prefetch, the first consumer to connect can grab ten thousand messages while the others sit idle, and all of them are redelivered if it dies. A small prefetch (tens) is a sensible starting point; measure and adjust.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Visibility timeout (SQS, Google Pub/Sub ack deadlines)</th><th>Connection-scoped acks (RabbitMQ, ActiveMQ)</th></tr></thead>
+<tbody>
+<tr><th>Delivery model</th><td>Pull: consumer polls (long polling up to 20 s)</td><td>Push over a persistent connection</td></tr>
+<tr><th>Crash detection</th><td>Timer expires</td><td>Connection or channel closes</td></tr>
+<tr><th>Redelivery delay after a crash</th><td class="meh">Up to the full timeout</td><td class="yes">Almost immediate</td></tr>
+<tr><th>Slow but healthy consumer</th><td class="no">Redelivered in parallel unless it extends the timeout</td><td class="yes">Keeps the message as long as the connection lives (up to the delivery timeout)</td></tr>
+<tr><th>Flow control</th><td>Batch size per receive call (up to 10)</td><td>Prefetch count</td></tr>
+</tbody></table></div>
+
+<h2 id="delivery-semantics">At-least-once delivery and duplicates</h2>
+<p>When the consumer acks decides what can go wrong:</p>
+<ul>
+<li><strong>Ack before processing</strong> (auto-ack, Celery's default early ack): a crash after the ack loses the message. This is <dfn>at-most-once</dfn> delivery.</li>
+<li><strong>Ack after processing</strong>: a crash after the work but before the ack causes the work to be done again. This is <dfn>at-least-once</dfn> delivery, and it is the default for almost every serious use of a queue.</li>
+</ul>
+<p>At-least-once means duplicates are normal, not exceptional. They come from crashes between work and ack, from slow consumers outliving their visibility timeout, from producers retrying a send whose response was lost, and, in SQS standard queues, occasionally from the service itself. A consumer that charges a card or sends an SMS must therefore be <strong>idempotent</strong>: processing the same message twice must have the same effect as processing it once. The usual tool is a deduplication record keyed by the message id or a business key, written in the same transaction as the side effect (<code>INSERT INTO processed(message_id) ...</code> fails on the second attempt, so the work is skipped). <a href="idempotency.html">Idempotency &amp; Delivery Semantics</a> covers the patterns in depth.</p>
+<div class="callout warn">
+<div class="callout-title">Common mistake</div>
+<p>Claiming "exactly-once delivery" from a queue. Some brokers deduplicate within a window (SQS FIFO drops duplicate sends with the same deduplication id for 5 minutes), but no broker can know whether your consumer's side effect happened before it crashed. Exactly-once <em>processing</em> is something the consumer builds, by combining at-least-once delivery with idempotent handling.</p>
+</div>
+
+<h2 id="retries-dlq">Retries, backoff and dead-letter queues</h2>
+<p>Redelivery handles crashes. Errors need a policy too. A worker that calls a payment API and gets <code>503 Service Unavailable</code> should not ack the message, because the work did not happen. It also should not retry instantly in a tight loop, because the API is already struggling and a thousand workers retrying at once keep it down.</p>
+<ul>
+<li><strong>Exponential backoff with jitter.</strong> Wait 1 s, then 2, 4, 8 and so on, each multiplied by a random factor so that retries from many workers spread out instead of arriving in synchronised waves. In SQS, the worker sets the message's visibility timeout to the backoff delay instead of deleting it. In RabbitMQ, the common pattern is a retry queue with a per-message TTL that dead-letters back into the main queue. Sidekiq and Celery do it in the library. <a href="fault-tolerance.html">Timeouts, Retries &amp; Circuit Breakers</a> explains the maths.</li>
+<li><strong>A retry limit.</strong> Some messages will never succeed. After a fixed number of attempts the message moves to a <dfn>dead-letter queue</dfn> (DLQ), a separate queue that nobody consumes automatically. In SQS this is the redrive policy's <code>maxReceiveCount</code>; in RabbitMQ it is a dead-letter exchange plus, on quorum queues, a delivery limit (20 by default since RabbitMQ 4.0; without a dead-letter exchange, messages over the limit are dropped).</li>
+<li><strong>Operating the DLQ.</strong> Alarm on DLQ depth above zero. Someone inspects the messages, fixes the bug or the data, and <em>redrives</em> them back to the main queue. A DLQ that nobody watches is just a slower way to lose data.</li>
+</ul>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 265" role="img" aria-label="Retry and dead-letter flow: a failed message returns to the queue after a backoff delay; after five failed receives it moves to the dead-letter queue">
+<rect class="n svc" x="20" y="100" width="100" height="50" rx="8"/><text class="t b mid" x="70" y="122">Producer</text><text class="t xs mute mid" x="70" y="138">checkout</text>
+<rect class="n queue" x="170" y="100" width="130" height="50" rx="8"/><text class="t b mid" x="235" y="122">orders</text><text class="t xs mono mute mid" x="235" y="138">maxReceiveCount 5</text>
+<rect class="n svc" x="370" y="100" width="120" height="50" rx="8"/><text class="t b mid" x="430" y="122">Worker</text><text class="t xs mute mid" x="430" y="138">charge card</text>
+<rect class="n ext" x="560" y="100" width="140" height="50" rx="8"/><text class="t b mid" x="630" y="122">Payment API</text><text class="t xs mute mid" x="630" y="138">sometimes 503</text>
+<rect class="n queue" x="560" y="190" width="140" height="50" rx="8"/><text class="t b mid" x="630" y="212">orders-dlq</text><text class="t xs mute mid" x="630" y="228">nobody consumes</text>
+<path class="e" d="M120,125 H166"/>
+<path class="e" d="M300,125 H366"/>
+<path class="e both" d="M490,125 H556"/>
+<path class="e dash red" d="M430,100 C430,50 235,50 235,96"/>
+<text class="t sm red mid" x="332" y="44">fail: no delete, visible again after backoff 1 s, 2 s, 4 s ...</text>
+<path class="e dash" d="M235,150 V203 Q235,215 247,215 H556"/>
+<text class="t sm mid" x="395" y="207">after the 5th failed receive</text>
+<text class="t xs mute mid" x="630" y="256">alarm on depth &gt; 0, fix, redrive</text>
+</svg>
+</div>
+<figcaption><b>Retry, then park.</b> Transient failures heal on a later attempt. Messages that fail every time stop consuming worker capacity after five tries and wait in the DLQ for a human.</figcaption>
+</figure>
+
+<h3 id="poison-messages">Poison messages</h3>
+<p>A <dfn>poison message</dfn> is one that crashes or fails its consumer every time: malformed JSON, a reference to a deleted customer, an input that triggers a bug. Without a retry limit it is redelivered forever. In a FIFO queue it is worse, because it blocks every message behind it in the same group. With a crash (rather than a caught exception) it can take down worker after worker as each one picks it up. Defences:</p>
+<ul>
+<li>Catch and classify errors. A validation error will never succeed, so send it straight to the DLQ instead of burning four more retries. A timeout might succeed, so retry it.</li>
+<li>Always configure a retry limit and a DLQ. The default in several brokers is unlimited redelivery, and where a default limit exists (RabbitMQ 4 quorum queues) a missing DLQ means the message is silently dropped.</li>
+<li>Include enough context in the DLQ (error message, stack trace, attempt count, original queue) that a human can act without reproducing the failure.</li>
+</ul>
+
+<h2 id="ordering">Ordering and its throughput cost</h2>
+<p>A standard queue with competing consumers does not preserve order, even if the broker hands messages out in order. Worker 1 takes <code>m1</code>, worker 2 takes <code>m2</code>, worker 2 finishes first. Add redelivery after a crash and <code>m1</code> may complete minutes after <code>m5</code>. SQS standard queues go further and only promise best-effort ordering.</p>
+<p>Usually the order you need is per entity, not global: the events for cart 17 must apply in order, but cart 17 and cart 42 are independent. FIFO queues express exactly that. In SQS FIFO, each message carries a <dfn>message group id</dfn>. The queue delivers messages within a group strictly in order and will not hand out the next message in a group until the previous one is deleted. Different groups proceed in parallel.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 260" role="img" aria-label="FIFO queue with three message groups; each group is processed in order by one consumer at a time; a failing head message blocks its group only">
+<text class="t sm b" x="20" y="24">Message group</text>
+<text class="t sm b" x="560" y="24">Consumers</text>
+<text class="t mono" x="20" y="75">cart-17</text>
+<rect class="n" x="150" y="55" width="62" height="34" rx="5"/><text class="t xs mono mid" x="181" y="76">c17-m4</text>
+<rect class="n" x="222" y="55" width="62" height="34" rx="5"/><text class="t xs mono mid" x="253" y="76">c17-m3</text>
+<rect class="n" x="294" y="55" width="62" height="34" rx="5"/><text class="t xs mono mid" x="325" y="76">c17-m2</text>
+<rect class="n good" x="366" y="55" width="62" height="34" rx="5"/><text class="t xs mono mid" x="397" y="76">c17-m1</text>
+<rect class="n svc" x="560" y="50" width="140" height="44" rx="8"/><text class="t b mid" x="630" y="77">consumer 1</text>
+<path class="e" d="M428,72 H556"/><text class="t xs mute mid" x="492" y="64">in flight</text>
+<text class="t mono" x="20" y="145">cart-42</text>
+<rect class="n ghost" x="222" y="125" width="62" height="34" rx="5"/><text class="t xs mono mute mid" x="253" y="146">c42-m3</text>
+<rect class="n ghost" x="294" y="125" width="62" height="34" rx="5"/><text class="t xs mono mute mid" x="325" y="146">c42-m2</text>
+<rect class="n bad" x="366" y="125" width="62" height="34" rx="5"/><text class="t xs mono mid" x="397" y="146">c42-m1</text>
+<rect class="n svc" x="560" y="120" width="140" height="44" rx="8"/><text class="t b mid" x="630" y="147">consumer 2</text>
+<path class="e red" d="M428,142 H556"/><text class="t xs red mid" x="492" y="134">failing, retry 3</text>
+<text class="t xs mute" x="150" y="146">blocked</text>
+<text class="t mono" x="20" y="215">cart-99</text>
+<rect class="n" x="294" y="195" width="62" height="34" rx="5"/><text class="t xs mono mid" x="325" y="216">c99-m2</text>
+<rect class="n good" x="366" y="195" width="62" height="34" rx="5"/><text class="t xs mono mid" x="397" y="216">c99-m1</text>
+<rect class="n svc" x="560" y="190" width="140" height="44" rx="8"/><text class="t b mid" x="630" y="217">consumer 3</text>
+<path class="e" d="M428,212 H556"/><text class="t xs mute mid" x="492" y="204">in flight</text>
+<text class="t xs mute mid" x="360" y="252">within a group: strictly one at a time, in order. across groups: parallel</text>
+</svg>
+</div>
+<figcaption><b>Message groups.</b> c42-m1 keeps failing, so c42-m2 and c42-m3 wait behind it (head-of-line blocking), but carts 17 and 99 are unaffected. The number of groups with work waiting is the ceiling on parallelism.</figcaption>
+</figure>
+
+<p>The price of ordering is throughput and isolation:</p>
+<ul>
+<li><strong>Parallelism is capped by the number of active groups.</strong> If every message uses the same group id, the queue processes one message at a time no matter how many consumers you run.</li>
+<li><strong>Lower broker limits.</strong> An SQS FIFO queue in its default mode supports 300 API calls per second per action, or 3,000 messages per second with batches of 10; standard queues are effectively unlimited. High-throughput mode raises the FIFO limit by partitioning on group id.</li>
+<li><strong>Head-of-line blocking.</strong> One slow or failing message stalls its whole group until it succeeds or reaches the DLQ.</li>
+</ul>
+<p>Before paying that price, check whether the consumer can make order irrelevant. A version number on each update (apply only if newer), a state machine that rejects impossible transitions, or a last-writer-wins timestamp often remove the need for a FIFO queue altogether.</p>
+
+<h2 id="backpressure">Backpressure and scaling on queue depth</h2>
+<p>A queue decouples the producer from the consumer's speed, which also means the producer gets no signal when consumers fall behind. <dfn>Backpressure</dfn> is any mechanism that pushes that signal back upstream. With a queue in the middle you have three choices when the backlog grows: let it grow (and watch message age), slow producers down (a bounded queue that rejects or blocks sends, like RabbitMQ's max-length with <code>reject-publish</code> or its memory alarms), or add consumers.</p>
+<p>The third is the usual answer for stateless workers, and the queue gives you the best possible scaling signal. CPU is a poor signal for I/O-bound workers that spend most of their time waiting on an API. Queue depth measures directly how much work is waiting.</p>
+<ul>
+<li><strong>Backlog per worker</strong> = visible messages / running workers. Pick a target from your latency goal: if one worker handles 66 messages per second and messages may wait 30 seconds, the target is about 2,000 messages per worker. AWS documents exactly this target-tracking setup for SQS, and KEDA does the same on Kubernetes for SQS, RabbitMQ, Kafka and Redis.</li>
+<li><strong>Age of the oldest message</strong> (SQS <code>ApproximateAgeOfOldestMessage</code>) is the best alert. It is what users feel, and it catches stuck consumers that a depth threshold misses when traffic is low.</li>
+<li><strong>Scale-in slowly.</strong> Removing workers when the queue hits zero causes flapping. Use a cooldown and let in-flight messages finish (graceful shutdown) or their visibility timeouts will cause redeliveries.</li>
+</ul>
+<p>Scaling consumers only helps until the downstream dependency saturates. If 50 workers already max out the database, 200 workers make it slower. Cap the worker count at what the downstream can take.</p>
+
+<h2 id="priority-delay">Priority and delay queues</h2>
+<h3 id="priority-queues">Priority queues</h3>
+<p>A password-reset email should not wait behind 200,000 newsletter emails. Two designs:</p>
+<ul>
+<li><strong>Broker-level priority.</strong> RabbitMQ supports priority queues declared with <code>x-max-priority</code> (2 to 4 levels are recommended, as each level has a cost; quorum queues ignore this argument and support priorities natively). Higher-priority messages are delivered first among those waiting. Priority only applies to messages that are queued, so with a large prefetch, low-priority messages already sitting in a consumer's buffer still go first.</li>
+<li><strong>Separate queues.</strong> SQS has no priorities, so you create <code>emails-high</code> and <code>emails-low</code>. Either give each its own worker pool (simple, isolated, but idle capacity cannot be shared), or have workers poll the high queue first and fall back to the low one. Sidekiq does this with weighted queues so the low queue is never fully starved.</li>
+</ul>
+<p>Strict priority starves low-priority work under sustained load. Weighted polling, or a reserved minimum capacity per class, avoids that.</p>
+<h3 id="delay-queues">Delay queues and scheduled messages</h3>
+<p>Some work should happen later: "send a reminder if the cart is still abandoned in 30 minutes", "retry in 5 minutes". SQS supports a per-queue or per-message delay of up to 15 minutes, during which the message is invisible. RabbitMQ needs a plugin or the TTL plus dead-letter trick. Sidekiq and Celery store scheduled jobs in a Redis sorted set keyed by run time and move them to the work queue when due. For delays of hours or days, a database table of due jobs polled by a scheduler is often simpler and easier to inspect than a queue.</p>
+
+<h2 id="simulation">Simulating a visibility timeout</h2>
+<p>The code below models an SQS-style queue: receiving hides a message rather than removing it, deleting needs the latest receipt, and a message received too many times moves to a dead-letter queue. Two workers process three orders. worker-a crashes holding one, and one order contains bad data that fails every time.</p>
+<pre><code class="language-python">import itertools
+
+
+class Queue:
+    """SQS-style queue: a receive hides a message for `visibility` seconds instead of removing it."""
+
+    def __init__(self, visibility=30, max_receives=3):
+        self.visibility, self.max_receives = visibility, max_receives
+        self.msgs = {}                    # id -&gt; {"body", "visible_at", "receives", "receipt"}
+        self.dlq = []
+        self.receipts = itertools.count(1)
+
+    def send(self, msg_id, body):
+        self.msgs[msg_id] = {"body": body, "visible_at": 0, "receives": 0, "receipt": None}
+
+    def receive(self, now):
+        for msg_id, m in list(self.msgs.items()):   # oldest first (best effort in SQS standard)
+            if m["visible_at"] &gt; now:
+                continue                            # in flight with some consumer
+            if m["receives"] == self.max_receives:  # redrive policy: stop retrying
+                self.dlq.append(msg_id)
+                del self.msgs[msg_id]
+                log(now, "queue", f"{msg_id} moved to DLQ after {self.max_receives} receives")
+                continue
+            m["receives"] += 1
+            m["visible_at"] = now + self.visibility
+            m["receipt"] = next(self.receipts)
+            return msg_id, m["body"], m["receipt"]
+        return None
+
+    def delete(self, msg_id, receipt):
+        m = self.msgs.get(msg_id)
+        if m and m["receipt"] == receipt:          # a stale receipt must not delete a newer delivery
+            del self.msgs[msg_id]
+
+
+def log(t, who, what):
+    print(f"t={t:&gt;3}s  {who:&lt;8} {what}")
+
+
+q = Queue(visibility=30, max_receives=3)
+for i, body in enumerate(["charge $42.00", "charge $17.50", "charge $-1 (bad data)"]):
+    q.send(f"order-{1001 + i}", body)
+
+jobs = {"worker-a": None, "worker-b": None}   # name -&gt; (msg_id, receipt, finishes_at)
+down = {"worker-a": range(3, 10)}             # worker-a crashes at t=3, restarts at t=10
+
+for now in range(100):
+    for name in jobs:
+        job = jobs[name]
+        if now in down.get(name, ()):
+            if job:
+                log(now, name, f"crashed holding {job[0]}, never deleted it")
+                jobs[name] = None
+            continue
+        if job and job[2] == now:
+            msg_id, receipt, _ = job
+            if "bad data" in q.msgs[msg_id]["body"]:
+                log(now, name, f"{msg_id} raised ValueError, left in queue")
+            else:
+                q.delete(msg_id, receipt)
+                log(now, name, f"{msg_id} processed and deleted")
+            jobs[name] = None
+        if jobs[name] is None and (got := q.receive(now)):
+            msg_id, _, receipt = got
+            log(now, name, f"received {msg_id} (receive #{q.msgs[msg_id]['receives']})")
+            jobs[name] = (msg_id, receipt, now + 5)  # every job takes 5 s
+
+print("queue:", list(q.msgs), "dlq:", q.dlq)</code></pre>
+<p>Running it prints:</p>
+<pre><code class="language-text">t=  0s  worker-a received order-1001 (receive #1)
+t=  0s  worker-b received order-1002 (receive #1)
+t=  3s  worker-a crashed holding order-1001, never deleted it
+t=  5s  worker-b order-1002 processed and deleted
+t=  5s  worker-b received order-1003 (receive #1)
+t= 10s  worker-b order-1003 raised ValueError, left in queue
+t= 30s  worker-a received order-1001 (receive #2)
+t= 35s  worker-a order-1001 processed and deleted
+t= 35s  worker-a received order-1003 (receive #2)
+t= 40s  worker-a order-1003 raised ValueError, left in queue
+t= 65s  worker-a received order-1003 (receive #3)
+t= 70s  worker-a order-1003 raised ValueError, left in queue
+t= 95s  queue    order-1003 moved to DLQ after 3 receives
+queue: [] dlq: ['order-1003']</code></pre>
+<p>Three things to notice. Nothing happens between t=10 and t=30: order-1001 is stranded in flight until its timeout expires, which is the cost of crash detection by timer. The poison order is retried every 30 seconds and holds a worker each time until the redrive policy parks it. And the stale-receipt check in <code>delete</code> matters: if worker-a had only been slow, not dead, its late delete must not remove the copy that worker-b is now processing.</p>
+
+<h2 id="worked-example">Worked example: sizing an email worker fleet</h2>
+<p>A retailer sends transactional email through a provider API. Peak load is 1.2 million emails per hour during a sale. Each API call takes 150 ms on average. The goal: no email waits more than 60 seconds at peak, and a 10-minute provider outage must not lose anything.</p>
+<div class="calc">Peak rate        1,200,000 / 3,600 s                ≈ <span class="r">333 msg/s</span>
+Concurrency      333 msg/s × 0.15 s (Little's law)    = 50 calls in flight
+Per pod          10 threads / 0.15 s                  ≈ 66 msg/s
+Pods             333 / 66 ≈ 5, plus 40% headroom    → <span class="r">7 pods</span>
+Autoscale target 66 msg/s × 30 s acceptable wait      ≈ <span class="r">2,000 visible msgs per pod</span>
+
+Outage           333 msg/s × 600 s                    ≈ <span class="r">200,000 msgs</span> queued
+Drain at 14 pods 14 × 66 = 924 msg/s, net 924 - 333  ≈ 591 msg/s
+Drain time       200,000 / 591                        ≈ <span class="r">5.6 minutes</span></div>
+<p>The outage is where the queue earns its keep. Checkout never noticed. When the provider recovers, the autoscaler sees 200,000 visible messages (about 29,000 per pod against a target of 2,000) and scales out, capped at 14 pods because the provider's rate limit is around 1,000 requests per second. The oldest emails go out about 10 minutes late, which is the outage itself; anything sent after recovery waits at most a few minutes behind the backlog. The business accepted that in advance. Three configuration choices fall out of the numbers: a visibility timeout of 30 seconds (200 times the mean call time, enough for slow tail calls), a <code>maxReceiveCount</code> of 10 with backoff doubling from 1 second (1 + 2 + ... + 512 s, about 17 minutes in total) so a 10-minute outage does not push good messages into the DLQ, and retention well above the longest plausible outage (SQS keeps messages 4 days by default, up to 14).</p>
+<div class="callout note">
+<div class="callout-title">Retries and outages interact</div>
+<p>With a <code>maxReceiveCount</code> of 3 and a 30-second visibility timeout, every message received during a 10-minute outage would hit the DLQ after 90 seconds. Size the retry budget so that its total backoff time covers the outages you expect, or stop consuming entirely while a circuit breaker on the provider is open.</p>
+</div>
+
+<h2 id="comparison">Choosing a queue</h2>
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>SQS standard</th><th>SQS FIFO</th><th>RabbitMQ</th><th>Redis lists (Sidekiq, RQ)</th><th>Kafka as a queue</th></tr></thead>
+<tbody>
+<tr><th>Ordering</th><td class="no">Best effort</td><td class="yes">Per message group</td><td class="meh">Per queue, lost with many consumers</td><td class="meh">Per list, lost with many workers</td><td class="yes">Per partition</td></tr>
+<tr><th>Duplicates</th><td class="meh">Occasional</td><td class="yes">Deduplicated for 5 min on send</td><td class="meh">On redelivery</td><td class="meh">On retry</td><td class="meh">On rebalance or crash</td></tr>
+<tr><th>Per-message ack and retry</th><td class="yes">Yes</td><td class="yes">Yes</td><td class="yes">Yes</td><td class="meh">Library-level</td><td class="no">Offset per partition (per-record acks with Kafka 4.2 share groups)</td></tr>
+<tr><th>Throughput</th><td class="yes">Effectively unlimited</td><td class="meh">Thousands/s per queue (more in high-throughput mode)</td><td class="meh">Tens of thousands/s per node</td><td class="yes">High, memory bound</td><td class="yes">Very high</td></tr>
+<tr><th>Replay after consumption</th><td class="no">No</td><td class="no">No</td><td class="no">No (yes with streams)</td><td class="no">No</td><td class="yes">Yes, within retention</td></tr>
+<tr><th>Operations</th><td class="yes">Fully managed</td><td class="yes">Fully managed</td><td class="meh">Cluster to run, or managed offering</td><td class="meh">Redis durability settings matter</td><td class="meh">Cluster to run, or managed offering</td></tr>
+</tbody></table></div>
+<p>The question that settles most choices: do you need per-message acknowledgement and retry, or replay and multiple independent readers? The first points to a queue, the second to a log. If you need both, the common answer is a log for the event stream plus a queue per consuming service for task-style work.</p>
+
+<h2 id="tradeoffs">Trade-offs at a glance</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>You gain</th><th>You pay</th></tr></thead>
+<tbody>
+<tr><td>Producers stay fast and available when consumers are slow or down</td><td>Results are not available to the caller; you need a status endpoint, a callback or a notification</td></tr>
+<tr><td>Consumers sized for the average, not the peak</td><td>Latency grows with backlog; a long backlog can make work useless by the time it runs</td></tr>
+<tr><td>Automatic retries of failed work</td><td>Duplicates: every consumer must be idempotent</td></tr>
+<tr><td>Easy horizontal scaling with competing consumers</td><td>No ordering unless you pay for FIFO and accept its throughput limits</td></tr>
+<tr><td>A natural autoscaling signal</td><td>Another stateful component to operate, monitor and secure, plus DLQs that someone must watch</td></tr>
+</tbody></table></div>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+<li><strong>Amazon SQS</strong>: the canonical managed queue. Visibility timeouts, long polling, redrive policies to a DLQ with one-click redrive back, FIFO queues with message groups and deduplication ids. Often paired with SNS for fan-out to several queues.</li>
+<li><strong>RabbitMQ</strong>: an AMQP broker with exchanges that route messages to queues by key or pattern. Quorum queues (Raft-replicated) are the recommended durable queue type; dead-letter exchanges, per-queue TTLs and priorities are built in. Streams, added in 3.9, provide a Kafka-like log alongside classic queues.</li>
+<li><strong>Celery</strong>: the standard Python task queue, on RabbitMQ or Redis. By default it acks a task <em>before</em> running it; setting <code>acks_late</code> switches to at-least-once, which is what you want for idempotent tasks. With the Redis broker it emulates a visibility timeout (one hour by default), so long ETA tasks can be redelivered.</li>
+<li><strong>Sidekiq</strong>: Ruby background jobs on Redis. Failed jobs retry with exponential backoff, 25 times over about three weeks by default, then go to a "dead" set. The open-source version's basic fetch can lose in-flight jobs if a process is killed; Sidekiq Pro's super_fetch keeps them in a per-process list so they can be recovered.</li>
+<li><strong>Google Cloud Pub/Sub</strong> and <strong>Azure Service Bus</strong> sit between the two worlds: topic-based, but with per-message ack deadlines, dead-letter topics, and ordering keys (Pub/Sub) or sessions (Service Bus) that behave like a managed queue per subscription.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>Whenever a request triggers slow or unreliable work whose result the user does not need immediately: sending email or push notifications, transcoding video, generating thumbnails or reports, calling flaky third parties. Say "the API writes to a queue and returns 202; workers process it with at-least-once delivery and idempotent handlers, failures retry with backoff and land in a DLQ" and you have covered most of what the interviewer wants. It shows up in the <a href="notification-system.html">notification system</a>, <a href="video-streaming.html">video platform</a> and <a href="web-crawler.html">web crawler</a> cases.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>What happens if a worker crashes mid-job? (Visibility timeout or connection loss triggers redelivery; work must be idempotent.)</li>
+<li>How do you handle a message that always fails? (Retry limit, DLQ, alarm, redrive.)</li>
+<li>Do you need ordering? Per what key? (Message groups or partitions, and their throughput cost.)</li>
+<li>How do you scale the workers? (On backlog per worker or oldest message age, capped by downstream capacity.)</li>
+<li>The queue keeps growing. What do you do? (Find the bottleneck: more workers, a downstream limit, a poison message, or a producer bug; then decide between scaling, shedding and backpressure.)</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>Assuming exactly-once delivery, or ignoring duplicates entirely.</li>
+<li>Putting a queue in front of work the user is waiting on synchronously, and calling it scaling.</li>
+<li>No retry limit or DLQ, so one bad message loops forever.</li>
+<li>Requiring global ordering on a high-throughput queue without asking whether per-entity ordering is enough.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html" target="_blank" rel="noopener">Amazon SQS visibility timeout</a><span>AWS documentation. In-flight messages, receipt handles, extending visibility, and how the timeout interacts with DLQs.</span></li>
+<li><a href="https://www.rabbitmq.com/docs/confirms" target="_blank" rel="noopener">RabbitMQ: Consumer Acknowledgements and Publisher Confirms</a><span>Delivery tags, manual acks, prefetch, and what happens to unacked messages when a connection closes.</span></li>
+<li><a href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/" target="_blank" rel="noopener">Exponential Backoff and Jitter</a><span>Marc Brooker, AWS Architecture Blog, 2015. Why jitter matters when many clients retry at once.</span></li>
+<li><a href="https://www.enterpriseintegrationpatterns.com/patterns/messaging/CompetingConsumers.html" target="_blank" rel="noopener">Enterprise Integration Patterns: Competing Consumers</a><span>Hohpe and Woolf. The pattern catalogue that named point-to-point channels, dead letter channels and competing consumers.</span></li>
+<li><a href="https://github.com/sidekiq/sidekiq/wiki/Error-Handling" target="_blank" rel="noopener">Sidekiq: Error Handling</a><span>Retry schedule, the dead set, and practical advice on idempotent jobs.</span></li>
+</ul>

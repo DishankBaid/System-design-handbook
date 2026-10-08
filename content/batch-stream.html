@@ -1,0 +1,449 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">Finance wants yesterday's revenue, exact to the cent, by 6 a.m. Operations wants revenue for the last minute, per region, on a wall screen, so they notice within seconds when checkout breaks in Brazil. Both are "sum the order amounts", but they are different problems: one has all of its data and can take an hour; the other never has all of its data and must answer now.</p>
+<p><dfn>Batch processing</dfn> runs a job over a bounded dataset (yesterday's files) and produces a complete result. <dfn>Stream processing</dfn> runs continuously over an unbounded sequence of events and produces results incrementally as data arrives. Batch is simpler and easier to get right. Streaming is faster but must deal with questions batch never asks: when is a minute "finished", what to do with an event that arrives ten minutes late, and how to survive a crash without counting anything twice.</p>
+
+<h2 id="batch">Batch processing</h2>
+<h3 id="mapreduce">The MapReduce model</h3>
+<p>Google's 2004 MapReduce paper gave large-scale batch processing its shape. The programmer writes two pure functions, and the framework handles distribution, scheduling and failures:</p>
+<ol class="steps">
+<li><strong>Map.</strong> Each input split (a 128 MB chunk of a file, say) is read by a mapper that emits key-value pairs. For word count: for every word, emit <code>(word, 1)</code>.</li>
+<li><strong>Shuffle.</strong> The framework partitions pairs by <code>hash(key)</code>, sends each partition to one reducer over the network, and sorts it so all values for a key are together. This is the expensive step: it moves data between machines and spills to disk.</li>
+<li><strong>Reduce.</strong> Each reducer receives a key with all its values and emits the result: <code>(word, sum(values))</code>.</li>
+</ol>
+
+<figure class="fig wide">
+<div class="fig-frame">
+<svg viewBox="0 0 760 290" role="img" aria-label="MapReduce word count: three input splits are mapped to word, 1 pairs, shuffled by key to two reducers, which sum the counts">
+<text class="t sm b" x="10" y="20">Input splits</text>
+<text class="t sm b" x="170" y="20">Map</text>
+<text class="t sm b" x="330" y="20">Shuffle</text>
+<text class="t sm b" x="450" y="20">Reduce</text>
+<text class="t sm b" x="630" y="20">Output</text>
+<rect class="n db" x="10" y="40" width="120" height="50" rx="6"/><text class="t sm mono mid" x="70" y="69">"the cat sat"</text>
+<rect class="n svc" x="170" y="40" width="150" height="50" rx="6"/><text class="t xs mute mid" x="245" y="59">mapper 1</text><text class="t xs mono mid" x="245" y="76">the 1, cat 1, sat 1</text>
+<path class="e" d="M130,65 H166"/>
+<rect class="n db" x="10" y="120" width="120" height="50" rx="6"/><text class="t sm mono mid" x="70" y="149">"the dog sat"</text>
+<rect class="n svc" x="170" y="120" width="150" height="50" rx="6"/><text class="t xs mute mid" x="245" y="139">mapper 2</text><text class="t xs mono mid" x="245" y="156">the 1, dog 1, sat 1</text>
+<path class="e" d="M130,145 H166"/>
+<rect class="n db" x="10" y="200" width="120" height="50" rx="6"/><text class="t sm mono mid" x="70" y="229">"the cat ran"</text>
+<rect class="n svc" x="170" y="200" width="150" height="50" rx="6"/><text class="t xs mute mid" x="245" y="219">mapper 3</text><text class="t xs mono mid" x="245" y="236">the 1, cat 1, ran 1</text>
+<path class="e" d="M130,225 H166"/>
+<rect class="n svc" x="450" y="60" width="150" height="54" rx="6"/><text class="t xs mute mid" x="525" y="76">reducer A</text>
+<text class="t xs mono mid" x="525" y="93">the: [1, 1, 1]</text>
+<text class="t xs mono mid" x="525" y="108">cat: [1, 1]</text>
+<rect class="n db" x="630" y="60" width="120" height="54" rx="6"/><text class="t xs mute mid" x="690" y="76">part-A</text>
+<text class="t xs mono mid" x="690" y="93">the 3</text>
+<text class="t xs mono mid" x="690" y="108">cat 2</text>
+<path class="e" d="M600,87 H626"/>
+<rect class="n svc" x="450" y="160" width="150" height="69" rx="6"/><text class="t xs mute mid" x="525" y="176">reducer B</text>
+<text class="t xs mono mid" x="525" y="193">sat: [1, 1]</text>
+<text class="t xs mono mid" x="525" y="208">dog: [1]</text>
+<text class="t xs mono mid" x="525" y="223">ran: [1]</text>
+<rect class="n db" x="630" y="160" width="120" height="69" rx="6"/><text class="t xs mute mid" x="690" y="176">part-B</text>
+<text class="t xs mono mid" x="690" y="193">sat 2</text>
+<text class="t xs mono mid" x="690" y="208">dog 1</text>
+<text class="t xs mono mid" x="690" y="223">ran 1</text>
+<path class="e" d="M600,194 H626"/>
+<path class="e" d="M320,65 C390,65 380,79 446,79"/>
+<path class="e" d="M320,65 C390,65 380,186 446,186"/>
+<path class="e" d="M320,145 C390,145 380,87 446,87"/>
+<path class="e" d="M320,145 C390,145 380,194 446,194"/>
+<path class="e" d="M320,225 C390,225 380,95 446,95"/>
+<path class="e" d="M320,225 C390,225 380,202 446,202"/>
+<text class="t xs mute mid" x="385" y="275">hash(word) picks the reducer; each reducer gets all values for its keys, sorted</text>
+</svg>
+</div>
+<figcaption><b>Word count in MapReduce.</b> Mappers work on their split independently. The shuffle guarantees that every <code>(the, 1)</code> pair, from any mapper, reaches the same reducer. A combiner (a local reduce on each mapper) would turn mapper 1's output into partial sums before the shuffle and cut network traffic.</figcaption>
+</figure>
+
+<p>Fault tolerance comes from determinism: inputs are immutable and the functions are pure, so a failed or slow task is simply rerun on another machine, possibly twice in parallel (speculative execution), and the first result wins. That is the deep property of batch: <strong>a job can be rerun from scratch and produce the same output</strong>, so bugs are fixed by fixing the code and rerunning.</p>
+
+<h3 id="spark">Spark and dataflow engines</h3>
+<p>Hadoop MapReduce wrote every intermediate result to disk, and a multi-step pipeline was a chain of separate jobs. Apache Spark generalised the model into a <dfn>DAG</dfn> of operators (map, filter, join, groupBy, aggregate) planned as a whole, keeps intermediate data in memory where it fits, and recovers lost partitions by recomputing them from their <dfn>lineage</dfn> rather than from replicated disk copies. Spark SQL and DataFrames added a query optimiser, so most batch jobs today are written as SQL or DataFrame code rather than map and reduce functions, on Spark, Trino, BigQuery, Snowflake or similar engines.</p>
+
+<h3 id="data-lakes">Data lakes and lakehouses</h3>
+<p>Batch jobs read from and write to a <dfn>data lake</dfn>: cheap object storage (S3, GCS, ADLS; see <a href="blob-storage.html">Blob &amp; Object Storage</a>) holding raw events and derived tables, usually in columnar Parquet files partitioned by date (<code>s3://lake/orders/dt=2026-10-08/</code>). Table formats such as Apache Iceberg, Delta Lake and Apache Hudi add a transactional metadata layer on top, giving atomic commits, schema evolution and time travel to plain files; this combination is often called a lakehouse. Partitioning by date is what makes daily jobs cheap: yesterday's job reads only yesterday's directory.</p>
+
+<h2 id="stream">Stream processing</h2>
+<p>A stream processor (Apache Flink, Kafka Streams, Spark Structured Streaming, Google Dataflow) is a long-running job that consumes events, usually from a log such as Kafka (<a href="event-streaming.html">Pub/Sub &amp; Event Streaming</a>), keeps state, and emits results continuously. The hard parts all come from the input never ending.</p>
+
+<h3 id="event-time">Event time vs processing time</h3>
+<p>Every event has two timestamps. <dfn>Event time</dfn> is when it happened: the order was placed at 12:00:55. <dfn>Processing time</dfn> is when the stream job sees it: 12:01:26, because the phone was in a tunnel, a Kafka partition was lagging, or the job was restarting. The gap between them, the <dfn>skew</dfn>, is variable and unbounded.</p>
+<p>Grouping by processing time is easy and wrong for most business questions: a restart that delays 10 minutes of events would show a dip followed by a spike in "revenue per minute" that never happened. Grouping by event time gives the true answer, but raises a new question: if events can arrive late, when can the job declare the 12:00 minute complete?</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 350" role="img" aria-label="Event time against processing time for eleven orders: the ideal line, the watermark staircase ten seconds behind the latest event, one late event accepted and one dropped">
+<path class="line" d="M80,300 H680.0"/><path class="line" d="M80,300 V40.0"/>
+<text class="t xs mute mid" x="80.0" y="316">0 s</text>
+<text class="t xs mute end" x="72" y="304.0">0 s</text>
+<text class="t xs mute mid" x="260.0" y="316">60 s</text>
+<text class="t xs mute end" x="72" y="226.0">60 s</text>
+<path class="line faint" d="M80,222.0 H680.0" style="stroke-dasharray:3 4"/>
+<text class="t xs mute mid" x="440.0" y="316">120 s</text>
+<text class="t xs mute end" x="72" y="148.0">120 s</text>
+<path class="line faint" d="M80,144.0 H680.0" style="stroke-dasharray:3 4"/>
+<text class="t xs mute mid" x="620.0" y="316">180 s</text>
+<text class="t xs mute end" x="72" y="70.0">180 s</text>
+<path class="line faint" d="M80,66.0 H680.0" style="stroke-dasharray:3 4"/>
+<text class="t sm mid" x="380.0" y="338">processing time (when the event reached the job)</text>
+<text class="t sm" x="20" y="22">event time</text>
+<path d="M80,300 L680.0,40.0" style="fill:none;stroke:var(--d-muted);stroke-width:1;stroke-dasharray:2 4"/>
+<text class="t xs mute end" x="366.0" y="170.0">ideal: no delay</text>
+<path d="M101.0,300.0 L125.0,300.0 L125.0,297.4 L263.0,297.4 L263.0,237.6 L272.0,237.6 L272.0,233.7 L314.0,233.7 L314.0,215.5 L482.0,215.5 L482.0,144.0 L647.0,144.0 L647.0,72.5 L680.0,72.5" style="fill:none;stroke:var(--d-cache-s);stroke-width:2"/>
+<text class="t xs" x="500.0" y="207.5" style="fill:var(--d-cache-s)">watermark = max event time - 10 s</text>
+<circle class="dot accent" cx="101.0" cy="293.5" r="4.5"/>
+<circle class="dot accent" cx="125.0" cy="284.4" r="4.5"/>
+<circle class="dot accent" cx="263.0" cy="224.6" r="4.5"/>
+<circle class="dot accent" cx="272.0" cy="220.7" r="4.5"/>
+<circle class="dot accent" cx="278.0" cy="236.3" r="4.5"/>
+<circle class="dot accent" cx="314.0" cy="202.5" r="4.5"/>
+<circle class="dot accent" cx="323.0" cy="207.7" r="4.5"/>
+<circle class="dot accent" cx="338.0" cy="228.5" r="4.5"/>
+<circle class="dot accent" cx="482.0" cy="131.0" r="4.5"/>
+<circle class="dot accent" cx="500.0" cy="232.4" r="4.5"/>
+<circle class="dot accent" cx="647.0" cy="59.5" r="4.5"/>
+<circle cx="338.0" cy="228.5" r="9" style="fill:none;stroke:var(--d-green);stroke-width:1.5"/>
+<text class="t xs b green" x="321.0" y="232.5">a</text>
+<text class="t xs green" x="100" y="95">a  12:00:55 arrived late but within allowed lateness: window updated</text>
+<circle cx="500.0" cy="232.4" r="9" style="fill:none;stroke:var(--d-red);stroke-width:1.5"/>
+<text class="t xs b red" x="482.0" y="236.4">b</text>
+<text class="t xs red" x="100" y="112">b  12:00:52 arrived after lateness expired: side output</text>
+<text class="t xs mute" x="86" y="217.0">window boundary</text>
+</svg>
+</div>
+<figcaption><b>Skew and the watermark.</b> Each dot is one order from the code example below, plotted by when it happened (vertical) and when the job saw it (horizontal). Every dot sits below the ideal line because events can only arrive late. The amber staircase is the watermark: when it crosses a window boundary, that window fires.</figcaption>
+</figure>
+
+<h3 id="windows">Windows</h3>
+<p>Aggregations over an infinite stream need a finite scope. A <dfn>window</dfn> assigns each event, by its event time, to one or more finite buckets:</p>
+<div class="defs">
+<div><h4>Tumbling</h4><p>Fixed size, no overlap, every event in exactly one window. "Revenue per minute." The default for dashboards and billing.</p></div>
+<div><h4>Sliding (hopping)</h4><p>Fixed size, advancing by a smaller step, so windows overlap and an event belongs to several. "Requests in the last 30 seconds, updated every 10." Used for moving averages and rate alerts.</p></div>
+<div><h4>Session</h4><p>Dynamic size, per key: a window stays open while events keep arriving within a gap, and closes after a period of inactivity. "A user's browsing session ends after 30 minutes idle."</p></div>
+</div>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 740 330" role="img" aria-label="Tumbling, sliding and session windows over the same twelve events">
+<text class="t sm b" x="10" y="44">tumbling</text>
+<text class="t sm b" x="10" y="129">sliding</text>
+<text class="t sm b" x="10" y="249">session</text>
+<text class="t xs mute" x="10" y="58">30 s, no overlap</text>
+<text class="t xs mute" x="10" y="143">30 s every 10 s</text>
+<text class="t xs mute" x="10" y="263">gap of 10 s</text>
+<path class="line faint" d="M110,40 H710.0"/>
+<circle class="dot accent" cx="125.0" cy="40" r="4"/>
+<circle class="dot accent" cx="150.0" cy="40" r="4"/>
+<circle class="dot accent" cx="180.0" cy="40" r="4"/>
+<circle class="dot accent" cx="245.0" cy="40" r="4"/>
+<circle class="dot accent" cx="265.0" cy="40" r="4"/>
+<circle class="dot accent" cx="275.0" cy="40" r="4"/>
+<circle class="dot accent" cx="420.0" cy="40" r="4"/>
+<circle class="dot accent" cx="435.0" cy="40" r="4"/>
+<circle class="dot accent" cx="460.0" cy="40" r="4"/>
+<circle class="dot accent" cx="600.0" cy="40" r="4"/>
+<circle class="dot accent" cx="630.0" cy="40" r="4"/>
+<circle class="dot accent" cx="645.0" cy="40" r="4"/>
+<rect class="n db" x="111.0" y="52" width="148.0" height="22" rx="4"/><text class="t xs mid" x="185.0" y="67">4 events</text>
+<rect class="n db" x="261.0" y="52" width="148.0" height="22" rx="4"/><text class="t xs mid" x="335.0" y="67">2 events</text>
+<rect class="n db" x="411.0" y="52" width="148.0" height="22" rx="4"/><text class="t xs mid" x="485.0" y="67">3 events</text>
+<rect class="n db" x="561.0" y="52" width="148.0" height="22" rx="4"/><text class="t xs mid" x="635.0" y="67">3 events</text>
+<path class="line faint" d="M110,125 H710.0"/>
+<circle class="dot accent" cx="125.0" cy="125" r="4"/>
+<circle class="dot accent" cx="150.0" cy="125" r="4"/>
+<circle class="dot accent" cx="180.0" cy="125" r="4"/>
+<circle class="dot accent" cx="245.0" cy="125" r="4"/>
+<circle class="dot accent" cx="265.0" cy="125" r="4"/>
+<circle class="dot accent" cx="275.0" cy="125" r="4"/>
+<circle class="dot accent" cx="420.0" cy="125" r="4"/>
+<circle class="dot accent" cx="435.0" cy="125" r="4"/>
+<circle class="dot accent" cx="460.0" cy="125" r="4"/>
+<circle class="dot accent" cx="600.0" cy="125" r="4"/>
+<circle class="dot accent" cx="630.0" cy="125" r="4"/>
+<circle class="dot accent" cx="645.0" cy="125" r="4"/>
+<rect class="n svc" x="111.0" y="136" width="48.0" height="18" rx="4"/><text class="t xs mid" x="135.0" y="149">2</text>
+<rect class="n svc" x="111.0" y="158" width="98.0" height="18" rx="4"/><text class="t xs mid" x="160.0" y="171">3</text>
+<rect class="n svc" x="111.0" y="180" width="148.0" height="18" rx="4"/><text class="t xs mid" x="185.0" y="193">4</text>
+<rect class="n svc" x="161.0" y="136" width="148.0" height="18" rx="4"/><text class="t xs mid" x="235.0" y="149">4</text>
+<rect class="n svc" x="211.0" y="158" width="148.0" height="18" rx="4"/><text class="t xs mid" x="285.0" y="171">3</text>
+<rect class="n svc" x="261.0" y="180" width="148.0" height="18" rx="4"/><text class="t xs mid" x="335.0" y="193">2</text>
+<rect class="n svc" x="311.0" y="136" width="148.0" height="18" rx="4"/><text class="t xs mid" x="385.0" y="149">2</text>
+<rect class="n svc" x="361.0" y="158" width="148.0" height="18" rx="4"/><text class="t xs mid" x="435.0" y="171">3</text>
+<rect class="n svc" x="411.0" y="180" width="148.0" height="18" rx="4"/><text class="t xs mid" x="485.0" y="193">3</text>
+<rect class="n svc" x="461.0" y="136" width="148.0" height="18" rx="4"/><text class="t xs mid" x="535.0" y="149">2</text>
+<rect class="n svc" x="511.0" y="158" width="148.0" height="18" rx="4"/><text class="t xs mid" x="585.0" y="171">3</text>
+<rect class="n svc" x="561.0" y="180" width="148.0" height="18" rx="4"/><text class="t xs mid" x="635.0" y="193">3</text>
+<rect class="n svc" x="611.0" y="136" width="98.0" height="18" rx="4"/><text class="t xs mid" x="660.0" y="149">2</text>
+<rect class="n svc" x="661.0" y="158" width="48.0" height="18" rx="4"/><text class="t xs mid" x="685.0" y="171">0</text>
+<path class="line faint" d="M110,245 H710.0"/>
+<circle class="dot accent" cx="125.0" cy="245" r="4"/>
+<circle class="dot accent" cx="150.0" cy="245" r="4"/>
+<circle class="dot accent" cx="180.0" cy="245" r="4"/>
+<circle class="dot accent" cx="245.0" cy="245" r="4"/>
+<circle class="dot accent" cx="265.0" cy="245" r="4"/>
+<circle class="dot accent" cx="275.0" cy="245" r="4"/>
+<circle class="dot accent" cx="420.0" cy="245" r="4"/>
+<circle class="dot accent" cx="435.0" cy="245" r="4"/>
+<circle class="dot accent" cx="460.0" cy="245" r="4"/>
+<circle class="dot accent" cx="600.0" cy="245" r="4"/>
+<circle class="dot accent" cx="630.0" cy="245" r="4"/>
+<circle class="dot accent" cx="645.0" cy="245" r="4"/>
+<rect class="n cache" x="125.0" y="257" width="105.0" height="22" rx="4"/><text class="t xs mid" x="177.5" y="272">3</text>
+<rect class="n cache" x="245.0" y="257" width="80.0" height="22" rx="4"/><text class="t xs mid" x="285.0" y="272">3</text>
+<rect class="n cache" x="420.0" y="257" width="90.0" height="22" rx="4"/><text class="t xs mid" x="465.0" y="272">3</text>
+<rect class="n cache" x="600.0" y="257" width="95.0" height="22" rx="4"/><text class="t xs mid" x="647.5" y="272">3</text>
+<text class="t xs mute mid" x="110.0" y="306">0 s</text>
+<path class="line faint" d="M110.0,292 V296"/>
+<text class="t xs mute mid" x="260.0" y="306">30 s</text>
+<path class="line faint" d="M260.0,292 V296"/>
+<text class="t xs mute mid" x="410.0" y="306">60 s</text>
+<path class="line faint" d="M410.0,292 V296"/>
+<text class="t xs mute mid" x="560.0" y="306">90 s</text>
+<path class="line faint" d="M560.0,292 V296"/>
+<text class="t xs mute mid" x="710.0" y="306">120 s</text>
+<path class="line faint" d="M710.0,292 V296"/>
+<path class="line faint" d="M110,292 H710.0"/>
+<text class="t xs mute" x="10" y="324">dots: events by event time; numbers: events per window</text>
+</svg>
+</div>
+<figcaption><b>Three window types, same twelve events.</b> Tumbling windows partition time. Sliding windows overlap, so the same event is counted in three windows. Session windows have no fixed boundaries: each burst of activity becomes one window, closed after 10 seconds without events.</figcaption>
+</figure>
+
+<h3 id="watermarks">Watermarks and late data</h3>
+<p>A <dfn>watermark</dfn> is the stream processor's estimate of event-time progress: a watermark of 12:01:05 asserts "I do not expect any more events with event time before 12:01:05". When the watermark passes the end of a window, the window fires and emits its result. Watermarks are generated at the sources, most often with a bounded-out-of-orderness heuristic: watermark = highest event time seen minus a fixed delay (10 seconds in the example).</p>
+<p>The delay is a direct trade-off between latency and completeness. A 10-second delay emits each minute's result 10 seconds after the minute ends and misses events delayed by more. A 5-minute delay catches almost everything and makes the dashboard 5 minutes stale. Since no heuristic is perfect, engines offer three tools for events that arrive behind the watermark:</p>
+<ul>
+<li><strong>Allowed lateness.</strong> Keep a fired window's state for a while longer; a late event updates it and the window emits a corrected result. Downstream must accept updates (an upsert into a table, not an append).</li>
+<li><strong>Side outputs.</strong> Events later than the allowed lateness go to a separate stream instead of being silently dropped, so they can be counted, alerted on, or merged by a batch correction.</li>
+<li><strong>Triggers.</strong> Emit early, speculative results before the watermark (every 5 seconds of processing time), then the on-time result, then late corrections. Apache Beam formalises this as the what, where, when and how of the Dataflow model.</li>
+</ul>
+
+<h3 id="state-checkpoints">State and checkpointing</h3>
+<p>Windows, joins, deduplication and per-user counters all need state that lives across events. Stream processors keep it local to each parallel task, partitioned by key like the input (all events for <code>region=BR</code> go to the same task), in memory or in an embedded RocksDB instance when it is larger than memory. Local state is what makes streaming fast: no network call per event.</p>
+<p>Local state must survive crashes. Flink takes periodic <dfn>checkpoints</dfn> using asynchronous barrier snapshotting, a variant of the Chandy-Lamport algorithm: the sources inject a barrier into the stream; when an operator has received the barrier on all inputs, it snapshots its state to durable storage (S3, HDFS) and forwards the barrier. A completed checkpoint is a consistent cut: the state of every operator plus the exact source offsets (Kafka partition offsets) that produced it. Kafka Streams does the equivalent differently: every state store change is also written to a compacted changelog topic, and a restarted task restores its store by replaying the changelog.</p>
+
+<h3 id="exactly-once">Exactly-once via checkpoints</h3>
+<p>On failure, Flink restores every operator from the last completed checkpoint and rewinds the sources to the offsets recorded in it. Events after the checkpoint are processed again, but against state that has not seen them, so the <em>state</em> reflects each event exactly once. The <em>output</em> is the remaining problem: results emitted between the checkpoint and the crash will be emitted again. Two ways to close the gap:</p>
+<ul>
+<li><strong>Idempotent sinks.</strong> Write results as upserts keyed by (window, key): writing "12:00 BR = $41,230" twice is harmless.</li>
+<li><strong>Transactional sinks.</strong> The sink writes into a transaction that commits only when the checkpoint completes (a two-phase commit coordinated with the checkpoint), for example Flink's Kafka sink using Kafka transactions, read with <code>read_committed</code>. Output becomes visible once per checkpoint interval, which adds latency equal to that interval.</li>
+</ul>
+<p>As with Kafka, "exactly-once" means exactly-once effect on state and on cooperating sinks. A stream job that sends an email per event still needs <a href="idempotency.html">idempotency</a> at the email service.</p>
+
+<h3 id="engines">Engines</h3>
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Apache Flink</th><th>Kafka Streams</th><th>Spark Structured Streaming</th></tr></thead>
+<tbody>
+<tr><th>Form</th><td>Cluster runtime (JobManager, TaskManagers)</td><td>Java library inside your service</td><td>Spark application</td></tr>
+<tr><th>Execution</th><td>True streaming, event at a time</td><td>Event at a time</td><td>Micro-batches by default</td></tr>
+<tr><th>Latency</th><td class="yes">Milliseconds</td><td class="yes">Milliseconds</td><td class="meh">Hundreds of ms to seconds</td></tr>
+<tr><th>Sources and sinks</th><td>Many (Kafka, Kinesis, files, CDC, JDBC)</td><td>Kafka in, Kafka out</td><td>Many; shares code with Spark batch</td></tr>
+<tr><th>State and recovery</th><td>RocksDB plus checkpoints to object storage</td><td>RocksDB plus Kafka changelog topics</td><td>State store plus checkpoint and write-ahead log</td></tr>
+<tr><th>Best fit</th><td>Large, stateful, event-time pipelines</td><td>Stream logic owned by an application team on Kafka</td><td>Teams already on Spark, unifying batch and stream code</td></tr>
+</tbody></table></div>
+
+<h2 id="implementation">A tumbling window with a watermark</h2>
+<p>The code implements event-time tumbling windows of one minute, a watermark trailing the highest event time by 10 seconds, 30 seconds of allowed lateness, and a side output for anything later. The events are orders arriving out of order; they are the dots in the skew chart above.</p>
+<pre><code class="language-python">from collections import defaultdict
+
+WINDOW = 60             # tumbling windows of 60 s of event time
+MAX_DELAY = 10          # watermark = max event time seen - 10 s (bounded out-of-orderness)
+ALLOWED_LATENESS = 30   # keep a fired window's state 30 s more of event time for late updates
+
+
+def ts(sec):
+    return f"12:{sec // 60:02d}:{sec % 60:02d}"
+
+
+def run(events):
+    sums = defaultdict(int)            # window start -&gt; revenue in cents
+    fired = set()
+    watermark = -1
+    for event_time, cents in events:   # events arrive in processing order, not event order
+        start = event_time - event_time % WINDOW
+        if start + WINDOW + ALLOWED_LATENESS &lt;= watermark:
+            print(f"  {ts(event_time)} ${cents / 100:.2f} too late, sent to side output")
+            continue
+        sums[start] += cents
+        if start in fired:             # late but within allowed lateness: emit a correction
+            print(f"  {ts(event_time)} late, window {ts(start)} updated to ${sums[start] / 100:.2f}")
+        watermark = max(watermark, event_time - MAX_DELAY)
+        for s in sorted(sums):
+            if s not in fired and s + WINDOW &lt;= watermark:
+                fired.add(s)
+                print(f"watermark {ts(watermark)}: window [{ts(s)}, {ts(s + WINDOW)}) = ${sums[s] / 100:.2f}")
+            if s + WINDOW + ALLOWED_LATENESS &lt;= watermark:
+                del sums[s]            # state is freed for good
+                fired.discard(s)
+    for s in sorted(set(sums) - fired):    # end of input: the watermark jumps to infinity
+        print(f"end of input: window [{ts(s)}, {ts(s + WINDOW)}) = ${sums[s] / 100:.2f}")
+
+
+# (event time in seconds after 12:00:00, order value in cents), in arrival order
+run([(5, 2000), (12, 3500), (58, 1500), (61, 4000), (49, 1000), (75, 2500), (71, 500),
+     (55, 3000), (130, 5000), (52, 9900), (185, 1000)])</code></pre>
+<p>Output:</p>
+<pre><code class="language-text">watermark 12:01:05: window [12:00:00, 12:01:00) = $80.00
+  12:00:55 late, window 12:00:00 updated to $110.00
+watermark 12:02:00: window [12:01:00, 12:02:00) = $70.00
+  12:00:52 $99.00 too late, sent to side output
+end of input: window [12:02:00, 12:03:00) = $50.00
+end of input: window [12:03:00, 12:04:00) = $10.00</code></pre>
+<p>Walk through it. The 12:00:49 order arrives after 12:01:01 but before the watermark reaches 12:01:00, so it lands in the first window on time. The window fires when the 12:01:15 event pushes the watermark to 12:01:05. The 12:00:55 order arrives after that, but within the allowed lateness, so the window is corrected from $80 to $110. Once the watermark passes 12:01:30 (window end plus lateness), the window's state is deleted, and the 12:00:52 order is diverted to the side output. A batch job over the full day would have counted it, which is exactly the kind of discrepancy the worked example below has to deal with.</p>
+
+<h2 id="micro-batching">Micro-batching</h2>
+<p>Between batch and true streaming sits <dfn>micro-batching</dfn>: run a small batch job every few hundred milliseconds or seconds over whatever arrived since the last one. Spark Streaming introduced it, and Spark Structured Streaming still uses it by default. It reuses the batch engine's fault tolerance (a failed micro-batch is just rerun) and gets good throughput from batching, at the cost of latency at least equal to the batch interval plus scheduling overhead. For a dashboard that refreshes every 10 seconds, micro-batching is fine. For fraud scoring inside a 100 ms payment authorisation, it is not.</p>
+<p>The distinction is blurring: true streaming engines batch internally for throughput (network buffers, bundled state writes), and micro-batch engines have shrunk their intervals. The useful question is the end-to-end latency you need, not the label.</p>
+
+<h2 id="lambda-kappa">Lambda vs Kappa architectures</h2>
+<p>Around 2011, stream processors were fast but could not be trusted to be exact, and batch was exact but slow. Nathan Marz's <dfn>Lambda architecture</dfn> ran both: a batch layer recomputes complete views from all historical data, a speed layer covers the hours since the last batch run with approximate streaming results, and a serving layer merges the two at query time.</p>
+<p>Jay Kreps' 2014 critique proposed the <dfn>Kappa architecture</dfn>: if the stream processor can be exact (event time, watermarks, exactly-once state) and the log retains enough history, one streaming code path is enough. To reprocess after a bug fix or logic change, start a second instance of the job reading the log from the beginning into a new table, and switch readers over when it catches up.</p>
+
+<figure class="fig wide" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 760 300" role="img" aria-label="Lambda architecture with separate batch and speed layers merged at serving time, and Kappa architecture with one streaming path that reprocesses by replaying the log">
+<rect class="n client" x="10" y="125" width="90" height="50" rx="8"/><text class="t b mid" x="55" y="147">Events</text><text class="t xs mute mid" x="55" y="163">orders, clicks</text>
+<rect class="n queue" x="125" y="125" width="95" height="50" rx="8"/><text class="t b mid" x="172" y="147">Log</text>
+<text class="t xs mute mid" x="172" y="163" data-show="1">Kafka, 7 days</text>
+<text class="t xs mute mid" x="172" y="163" data-show="2">Kafka, 90 days+</text>
+<rect class="n svc" x="665" y="125" width="85" height="50" rx="8"/><text class="t b mid" x="707" y="147">Serving</text>
+<text class="t xs mute mid" x="707" y="163" data-show="1">merge both</text>
+<text class="t xs mute mid" x="707" y="163" data-show="2">one table</text>
+<path class="e" d="M100,150 H121"/>
+
+<g data-show="1">
+<text class="t xs mute" x="245" y="28">batch layer: complete and correct, hours behind</text>
+<rect class="n db" x="245" y="40" width="110" height="50" rx="8"/><text class="t b mid" x="300" y="62">Data lake</text><text class="t xs mute mid" x="300" y="78">S3 / HDFS</text>
+<rect class="n svc" x="385" y="40" width="115" height="50" rx="8"/><text class="t b mid" x="442" y="62">Batch job</text><text class="t xs mute mid" x="442" y="78">Spark, nightly</text>
+<rect class="n db" x="530" y="40" width="110" height="50" rx="8"/><text class="t b mid" x="585" y="62">Batch view</text><text class="t xs mute mid" x="585" y="78">up to midnight</text>
+<rect class="n svc" x="385" y="210" width="115" height="50" rx="8"/><text class="t b mid" x="442" y="232">Stream job</text><text class="t xs mute mid" x="442" y="248">Flink</text>
+<rect class="n cache" x="530" y="210" width="110" height="50" rx="8"/><text class="t b mid" x="585" y="232">Real-time view</text><text class="t xs mute mid" x="585" y="248">since midnight</text>
+<text class="t xs mute" x="245" y="282">speed layer: approximate, seconds behind</text>
+<path class="e" d="M220,140 C235,140 228,65 241,65"/>
+<path class="e" d="M355,65 H381"/>
+<path class="e" d="M500,65 H526"/>
+<path class="e" d="M220,160 C300,160 300,235 381,235"/>
+<path class="e" d="M500,235 H526"/>
+<path class="e" d="M640,65 C655,65 650,140 661,140"/>
+<path class="e" d="M640,235 C655,235 650,160 661,160"/>
+<path class="flow" d="M220,160 C300,160 300,235 381,235"/>
+<path class="flow" d="M500,235 H526"/>
+</g>
+
+<g data-show="2">
+<text class="t xs mute" x="385" y="28">current job, serving live traffic</text>
+<rect class="n svc" x="385" y="40" width="115" height="50" rx="8"/><text class="t b mid" x="442" y="62">Stream job v1</text><text class="t xs mute mid" x="442" y="78">Flink</text>
+<rect class="n db" x="530" y="40" width="110" height="50" rx="8"/><text class="t b mid" x="585" y="62">Table v1</text><text class="t xs mute mid" x="585" y="78">live</text>
+<rect class="n svc" x="385" y="210" width="115" height="50" rx="8"/><text class="t b mid" x="442" y="232">Stream job v2</text><text class="t xs mute mid" x="442" y="248">fixed logic</text>
+<rect class="n db" x="530" y="210" width="110" height="50" rx="8"/><text class="t b mid" x="585" y="232">Table v2</text><text class="t xs mute mid" x="585" y="248">rebuilding</text>
+<text class="t xs mute mid" x="300" y="154">no batch layer</text>
+<path class="e" d="M220,140 C300,140 300,65 381,65"/>
+<path class="e" d="M500,65 H526"/>
+<path class="e" d="M640,65 C655,65 650,140 661,140"/>
+<path class="e accent" d="M220,160 C300,160 300,235 381,235"/>
+<path class="e" d="M500,235 H526"/>
+<path class="e dash" d="M640,235 C655,235 650,160 661,160"/>
+<text class="t xs accent" x="245" y="282">replay from offset 0</text>
+<text class="t xs mute end" x="750" y="282">switch when v2 catches up</text>
+<path class="flow" d="M220,140 C300,140 300,65 381,65"/>
+<path class="flow" d="M220,160 C300,160 300,235 381,235"/>
+</g>
+</svg>
+
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Lambda</button><button type="button" data-step="2" aria-pressed="false">Kappa</button></div>
+</div>
+<figcaption><b>Two architectures.</b> Lambda keeps two code paths and merges their outputs. Kappa keeps one code path and handles reprocessing by replaying the log into a new version of the output table.</figcaption>
+</figure>
+
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Lambda</th><th>Kappa</th></tr></thead>
+<tbody>
+<tr><th>Code paths</th><td class="no">Two: same logic in batch and stream, kept in sync</td><td class="yes">One</td></tr>
+<tr><th>Reprocessing</th><td class="yes">Natural: rerun the batch job</td><td class="meh">Replay the log; needs long retention or tiered storage, and replay throughput</td></tr>
+<tr><th>Correctness of recent data</th><td class="meh">Approximate until the batch catches up</td><td class="meh">As good as the watermark and lateness policy</td></tr>
+<tr><th>Serving</th><td class="no">Merge two views at query time</td><td class="yes">Query one table</td></tr>
+<tr><th>Operational cost</th><td class="no">Two systems, two failure modes</td><td class="meh">One always-on stateful system</td></tr>
+</tbody></table></div>
+<p>Today most teams land in between: streaming for operational, low-latency outputs; scheduled batch over the lake for finance-grade numbers, backfills, and machine learning training sets; and unified APIs (Apache Beam, Flink's Table API, Spark's DataFrames) so the logic is written once even when it runs in two modes.</p>
+
+<h2 id="choosing">Choosing between them</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Concern</th><th>Batch</th><th>Stream</th></tr></thead>
+<tbody>
+<tr><th>Latency</th><td class="no">Minutes to a day</td><td class="yes">Milliseconds to seconds</td></tr>
+<tr><th>Completeness</th><td class="yes">All data for the period is present before the job runs</td><td class="meh">Bounded by the watermark; late data needs a policy</td></tr>
+<tr><th>Correctness and reruns</th><td class="yes">Rerun the job; deterministic output</td><td class="meh">Exactly-once needs checkpoints and cooperative sinks; replays need retained input</td></tr>
+<tr><th>Cost</th><td class="yes">Compute only while the job runs; spot instances work well</td><td class="meh">Always-on cluster sized for peak, plus state storage</td></tr>
+<tr><th>Complex logic (large joins, ML training)</th><td class="yes">Natural</td><td class="meh">Possible but state grows with the join window</td></tr>
+<tr><th>Operational burden</th><td class="yes">A failed job is retried in the morning</td><td class="no">A failed job is an incident; lag grows every second</td></tr>
+</tbody></table></div>
+<p>A good default: <strong>use batch unless someone will act on the result within minutes.</strong> Alerting, fraud detection, live dashboards, real-time personalisation and keeping search indexes fresh justify streaming. Monthly reports, billing, reconciliation and model training rarely do.</p>
+
+<h2 id="worked-example">Worked example: real-time and daily revenue dashboards</h2>
+<p>A retailer takes 2 million orders a day across 50 regions, peaking at 10 times the average rate during sales. Operations wants revenue per region per minute on a live screen. Finance wants the daily total per region, exact, by 6 a.m. Assume (from the mobile team's metrics) that 0.5% of orders reach the backend more than 30 seconds after they were placed, mostly from apps that were offline, and a few arrive hours later.</p>
+<div class="calc">Orders            2,000,000 / 86,400 s               ≈ 23/s average, <span class="r">~230/s peak</span>
+Raw events        2M × 1 KB                           = 2 GB/day into Kafka and the lake
+Live windows      1-minute tumbling × 50 regions      = 72,000 results/day (1,440 × 50)
+State             ~12 windows (current + 10 min lateness) × 50 regions → kilobytes; a single Flink task could hold it
+Watermark delay   30 s  → each minute appears ~30 s after it ends
+Late events       0.5% beyond 30 s                    ≈ 10,000 orders/day go to the update path
+Allowed lateness  10 min; anything later goes to the side output
+Daily batch       read 2 GB of Parquet for one date   → a few minutes on a small Spark cluster</div>
+<p>The resulting design:</p>
+<ol class="steps">
+<li><strong>Live path.</strong> Orders flow from the order service's outbox into Kafka, keyed by region. A Flink job assigns event-time one-minute windows, with a 30-second watermark delay and 10 minutes of allowed lateness, and upserts <code>(region, minute) → revenue</code> into a serving table that the dashboard polls. Late corrections overwrite the earlier value, so the chart quietly fixes itself.</li>
+<li><strong>Side output.</strong> Orders later than 10 minutes go to a <code>late-orders</code> topic. The dashboard does not show them; an alert fires if their rate exceeds a threshold, because a spike usually means an upstream outage.</li>
+<li><strong>Daily batch.</strong> At 01:00, once the lake partition for the previous day is closed, a Spark job computes the daily totals from the raw events, including every late order, refunds and currency conversion at the official daily rate. This is the number finance reports.</li>
+<li><strong>Reconciliation.</strong> A check compares the stream's daily sum with the batch result per region and alerts if they differ by more than 0.5%. Small differences are expected (late orders, refunds); large ones indicate a bug in one of the paths.</li>
+</ol>
+<p>Two consequences are worth saying in an interview. The live number is <em>operationally</em> correct, good enough to spot a 30% drop within a minute, and is explicitly not the financial number. And this is a Lambda-shaped system, deliberately: the batch path exists not because streaming is unreliable but because finance's definition of revenue (refunds, FX, accounting cut-offs) differs from operations', and a daily rerunnable job is the simplest way to compute it exactly.</p>
+
+<h2 id="tradeoffs">Trade-offs at a glance</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>You gain with streaming</th><th>You pay</th></tr></thead>
+<tbody>
+<tr><td>Results seconds after events happen</td><td>Watermarks, lateness policies and corrections to reason about</td></tr>
+<tr><td>Continuous, incremental computation; no daily spike of work</td><td>An always-on, stateful system that must be monitored and upgraded without losing state</td></tr>
+<tr><td>Natural fit for alerting, fraud and live features</td><td>Exactly-once only with checkpoints plus idempotent or transactional sinks</td></tr>
+<tr><td>One pipeline for live and historical data (Kappa)</td><td>Reprocessing needs long log retention and enough replay throughput</td></tr>
+</tbody></table></div>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+<li><strong>Google</strong> published MapReduce (2004), then FlumeJava and MillWheel, combined into Cloud Dataflow, whose model became <strong>Apache Beam</strong>: one API for batch and streaming with explicit event time, windows, watermarks and triggers.</li>
+<li><strong>Apache Spark</strong> replaced Hadoop MapReduce as the default batch engine and serves both batch and micro-batch streaming from the same DataFrame API, used widely through Databricks and cloud services such as EMR and Dataproc.</li>
+<li><strong>Apache Flink</strong> is the most widely used true stream processor for large stateful jobs; Alibaba, Uber and Netflix are among the companies that have described large Flink deployments.</li>
+<li><strong>Kafka Streams and ksqlDB</strong> keep stream processing inside the Kafka ecosystem, with state stores backed by changelog topics and exactly-once via Kafka transactions.</li>
+<li><strong>Lakehouse table formats</strong> (Iceberg, Delta Lake, Hudi) let streaming jobs write into the same tables that batch jobs read, which is how many teams run Lambda-style designs without two separate storage systems.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>Whenever the design includes analytics, counters, leaderboards, trending lists or anything computed over many events: clicks in the <a href="url-shortener.html">URL shortener</a>, trending queries in <a href="autocomplete.html">autocomplete</a>, view counts in the <a href="video-streaming.html">video platform</a>. Say which outputs need streaming and which can be batch, and why. Mentioning event time and late data unprompted is a strong signal.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>Event time or processing time? What happens when the job restarts after 10 minutes down?</li>
+<li>How do you handle events that arrive late? (Watermark delay, allowed lateness, side output, batch correction.)</li>
+<li>How do you get exactly-once counts? (Checkpoints with source rewind, plus idempotent upserts or transactional sinks.)</li>
+<li>You found a bug in the aggregation. How do you fix last month's numbers? (Rerun the batch job, or replay the log into a new table in Kappa.)</li>
+<li>Lambda or Kappa, and what does each cost to operate?</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>Windowing by processing time for business metrics, without acknowledging the distortion.</li>
+<li>Assuming events arrive in order, or that all events for a minute have arrived when the wall clock passes the minute.</li>
+<li>Proposing a streaming pipeline for a report that someone reads once a month.</li>
+<li>Claiming end-to-end exactly-once without saying how the sink handles replays.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://static.googleusercontent.com/media/research.google.com/en//archive/mapreduce-osdi04.pdf" target="_blank" rel="noopener">MapReduce: Simplified Data Processing on Large Clusters</a><span>Dean and Ghemawat, OSDI 2004. The programming model, the shuffle and re-execution for fault tolerance.</span></li>
+<li><a href="https://www.vldb.org/pvldb/vol8/p1792-Akidau.pdf" target="_blank" rel="noopener">The Dataflow Model</a><span>Akidau et al., VLDB 2015. Event time, windowing, watermarks and triggers as one model for batch and streaming.</span></li>
+<li><a href="https://www.oreilly.com/radar/the-world-beyond-batch-streaming-101/" target="_blank" rel="noopener">The world beyond batch: Streaming 101</a><span>Tyler Akidau, O'Reilly Radar, 2015. The clearest introduction to event time vs processing time and windowing.</span></li>
+<li><a href="https://www.oreilly.com/radar/questioning-the-lambda-architecture/" target="_blank" rel="noopener">Questioning the Lambda Architecture</a><span>Jay Kreps, O'Reilly Radar, 2014. The argument for Kappa: one stream processing path plus log replay.</span></li>
+<li><a href="https://arxiv.org/abs/1506.08603" target="_blank" rel="noopener">Lightweight Asynchronous Snapshots for Distributed Dataflows</a><span>Carbone et al., 2015. The barrier-based checkpointing behind Flink's exactly-once state.</span></li>
+</ul>

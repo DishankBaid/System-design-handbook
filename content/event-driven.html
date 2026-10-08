@@ -1,0 +1,414 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">When an order is placed, six things must happen: charge the card, reserve stock, create a shipment, email the customer, update the analytics warehouse and award loyalty points. If the order service calls each of those services directly, it must know all six, wait for all six, and fail when any one of them is down. Every new feature that cares about orders means another change to the order service.</p>
+<p>In an <dfn>event-driven architecture</dfn>, the order service instead announces a fact, <code>OrderPlaced</code>, and stops there. Each interested service subscribes and reacts on its own schedule. Adding a seventh reaction means deploying a new subscriber, without touching the order service. The coupling moves from "who do I call" to "what does this event look like", which is a smaller and more stable contract.</p>
+<p>The price is that the system's behaviour is no longer visible in any one place. A request becomes a chain of asynchronous reactions across services and topics, consistency becomes eventual, and failures surface minutes later in a different service. This chapter covers the patterns, and the engineering needed to keep them understandable. The transport underneath is usually a log like Kafka (<a href="event-streaming.html">Pub/Sub &amp; Event Streaming</a>) or a broker with fan-out (<a href="message-queues.html">Message Queues</a>).</p>
+
+<h2 id="messages">Events, commands and queries</h2>
+<p>Three kinds of message look similar on the wire but mean very different things. Getting the distinction right is most of the design.</p>
+<div class="defs">
+<div><h4>Event</h4><p>A fact that already happened, named in the past tense: <code>OrderPlaced</code>, <code>PaymentCaptured</code>. The sender does not know or care who listens. Zero, one or many consumers. Cannot be rejected, only reacted to.</p></div>
+<div><h4>Command</h4><p>A request for a specific receiver to do something, in the imperative: <code>ChargeCard</code>, <code>ReserveStock</code>. Exactly one handler. Can fail or be refused, so the sender usually needs a reply.</p></div>
+<div><h4>Query</h4><p>A request for information that changes nothing: <code>GetOrderStatus</code>. Usually synchronous (HTTP, gRPC), because the caller is waiting for the answer.</p></div>
+</div>
+<p>A common smell is a command dressed up as an event: <code>SendWelcomeEmail</code> published to a topic. It has one intended receiver and the sender depends on it happening, so the decoupling is fake. Either publish the fact (<code>UserRegistered</code>) and let the email service decide, or send a command to the email service's queue and admit the dependency.</p>
+
+<h2 id="event-patterns">Three ways to use events</h2>
+<p>Martin Fowler's taxonomy (which also lists CQRS, covered in its own chapter) separates patterns that are often lumped together as "event-driven":</p>
+<h3 id="event-notification">Event notification</h3>
+<p>The event is thin: it says what happened and carries an identifier. <code>{"type": "OrderPlaced", "order_id": 81723}</code>. Consumers that need details call back to the source. The event is small and the source stays the only owner of the data, but every consumer adds read load to the source and depends on it being up when the event is processed.</p>
+<h3 id="state-transfer">Event-carried state transfer</h3>
+<p>The event is fat: it carries the data consumers need, so they never call back. <code>CustomerAddressChanged</code> includes the full new address, and the shipping service keeps its own local copy of customer addresses. Consumers are fully decoupled at runtime and reads are local and fast. In exchange, data is duplicated across services, each copy is eventually consistent, and the event schema becomes a much larger contract.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 300" role="img" aria-label="Event notification: a thin event followed by a call back for details. Event-carried state transfer: a fat event stored in a local copy, no call back">
+<text class="t sm b" x="20" y="22">Event notification</text>
+<rect class="n svc" x="20" y="38" width="130" height="52" rx="8"/><text class="t b mid" x="85" y="69">Order service</text>
+<rect class="n queue" x="230" y="44" width="250" height="40" rx="20"/><text class="t sm mono mid" x="355" y="68">OrderPlaced {order_id: 81723}</text>
+<rect class="n svc" x="560" y="38" width="140" height="52" rx="8"/><text class="t b mid" x="630" y="69">Shipping</text>
+<path class="e" d="M150,64 H226"/><path class="e" d="M480,64 H556"/>
+<path class="e dash" d="M630,90 V112 H85 V94"/>
+<text class="t xs mute mid" x="355" y="128">GET /orders/81723 to fetch the details: runtime dependency on the source</text>
+<path class="line faint" d="M20,150 H700" style="stroke-dasharray:4 4"/>
+<text class="t sm b" x="20" y="176">Event-carried state transfer</text>
+<rect class="n svc" x="20" y="192" width="130" height="52" rx="8"/><text class="t b mid" x="85" y="223">Customer service</text>
+<rect class="n queue" x="200" y="192" width="310" height="52" rx="20"/><text class="t sm mono mid" x="355" y="214">CustomerAddressChanged</text><text class="t xs mono mute mid" x="355" y="231">{customer_id, street, city, zip, country}</text>
+<rect class="n svc" x="560" y="192" width="140" height="52" rx="8"/><text class="t b mid" x="630" y="223">Shipping</text>
+<path class="e" d="M150,218 H196"/><path class="e" d="M510,218 H556"/>
+<rect class="n db" x="575" y="262" width="110" height="30" rx="6"/><text class="t xs mid" x="630" y="281">local address copy</text>
+<path class="e" d="M630,244 V258"/>
+<text class="t xs mute end" x="560" y="281">no call back, works when Customer is down</text>
+</svg>
+</div>
+<figcaption><b>Thin vs fat events.</b> Notification keeps one owner of the data but couples consumers to the source at runtime. State transfer removes the runtime coupling and replaces it with a larger schema contract and duplicated, eventually consistent data.</figcaption>
+</figure>
+
+<h3 id="event-sourcing-pattern">Event sourcing</h3>
+<p>The third pattern goes further: the events <em>are</em> the source of truth, and current state is derived by replaying them. That changes how a service stores data, not just how it communicates, and it has its own chapter: <a href="cqrs-event-sourcing.html">CQRS &amp; Event Sourcing</a>. Events used for integration between services and events used for storage inside one service should usually be different events, because internal storage events change with the implementation while integration events are a public contract.</p>
+
+<h2 id="choreography-orchestration">Choreography vs orchestration</h2>
+<p>A business process that spans services, such as placing an order, needs something to drive it forward and to undo completed steps when a later one fails. There are two ways to arrange that.</p>
+<h3 id="choreography">Choreography</h3>
+<p>In <dfn>choreography</dfn>, there is no coordinator. Each service listens for events and emits its own; the process emerges from the chain of reactions.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 340" role="img" aria-label="Choreography: services publish and subscribe to events on a shared bus; order placed, payment captured, stock reserved, and a failure path where out of stock triggers a refund">
+<rect class="n svc" x="40" y="40" width="140" height="52" rx="8"/><text class="t b mid" x="110" y="62">Order</text>
+<text class="t xs mid mute" x="110" y="80" data-show="1">publishes OrderPlaced</text>
+<text class="t xs mid mute" x="110" y="80" data-show="2">idle</text>
+<text class="t xs mid mute" x="110" y="80" data-show="3">status: CONFIRMED</text>
+<text class="t xs mid red" x="110" y="80" data-show="4">status: CANCELLED</text>
+<rect class="n svc" x="290" y="40" width="140" height="52" rx="8"/><text class="t b mid" x="360" y="62">Payment</text>
+<text class="t xs mid mute" x="360" y="80" data-show="1">charges card</text>
+<text class="t xs mid mute" x="360" y="80" data-show="2">publishes PaymentCaptured</text>
+<text class="t xs mid mute" x="360" y="80" data-show="3">idle</text>
+<text class="t xs mid red" x="360" y="80" data-show="4">refunds card</text>
+<rect class="n svc" x="540" y="40" width="140" height="52" rx="8"/><text class="t b mid" x="610" y="62">Inventory</text>
+<text class="t xs mid mute" x="610" y="80" data-show="1">idle</text>
+<text class="t xs mid mute" x="610" y="80" data-show="2">reserves stock</text>
+<text class="t xs mid mute" x="610" y="80" data-show="3">publishes StockReserved</text>
+<text class="t xs mid mute" x="610" y="80" data-show="4">publishes OutOfStock</text>
+<rect class="n svc" x="165" y="250" width="140" height="52" rx="8"/><text class="t b mid" x="235" y="272">Shipping</text>
+<text class="t xs mute mid" x="235" y="290" data-show="1">idle</text>
+<text class="t xs mute mid" x="235" y="290" data-show="2">idle</text>
+<text class="t xs mute mid" x="235" y="290" data-show="3">creates shipment</text>
+<text class="t xs mute mid" x="235" y="290" data-show="4">idle</text>
+<rect class="n svc" x="415" y="250" width="140" height="52" rx="8"/><text class="t b mid" x="485" y="272">Notifications</text>
+<text class="t xs mute mid" x="485" y="290" data-show="1">sends "order received"</text>
+<text class="t xs mute mid" x="485" y="290" data-show="2">idle</text>
+<text class="t xs mute mid" x="485" y="290" data-show="3">idle</text>
+<text class="t xs mute mid" x="485" y="290" data-show="4">idle</text>
+<rect class="n queue" x="30" y="145" width="660" height="50" rx="10"/>
+<text class="t xs mute end" x="690" y="222">event bus: one topic per event type</text>
+<g data-show="1">
+<path class="e accent" d="M85,94 V183 H385 V96"/>
+<path class="flow" d="M85,94 V183 H385 V96"/>
+<path class="e accent" d="M85,94 V183 H485 V246"/>
+<path class="flow" d="M85,94 V183 H485 V246"/>
+<text class="t sm mono mid accent" x="235" y="170">OrderPlaced</text>
+</g>
+<g data-show="2">
+<path class="e accent" d="M335,94 V183 H635 V96"/>
+<path class="flow" d="M335,94 V183 H635 V96"/>
+<text class="t sm mono mid accent" x="485" y="170">PaymentCaptured</text>
+</g>
+<g data-show="3">
+<path class="e accent" d="M585,94 V183 H235 V246"/>
+<path class="flow" d="M585,94 V183 H235 V246"/>
+<path class="e accent" d="M585,94 V183 H135 V96"/>
+<path class="flow" d="M585,94 V183 H135 V96"/>
+<text class="t sm mono mid accent" x="330" y="170">StockReserved</text>
+</g>
+<g data-show="4">
+<path class="e red" d="M585,94 V183 H385 V96"/>
+<path class="flow" d="M585,94 V183 H385 V96"/>
+<path class="e red" d="M585,94 V183 H135 V96"/>
+<path class="flow" d="M585,94 V183 H135 V96"/>
+<text class="t sm mono mid red" x="330" y="170">OutOfStock</text>
+</g>
+<text class="t sm mid" x="360" y="330" data-show="1">Order writes its row and emits OrderPlaced. Payment and Notifications ("order received" email) react on their own.</text>
+<text class="t sm mid" x="360" y="330" data-show="2">Payment emits PaymentCaptured. Order does not know or care who listens.</text>
+<text class="t sm mid" x="360" y="330" data-show="3">Inventory emits StockReserved. Shipping starts work; Order updates its status.</text>
+<text class="t sm mid" x="360" y="330" data-show="4">Failure: OutOfStock. Payment must know to refund. The compensation logic lives in Payment.</text>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Order placed</button><button type="button" data-step="2" aria-pressed="false">Payment captured</button><button type="button" data-step="3" aria-pressed="false">Stock reserved</button><button type="button" data-step="4" aria-pressed="false">Out of stock</button></div>
+</div>
+<figcaption><b>Choreography.</b> Every arrow is an event on the bus. Nobody owns the whole flow: to answer "what happens after payment?" you must read the subscriptions of every service. The failure path is spread across Payment and Order.</figcaption>
+</figure>
+
+<h3 id="orchestration">Orchestration</h3>
+<p>In <dfn>orchestration</dfn>, one component, the orchestrator, owns the process. It sends commands to services, waits for replies, persists its progress, and decides what to do next, including compensating actions when a step fails. This is the <dfn>saga</dfn> pattern from <a href="distributed-transactions.html">Distributed Transactions</a>, implemented as an explicit state machine.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 340" role="img" aria-label="Orchestration: a saga orchestrator sends commands to payment, inventory and shipping and receives replies; on out of stock it sends a refund command">
+<rect class="n cache" x="245" y="24" width="230" height="62" rx="8"/><text class="t b mid" x="360" y="48">Order saga orchestrator</text>
+<text class="t xs mono mid mute" x="360" y="68" data-show="1">state: AWAITING_PAYMENT</text>
+<text class="t xs mono mid mute" x="360" y="68" data-show="2">state: RESERVING_STOCK</text>
+<text class="t xs mono mid mute" x="360" y="68" data-show="3">state: COMPLETED</text>
+<text class="t xs mono mid red" x="360" y="68" data-show="4">state: COMPENSATING</text>
+<rect class="n svc" x="60" y="236" width="130" height="52" rx="8"/><text class="t b mid" x="125" y="266">Payment</text>
+<rect class="n svc" x="295" y="236" width="130" height="52" rx="8"/><text class="t b mid" x="360" y="266">Inventory</text>
+<rect class="n svc" x="530" y="236" width="130" height="52" rx="8"/><text class="t b mid" x="595" y="266">Shipping</text>
+<g data-show="1">
+<path class="e accent" d="M364.3,92.7 L132.7,240.6"/>
+<text class="t xs mono " x="252.2" y="180.2">ChargeCard</text>
+<path class="e dash" d="M120.7,229.3 L352.3,81.4"/>
+<text class="t xs mono end" x="232.8" y="149.8">PaymentCaptured</text>
+</g>
+<g data-show="2">
+<path class="e accent" d="M368.0,86.0 L368.0,232.0"/>
+<text class="t xs mono " x="378.0" y="165.0">ReserveStock</text>
+<path class="e dash" d="M352.0,236.0 L352.0,90.0"/>
+<text class="t xs mono end" x="342.0" y="165.0">StockReserved</text>
+</g>
+<g data-show="3">
+<path class="e accent" d="M364.3,79.3 L595.9,227.1"/>
+<text class="t xs mono " x="487.2" y="149.8">CreateShipment</text>
+<path class="e dash" d="M590.7,242.7 L359.1,94.9"/>
+<text class="t xs mono end" x="467.8" y="180.2">ShipmentCreated</text>
+</g>
+<g data-show="4">
+<path class="e dash red" d="M352.0,236.0 L352.0,90.0"/>
+<text class="t xs mono  red" x="362.0" y="165.0">OutOfStock</text>
+<path class="e red" d="M364.3,92.7 L132.7,240.6"/>
+<text class="t xs mono  red" x="252.2" y="180.2">RefundPayment</text>
+</g>
+<text class="t sm mid" x="360" y="326" data-show="1">The orchestrator owns the workflow. It sends a command and waits for the reply.</text>
+<text class="t sm mid" x="360" y="326" data-show="2">Each step's result decides the next command. The state is persisted after every step.</text>
+<text class="t sm mid" x="360" y="326" data-show="3">Shipping replies and the saga completes. Services know nothing about each other.</text>
+<text class="t sm mid" x="360" y="326" data-show="4">OutOfStock: the orchestrator runs the compensation itself by commanding a refund.</text>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Charge</button><button type="button" data-step="2" aria-pressed="false">Reserve</button><button type="button" data-step="3" aria-pressed="false">Ship</button><button type="button" data-step="4" aria-pressed="false">Compensate</button></div>
+</div>
+<figcaption><b>Orchestration.</b> Solid arrows are commands, dashed arrows are replies. The whole workflow, including the refund on failure, is readable in one place: the orchestrator's state machine.</figcaption>
+</figure>
+
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Choreography</th><th>Orchestration</th></tr></thead>
+<tbody>
+<tr><th>Where the flow lives</th><td class="no">Implicit, spread across subscribers</td><td class="yes">Explicit, in one state machine</td></tr>
+<tr><th>Coupling</th><td class="yes">Services only know event schemas</td><td class="meh">Orchestrator knows every participant's commands</td></tr>
+<tr><th>Adding a reaction</th><td class="yes">Deploy a new subscriber, nothing else changes</td><td class="meh">Change the orchestrator</td></tr>
+<tr><th>Failure handling and compensation</th><td class="no">Each service must know which events mean "undo"</td><td class="yes">Central, testable, with timeouts per step</td></tr>
+<tr><th>Answering "where is order 81723 stuck?"</th><td class="no">Correlate logs across services</td><td class="yes">Look at the saga's state</td></tr>
+<tr><th>Single point of failure</th><td class="yes">None beyond the bus</td><td class="meh">The orchestrator, so it must be persistent and replicated</td></tr>
+</tbody></table></div>
+<p>A practical rule: use choreography for loosely related <em>reactions</em> to a fact (send an email, update search, award points), where adding a listener should not require anyone's permission. Use orchestration for a <em>process</em> with ordered steps, a business outcome and compensations, such as order fulfilment, loan approval or account onboarding. Most real systems mix them: an orchestrated saga for fulfilment that publishes <code>OrderConfirmed</code>, which a dozen services consume by choreography. Workflow engines such as Temporal, AWS Step Functions and Camunda exist to make orchestrators durable without hand-writing the state persistence.</p>
+
+<h2 id="schema">Event schema design and evolution</h2>
+<p>An event published to a shared topic is a public API with consumers you may not know about. Once it is published, it is also permanent: events retained in a log or an event store will be read years later by code that did not exist when they were written.</p>
+<h3 id="envelope">The envelope</h3>
+<p>Every event should carry the same metadata, whatever its payload. The CNCF CloudEvents specification standardises most of it.</p>
+<pre><code class="language-jsonc">{
+  "id": "9b2f6c1e-4d0a-4c4e-9a63-2f1d8c0e7b51",   // unique per event: the deduplication key
+  "type": "com.shop.order.OrderPlaced",
+  "specversion": "1.0",
+  "source": "/services/order",
+  "time": "2026-10-09T14:03:27.512Z",             // when it happened, not when it was sent
+  "subject": "order/81723",                        // the entity: also the partition key
+  "dataschema": "registry://orders/OrderPlaced/3",
+  "correlationid": "c-5f1a9e",                     // extension: same for the whole business flow
+  "causationid": "evt-77e2...",                    // extension: the event that caused this one
+  "data": { "order_id": 81723, "customer_id": 4411, "total_cents": 4200, "currency": "USD",
+            "lines": [ { "sku": "MUG-RED-12OZ", "qty": 2, "unit_cents": 2100 } ] }
+}</code></pre>
+<p>Design rules that save pain later: name events for business facts, not database changes (<code>OrderCancelled</code>, not <code>OrderRowUpdated</code>); include the entity id and a timestamp of the business occurrence; use explicit units and currencies (<code>total_cents</code> plus <code>currency</code>, never a bare float); and include enough state that common consumers do not need to call back.</p>
+
+<h3 id="compatibility">Compatibility and a schema registry</h3>
+<p>Producers and consumers deploy independently, so for some period an old consumer reads new events and a new consumer reads old ones. A <dfn>schema registry</dfn> (Confluent Schema Registry, AWS Glue Schema Registry, Apicurio) stores every version of each event schema and rejects a new version that breaks the configured compatibility rule. Producers embed a schema id in each message, so consumers can always find the exact schema it was written with.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Mode</th><th>Guarantee</th><th>Who upgrades first</th><th>Typical allowed change</th></tr></thead>
+<tbody>
+<tr><th>Backward</th><td>New consumers can read data written with the previous schema</td><td>Consumers</td><td>Delete a field; add a field with a default</td></tr>
+<tr><th>Forward</th><td>Old consumers can read data written with the new schema</td><td>Producers</td><td>Add a field; delete a field that had a default</td></tr>
+<tr><th>Full</th><td>Both directions</td><td>Either, in any order</td><td>Add or remove only fields that have defaults</td></tr>
+<tr><th>*_Transitive</th><td>Same, checked against every earlier version, not just the last</td><td>As above</td><td>Required when consumers replay old data from a long-retention log</td></tr>
+</tbody></table></div>
+<p>Format choice shapes what is possible. <strong>Avro</strong> resolves the writer's schema against the reader's schema by field name, using defaults for missing fields; it is compact and the registry's original home. <strong>Protobuf</strong> identifies fields by number, so renaming is free but a field number must never be reused (mark removed ones <code>reserved</code>). <strong>JSON Schema</strong> is the most readable and the loosest; it is easy to publish JSON that no schema checks at all. When a change cannot be made compatibly (a field changes meaning), publish a new event type or version (<code>OrderPlaced.v2</code>) and run both until old consumers migrate.</p>
+
+<h2 id="eventual-consistency">Eventual consistency and the user experience</h2>
+<p>In an event-driven flow, the moment the user clicks "Place order" is not the moment the order is confirmed. Payment may take a second, stock reservation another 50 ms, and the search index or "my orders" page might reflect the order a few seconds later. If the UI pretends otherwise, users see confusing states: an order missing from their order list right after they placed it, or a confirmation that is later revoked.</p>
+<ul>
+<li><strong>Design the intermediate state.</strong> Return <code>202 Accepted</code> with an order id and show "Order received, confirming payment". Push the final status over a WebSocket or SSE connection, or poll a status endpoint (<a href="realtime.html">Polling, SSE &amp; WebSockets</a>).</li>
+<li><strong>Read your own writes.</strong> Serve "my orders" for the user who just ordered from the order service's own database, not from a read model fed by events, or merge the just-created order into the response on the client.</li>
+<li><strong>Optimistic UI only for safe actions.</strong> Showing a "like" immediately is fine. Showing "payment successful" before payment succeeded is not.</li>
+<li><strong>Make the lag measurable.</strong> Track the time from event creation to each consumer's processing, and set an SLO for it ("search reflects new products within 30 seconds at p99"). See <a href="consistency-models.html">Consistency Models</a> for the vocabulary.</li>
+</ul>
+
+<h2 id="tracing">Debugging and tracing async flows</h2>
+<p>With synchronous calls, a stack trace or a single trace shows what happened. With events, the "call stack" is spread across topics, services and time. Three pieces of metadata make it recoverable:</p>
+<ul>
+<li><strong>Correlation id.</strong> Generated once at the edge (the HTTP request that placed the order) and copied onto every event and command in the flow. Searching logs for <code>correlationid=c-5f1a9e</code> returns the whole story of order 81723.</li>
+<li><strong>Causation id.</strong> The id of the event that directly caused this one. Correlation tells you which flow; causation rebuilds the tree within it, which matters when one event fans out into several.</li>
+<li><strong>Trace context in message headers.</strong> OpenTelemetry propagates the W3C <code>traceparent</code> header through Kafka or AMQP message headers, so a distributed trace continues across the asynchronous hop and shows queueing time as a gap between spans. See <a href="observability.html">Observability</a>.</li>
+</ul>
+<p>Beyond tracing: keep an event catalogue (who produces and who consumes each event type, generated from code or documented with AsyncAPI), make DLQs visible per consumer, and build a way to replay a single event to a single consumer. The first production incident without these tools usually pays for them.</p>
+
+<h2 id="outbox-cdc">Publishing reliably: the outbox and CDC</h2>
+<p>The order service must do two things when an order is placed: write the order to its database and publish <code>OrderPlaced</code>. These are two different systems, and no local transaction spans both. This is the <dfn>dual-write problem</dfn>:</p>
+<ul>
+<li>Write the database, then publish: a crash between the two leaves an order that no other service will ever hear about.</li>
+<li>Publish, then write: a crash between the two announces an order that does not exist.</li>
+<li>Publish inside the database transaction: the publish cannot be rolled back if the commit fails, and a slow broker now holds database locks.</li>
+</ul>
+<p>The <dfn>transactional outbox</dfn> removes the second system from the transaction. The service writes the event as a row in an <code>outbox</code> table <strong>in the same local transaction</strong> as the business change. A separate relay reads the outbox and publishes to the broker, retrying until it succeeds. Either both the order and its event exist, or neither does; publishing is then at-least-once, so consumers deduplicate by event id.</p>
+
+<figure class="fig wide">
+<div class="fig-frame">
+<svg viewBox="0 0 760 280" role="img" aria-label="Transactional outbox with change data capture: the order service writes the order row and the outbox row in one transaction; Debezium reads the write-ahead log and publishes to Kafka; consumers read the topic">
+<rect class="n svc" x="20" y="118" width="120" height="56" rx="8"/><text class="t b mid" x="80" y="141">Order service</text><text class="t xs mute mid" x="80" y="158">place_order()</text>
+<rect class="zone" x="180" y="30" width="230" height="230" rx="10"/>
+<text class="t sm b" x="196" y="52">PostgreSQL</text>
+<rect class="n db" x="200" y="66" width="190" height="44" rx="6"/><text class="t sm mono mid" x="295" y="85">orders</text><text class="t xs mute mid" x="295" y="101">INSERT 81723 PLACED</text>
+<rect class="n db" x="200" y="126" width="190" height="44" rx="6"/><text class="t sm mono mid" x="295" y="145">outbox</text><text class="t xs mute mid" x="295" y="161">INSERT OrderPlaced event</text>
+<rect class="n" x="200" y="200" width="190" height="40" rx="6"/><text class="t sm mid" x="295" y="218">write-ahead log</text><text class="t xs mute mid" x="295" y="233">both rows, one commit</text>
+<path class="e" d="M140,138 C166,138 170,88 196,88"/>
+<path class="e" d="M140,150 H196"/>
+<text class="t xs mute mid" x="80" y="196">one local</text><text class="t xs mute mid" x="80" y="209">transaction</text>
+<path class="line faint" d="M295,174 V196"/>
+<rect class="n ext" x="450" y="195" width="130" height="50" rx="8"/><text class="t b mid" x="515" y="217">Debezium</text><text class="t xs mute mid" x="515" y="233">tails the WAL</text>
+<rect class="n queue" x="450" y="65" width="130" height="50" rx="8"/><text class="t b mid" x="515" y="87">Kafka</text><text class="t xs mono mute mid" x="515" y="103">order.events</text>
+<rect class="n svc" x="620" y="30" width="120" height="40" rx="8"/><text class="t sm b mid" x="680" y="55">Email</text>
+<rect class="n svc" x="620" y="80" width="120" height="40" rx="8"/><text class="t sm b mid" x="680" y="105">Inventory</text>
+<rect class="n svc" x="620" y="130" width="120" height="40" rx="8"/><text class="t sm b mid" x="680" y="155">Analytics</text>
+<path class="e" d="M390,220 H446"/>
+<path class="e" d="M515,195 V119"/>
+<path class="e" d="M580,82 C598,82 598,50 616,50"/>
+<path class="e" d="M580,90 H616"/>
+<path class="e" d="M580,98 C598,98 598,150 616,150"/>
+<path class="flow" d="M140,150 H196"/>
+<path class="flow" d="M390,220 H446"/>
+<path class="flow" d="M515,195 V119"/>
+<path class="flow" d="M580,90 H616"/>
+<text class="t xs mute" x="525" y="160">publish,</text><text class="t xs mute" x="525" y="173">at-least-once</text>
+</svg>
+</div>
+<figcaption><b>Outbox plus change data capture.</b> The service never talks to Kafka. The database commit is the single point of truth, and Debezium turns committed outbox rows into events in commit order. A polling relay (<code>SELECT ... WHERE published = 0</code>) is the simpler alternative when CDC infrastructure is not available.</figcaption>
+</figure>
+
+<p>There are two ways to run the relay:</p>
+<ul>
+<li><strong>Polling publisher.</strong> A loop selects unpublished rows in order, publishes them, marks them published. Simple, works on any database, adds query load and some latency (the poll interval).</li>
+<li><strong>Change data capture</strong> (CDC). A connector such as <strong>Debezium</strong> reads the database's replication log (PostgreSQL logical decoding, the MySQL binlog) and turns committed changes into Kafka records, typically within milliseconds and without polling. Debezium's outbox event router maps outbox rows to topics and keys. CDC can also publish changes to ordinary tables directly, but that leaks your internal schema as a public contract; the outbox table lets you publish deliberate events instead.</li>
+</ul>
+<p>The code below shows the outbox end to end with SQLite: the order and its event commit atomically, the relay crashes after publishing but before marking the row, and the consumer's deduplication absorbs the resulting duplicate.</p>
+<pre><code class="language-python">import json
+import sqlite3
+import uuid
+
+db = sqlite3.connect(":memory:")
+db.executescript("""
+CREATE TABLE orders (id INTEGER PRIMARY KEY, customer TEXT, total_cents INTEGER, status TEXT);
+CREATE TABLE outbox (seq INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT, topic TEXT,
+                     payload TEXT, published INTEGER DEFAULT 0);
+""")
+
+
+def place_order(order_id, customer, total_cents):
+    """The order row and its event commit together, or not at all. No dual write."""
+    event = {"event_id": str(uuid.uuid4()), "type": "OrderPlaced", "version": 2,
+             "order_id": order_id, "customer": customer, "total_cents": total_cents}
+    with db:  # one local ACID transaction
+        db.execute("INSERT INTO orders VALUES (?, ?, ?, 'PLACED')", (order_id, customer, total_cents))
+        db.execute("INSERT INTO outbox (event_id, topic, payload) VALUES (?, 'orders', ?)",
+                   (event["event_id"], json.dumps(event)))
+
+
+def relay(publish, crash_after_publish=False):
+    """Poll the outbox in order and publish. Debezium does this by tailing the WAL instead."""
+    rows = db.execute("SELECT seq, topic, payload FROM outbox WHERE published = 0 ORDER BY seq").fetchall()
+    for seq, topic, payload in rows:
+        publish(topic, json.loads(payload))
+        if crash_after_publish:
+            print("relay crashed after publishing, before marking the row")
+            return
+        with db:
+            db.execute("UPDATE outbox SET published = 1 WHERE seq = ?", (seq,))
+
+
+processed = set()  # in production: a table written in the same transaction as the side effect
+
+
+def email_service(topic, event):
+    if event["event_id"] in processed:
+        print(f"  duplicate {event['type']} for order {event['order_id']} ignored")
+        return
+    processed.add(event["event_id"])
+    print(f"  emailing {event['customer']}: order {event['order_id']} "
+          f"for ${event['total_cents'] / 100:.2f} received")
+
+
+place_order(81723, "ana@example.com", 4200)
+place_order(81724, "raj@example.com", 1750)
+relay(email_service, crash_after_publish=True)   # publishes 81723, dies before marking it
+print("relay restarted")
+relay(email_service)                             # republishes 81723 (at-least-once), then 81724
+print("unpublished rows left:", db.execute("SELECT COUNT(*) FROM outbox WHERE published = 0").fetchone()[0])</code></pre>
+<p>Output:</p>
+<pre><code class="language-text">  emailing ana@example.com: order 81723 for $42.00 received
+relay crashed after publishing, before marking the row
+relay restarted
+  duplicate OrderPlaced for order 81723 ignored
+  emailing raj@example.com: order 81724 for $17.50 received
+unpublished rows left: 0</code></pre>
+<p>The outbox makes publishing reliable, not exactly-once. That is why the event id in the envelope matters: it is the key every consumer uses to discard the duplicate. The <a href="idempotency.html">Idempotency</a> chapter covers storing that key atomically with the side effect.</p>
+
+<h2 id="pitfalls">Pitfalls</h2>
+<div class="defs">
+<div><h4>Event storms</h4><p>A consumer reacts to an event by emitting events that other consumers react to, sometimes in a cycle. A bulk import of 2 million products fires 2 million <code>ProductUpdated</code> events, each triggering search reindexing, cache invalidation and recommendation recomputation. Guard with batch events for bulk operations, rate limits on consumers, and loop detection via causation chains.</p></div>
+<div><h4>Hidden coupling</h4><p>Services look decoupled but rely on unstated facts: that <code>PaymentCaptured</code> always follows <code>OrderPlaced</code> within a minute, or that a field is never null. The coupling is still there, just invisible to the compiler. Document contracts, test them with consumer-driven contract tests, and keep a catalogue of who consumes what.</p></div>
+<div><h4>Ordering</h4><p>Events about one entity can arrive out of order across partitions, after retries, or from different producers. Key events by entity id so they share a partition, carry a per-entity version number, and make consumers ignore stale versions.</p></div>
+<div><h4>Duplicates</h4><p>Every hop is at-least-once: the outbox relay, the broker, the consumer's offset commit. Every consumer needs an idempotency strategy, usually a processed-event table keyed by event id or a natural idempotent write.</p></div>
+<div><h4>Lost failures</h4><p>A consumer that fails puts the event in a DLQ, and the user's order stays "confirming payment" forever. Every saga step needs a timeout, and stuck flows need an alert and a dashboard.</p></div>
+<div><h4>Distributed monolith</h4><p>If every feature still needs coordinated changes to five services and their events, the system has the costs of distribution and the coupling of a monolith. See <a href="microservices.html">Monolith vs Microservices</a>.</p></div>
+</div>
+
+<h2 id="worked-example">Worked example: the order-placed flow</h2>
+<p>An online retailer takes 3 million orders per day, with flash sales peaking at 10 times the average rate. The flow: the order service accepts the order (outbox), an orchestrated saga charges payment and reserves stock, and on confirmation an <code>OrderConfirmed</code> event fans out by choreography to email, search, analytics and loyalty. Each order produces about 8 events over its lifetime (placed, payment authorised, stock reserved, confirmed, shipment created, shipped, delivered, plus one notification event), averaging 1 KB.</p>
+<div class="calc">Orders           3,000,000 / 86,400 s                ≈ 35/s average, <span class="r">~350/s peak</span>
+Events           3M × 8 = 24M/day                    ≈ 280/s average, <span class="r">~2,800/s peak</span>
+Bandwidth        2,800/s × 1 KB                      ≈ 2.8 MB/s peak: small for any broker
+Inventory        50 reservations/s per consumer (20 ms DB write each)
+                 350 / 50 = 7 consumers  →  <span class="r">12 partitions</span> on order.events for headroom
+Retention        24 GB/day × 7 days × 3 replicas     ≈ 504 GB
+Outbox rows      ~3 per order × 3M                   = 9M rows/day, deleted after 24 h
+
+Latency budget for "order confirmed" (p99)
+  outbox → Kafka via CDC          ~ 50 ms
+  saga: ChargeCard → reply         ~ 800 ms   (payment provider dominates)
+  saga: ReserveStock → reply       ~ 60 ms
+  OrderConfirmed → push to browser ~ 100 ms
+  total                            ≈ <span class="r">~1 s</span>, so the UI shows "confirming" briefly, then flips</div>
+<p>The numbers show where the design effort belongs. Throughput is trivial; a three-broker cluster is mostly idle. What matters is the correctness machinery: the outbox, idempotent consumers keyed by event id, per-step timeouts in the saga (if payment has not replied in 30 seconds, query the provider, then compensate), and a clear UX for the second during which the order is neither confirmed nor failed. During a flash sale the risk is not the broker but the inventory consumer's database contention on hot SKUs, which keying the ReserveStock commands by SKU (one command per order line) keeps serialised per SKU.</p>
+
+<h2 id="tradeoffs">Trade-offs at a glance</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>You gain</th><th>You pay</th></tr></thead>
+<tbody>
+<tr><td>Producers do not know their consumers; new reactions need no producer change</td><td>The end-to-end flow is not visible in any single codebase</td></tr>
+<tr><td>Temporal decoupling: consumers can be down without failing the producer</td><td>Eventual consistency, visible to users unless the UX is designed for it</td></tr>
+<tr><td>Natural audit trail and replay of business facts</td><td>Event schemas become long-lived public contracts that must evolve compatibly</td></tr>
+<tr><td>Independent scaling of each consumer</td><td>Duplicates, reordering and DLQs to handle in every consumer</td></tr>
+<tr><td>Fewer synchronous call chains, so fewer cascading failures</td><td>Harder debugging; correlation ids, tracing and an event catalogue are mandatory</td></tr>
+</tbody></table></div>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+<li><strong>Debezium</strong> is the standard open-source CDC engine on Kafka Connect, with connectors for PostgreSQL, MySQL, SQL Server, MongoDB and others, and a built-in outbox event router.</li>
+<li><strong>Confluent Schema Registry</strong> popularised registry-enforced compatibility for Avro, later adding Protobuf and JSON Schema. <strong>AWS Glue Schema Registry</strong> and <strong>Apicurio</strong> fill the same role.</li>
+<li><strong>Amazon EventBridge</strong> is a managed event bus with content-based routing rules, a schema registry that can infer schemas from traffic, and archive and replay.</li>
+<li><strong>Temporal</strong> (from the creators of Uber's Cadence), <strong>AWS Step Functions</strong> and <strong>Netflix Conductor</strong> are orchestration engines: they persist workflow state after every step so a saga survives process crashes and can wait for days.</li>
+<li><strong>CloudEvents</strong>, a CNCF specification, standardises the event envelope so that events can move between brokers, clouds and serverless platforms with the same metadata.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>When one action triggers several independent follow-ups (order placed, user signed up, video uploaded), or when a multi-service process needs to survive partial failures. State the pattern precisely: "The order service writes the order and an <code>OrderPlaced</code> outbox row in one transaction; Debezium publishes it; fulfilment is an orchestrated saga with compensations; notifications and analytics subscribe by choreography." It fits the <a href="notification-system.html">notification system</a>, <a href="ride-sharing.html">ride-sharing</a> and <a href="video-streaming.html">video platform</a> cases.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>How do you update the database and publish the event atomically? (Transactional outbox, polling or CDC.)</li>
+<li>Choreography or orchestration for this flow, and why?</li>
+<li>Payment succeeded but stock is gone. What happens? (Compensating refund, triggered by the saga.)</li>
+<li>How do you change an event's schema without breaking consumers? (Registry, compatibility mode, additive changes with defaults, new event version for breaking changes.)</li>
+<li>A user says their order is stuck. How do you find out where? (Correlation id, trace, saga state, DLQs.)</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>Writing to the database and then publishing to Kafka in the request handler, with no answer for a crash in between.</li>
+<li>Assuming events arrive exactly once and in order.</li>
+<li>Choreographing a long, failure-prone business process with no owner, no timeouts and no compensation plan.</li>
+<li>Publishing raw database change events as the public contract between teams.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://martinfowler.com/articles/201701-event-driven.html" target="_blank" rel="noopener">What do you mean by "Event-Driven"?</a><span>Martin Fowler, 2017. Event notification, event-carried state transfer, event sourcing and CQRS, and why they should not be confused.</span></li>
+<li><a href="https://microservices.io/patterns/data/transactional-outbox.html" target="_blank" rel="noopener">Pattern: Transactional outbox</a><span>Chris Richardson, microservices.io. The dual-write problem and the outbox, with polling and log-tailing relays.</span></li>
+<li><a href="https://debezium.io/documentation/" target="_blank" rel="noopener">Debezium documentation</a><span>Log-based change data capture connectors and the outbox event router.</span></li>
+<li><a href="https://docs.confluent.io/platform/current/schema-registry/fundamentals/schema-evolution.html" target="_blank" rel="noopener">Schema Evolution and Compatibility</a><span>Confluent documentation. Backward, forward, full and transitive modes, and which changes each allows for Avro, Protobuf and JSON Schema.</span></li>
+<li><a href="https://cloudevents.io/" target="_blank" rel="noopener">CloudEvents</a><span>CNCF specification for a common event envelope across brokers and platforms.</span></li>
+</ul>
