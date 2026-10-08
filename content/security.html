@@ -1,0 +1,443 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">Every request that reaches your system carries a claim: "I am user 8412, and I want to read order 77310." Security is the machinery that checks both halves of that sentence on every request, protects the data while it moves and while it sits on disk, and keeps working when one layer is bypassed.</p>
+<p>Treat the cryptography as well-tested building blocks. Your job is to assemble them correctly, and most real breaches come from assembly mistakes, not broken ciphers.</p>
+
+<h2 id="authn-authz">Authentication vs authorization</h2>
+<p><dfn>Authentication</dfn> (authn) answers "who is this?" It turns a credential (a password, a passkey, a certificate, a signed token) into a verified identity such as <code>user_8412</code> or <code>spiffe://prod/ns/billing/sa/invoicer</code>. <dfn>Authorization</dfn> (authz) answers "may this identity do this action on this resource?" It takes the identity, the action and the resource, and returns allow or deny.</p>
+<p>They fail differently, which is why it pays to keep them apart in your head and in your code:</p>
+<ul>
+<li>HTTP says so explicitly: <code>401 Unauthorized</code> means "I do not know who you are" (despite the name, it is about authentication), and <code>403 Forbidden</code> means "I know who you are, and the answer is no."</li>
+<li>Authentication is usually centralized: one identity provider, one login page, one token format. Authorization is spread out, because only the orders service knows that order 77310 belongs to user 8412.</li>
+<li>Authentication bugs tend to be loud (nobody can log in). Authorization bugs are silent: one user reads another user's invoices by changing an id in the URL.</li>
+</ul>
+
+<h2 id="passwords">Storing passwords</h2>
+<p>If your system stores passwords, assume the database will leak one day, through a backup, a misconfigured replica or an SQL injection. The goal of password storage is that a leaked table does not hand the attacker the passwords, and that cracking them costs so much that most survive.</p>
+
+<h3 id="hash-and-salt">Hash, salt, and make it slow</h3>
+<p>Three rules, each closing a specific attack:</p>
+<ol class="steps">
+<li><strong>Never store the password, store a one-way hash.</strong> At login, hash what the user typed and compare. Encryption is the wrong tool, because whoever holds the key can decrypt every password at once.</li>
+<li><strong>Add a unique random <dfn>salt</dfn> per user.</strong> A salt is 16 or so random bytes stored next to the hash and mixed into it. Without salts, two users with the password <code>Summer2026!</code> have the same hash, and an attacker can use a precomputed table (a <dfn>rainbow table</dfn>) to reverse common hashes instantly. With salts, every hash must be attacked separately.</li>
+<li><strong>Use a deliberately slow, memory-hard function.</strong> SHA-256 is designed to be fast, which is exactly wrong here: the attacker's cost per guess is your cost per login. Password hashing functions have a tunable work factor so each guess costs tens of milliseconds and, for the memory-hard ones, tens of megabytes of RAM, which is what makes GPUs and custom chips much less effective.</li>
+</ol>
+<p>Measured on one laptop core with Python's <code>hashlib</code>, the gap between a fast hash and a password hash is enormous:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Function</th><th class="num">Time per hash</th><th class="num">Guesses per second per core</th><th class="num">8-char <code>[a-z0-9]</code> space (2.8 × 10<sup>12</sup>)</th></tr></thead>
+<tbody>
+<tr><th>SHA-256 + salt</th><td class="num">0.0002 ms</td><td class="num">~4.8 million</td><td class="no num">~6.8 days on one core, minutes on a GPU</td></tr>
+<tr><th>PBKDF2-HMAC-SHA256, 600,000 iterations</th><td class="num">~44 ms</td><td class="num">~23</td><td class="meh num">~4,000 core-years</td></tr>
+<tr><th>scrypt, N = 2<sup>17</sup>, r = 8, p = 1 (128 MiB)</th><td class="num">~189 ms</td><td class="num">~5</td><td class="yes num">~16,900 core-years, and memory-bound on GPUs</td></tr>
+</tbody></table></div>
+<p>Attackers try leaked password lists before brute force, so weak passwords fall even against a slow hash. The slow hash buys time for everyone else, and time to force resets.</p>
+
+<h3 id="which-hash">Which function to choose</h3>
+<div class="defs">
+<div><h4>Argon2id</h4><p>Winner of the 2015 Password Hashing Competition and the first choice in OWASP's guidance. Tunable memory, iterations and parallelism. OWASP's minimum is 19 MiB of memory, 2 iterations, parallelism 1.</p></div>
+<div><h4>scrypt</h4><p>Memory-hard, older than Argon2, available in many standard libraries (including Python's <code>hashlib</code>). A good choice when Argon2 is not available.</p></div>
+<div><h4>bcrypt</h4><p>From 1999, still widely used and acceptable with a cost of 10 or more. Not memory-hard, and it silently ignores input beyond 72 bytes, so long passphrases are truncated.</p></div>
+<div><h4>PBKDF2</h4><p>Iterated HMAC. Not memory-hard, so GPUs love it, but it is the one to use when FIPS-140 compliance is required. OWASP recommends 600,000 iterations with SHA-256.</p></div>
+</div>
+<p>Two operational details matter in a design. First, store the algorithm and parameters with each hash (the standard encodings such as <code>$argon2id$v=19$m=19456,t=2,p=1$...</code> do this), so you can raise the cost later and rehash each user at their next successful login. Second, password hashing is CPU and memory heavy on purpose. A login endpoint doing 2,000 logins per second at 50 ms of CPU each needs about 100 cores just for hashing, and is an easy denial-of-service target, so put it behind a <a href="rate-limiting.html">rate limiter</a> and lock out or slow down repeated failures per account and per IP.</p>
+<div class="callout note">
+<div class="callout-title">Better: do not store passwords at all</div>
+<p>Delegating login to an identity provider (OIDC, below) or using passkeys (WebAuthn, where the user's device holds a private key and the server stores only the public key) removes the password table entirely. A leaked public key is useless to an attacker. For a new system, say this out loud.</p>
+</div>
+
+<h2 id="sessions-tokens">Sessions vs tokens</h2>
+<p>After login, the user should not send a password on every request. The server issues something the client presents instead. There are two families.</p>
+<p>A <dfn>session</dfn> is server-side state. The server generates a random, unguessable session id (128 bits or more), stores <code>session_id → {user_id, expires_at, ...}</code> in a database or Redis, and sends the id in a cookie marked <code>HttpOnly</code> (JavaScript cannot read it), <code>Secure</code> (HTTPS only) and <code>SameSite=Lax</code> or <code>Strict</code> (not sent on most cross-site requests, which blunts CSRF). Every request costs a lookup, and logging out is a delete.</p>
+<p>A <dfn>self-contained token</dfn> carries the identity and its claims inside itself, signed so that any service holding the verification key can check it without a lookup. The most common format is the JWT.</p>
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Server-side session</th><th>Signed token (JWT)</th></tr></thead>
+<tbody>
+<tr><th>Validation cost</th><td class="meh">A store lookup per request (sub-millisecond from Redis)</td><td class="yes">A signature check, no network call</td></tr>
+<tr><th>Revocation</th><td class="yes">Delete the row; effective immediately</td><td class="no">Valid until it expires unless you add a denylist</td></tr>
+<tr><th>Works across services and domains</th><td class="meh">Every service needs access to the session store</td><td class="yes">Any service with the public key can verify</td></tr>
+<tr><th>Size on the wire</th><td class="yes">~32 bytes of id</td><td class="meh">Often 500 bytes to over 1 KB per request</td></tr>
+<tr><th>Data freshness</th><td class="yes">Roles read from the store are current</td><td class="no">Roles baked in at issue time can go stale</td></tr>
+<tr><th>Best fit</th><td>A browser talking to its own web app</td><td>APIs, mobile apps, service-to-service calls, federation</td></tr>
+</tbody></table></div>
+<p>Production systems often use both: a session cookie from the browser to the edge, exchanged there for a short-lived token that travels between internal services.</p>
+
+<h2 id="jwt">JSON Web Tokens</h2>
+<p>A <dfn>JWT</dfn> (RFC 7519) is three base64url-encoded parts joined by dots: a header, a payload of <dfn>claims</dfn>, and a signature over the first two. The header and payload are <strong>encoded, not encrypted</strong>. Anyone holding the token can read them, so never put secrets or personal data you would not show the user into a JWT.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 270" role="img" aria-label="Anatomy of a JWT: header, payload and signature segments, each decoded below; the signature is an HMAC or RSA signature over the first two parts">
+<text class="t xs mute mid" x="105" y="16">header</text>
+<text class="t xs mute mid" x="350" y="16">payload</text>
+<text class="t xs mute mid" x="605" y="16">signature</text>
+<rect class="n svc" x="20" y="24" width="170" height="32" rx="6"/><text class="t mono mid" x="105" y="44">eyJhbGciOiJIUzI1...</text>
+<text class="t b mid" x="197" y="45">.</text>
+<rect class="n cache" x="205" y="24" width="290" height="32" rx="6"/><text class="t mono mid" x="350" y="44">eyJzdWIiOiJ1c2VyXzg0MTIiLCJhdWQi...</text>
+<text class="t b mid" x="502" y="45">.</text>
+<rect class="n db" x="510" y="24" width="190" height="32" rx="6"/><text class="t mono mid" x="605" y="44">kYYjcc46cOLTXhF5...</text>
+<path class="e dash" d="M105,56 V88"/>
+<path class="e dash" d="M350,56 V88"/>
+<path class="e dash" d="M605,56 V88"/>
+<text class="t xs mute" x="111" y="77">base64url decode</text>
+<text class="t xs mute" x="356" y="77">base64url decode</text>
+<text class="t xs mute" x="611" y="77">computed as</text>
+<rect class="n ghost" x="20" y="92" width="170" height="64" rx="6"/>
+<text class="t mono" x="34" y="116">"alg": "HS256",</text>
+<text class="t mono" x="34" y="136">"typ": "JWT"</text>
+<rect class="n ghost" x="205" y="92" width="290" height="124" rx="6"/>
+<text class="t mono" x="219" y="116">"sub": "user_8412",</text>
+<text class="t mono" x="219" y="136">"aud": "orders-api",</text>
+<text class="t mono" x="219" y="156">"scope": "orders:read",</text>
+<text class="t mono" x="219" y="176">"iat": 1791504000,</text>
+<text class="t mono" x="219" y="196">"exp": 1791504900</text>
+<rect class="n ghost" x="510" y="92" width="190" height="104" rx="6"/>
+<text class="t mono" x="522" y="116">HMAC-SHA256(</text>
+<text class="t mono" x="536" y="136">key,</text>
+<text class="t mono" x="536" y="156">header + "." +</text>
+<text class="t mono" x="536" y="176">payload)</text>
+<text class="t xs mute mid" x="105" y="176">which algorithm</text>
+<text class="t xs mute mid" x="105" y="190">verifies it</text>
+<text class="t xs mute mid" x="605" y="214">RS256 / ES256: signed with a</text>
+<text class="t xs mute mid" x="605" y="228">private key, checked with public</text>
+<text class="t sm mid" x="360" y="256">Anyone can read the first two parts. Only a holder of the signing key can produce the third.</text>
+</svg>
+</div>
+<figcaption><b>Anatomy of a JWT.</b> The signature covers the exact encoded bytes of header and payload, so changing one character of the payload (for example <code>orders:read</code> to <code>orders:admin</code>) invalidates it.</figcaption>
+</figure>
+
+<h3 id="jwt-claims">Claims and signing algorithms</h3>
+<p>The registered claims are short on purpose: <code>iss</code> (issuer), <code>sub</code> (subject, the user or service), <code>aud</code> (audience, which service the token is for), <code>exp</code> (expiry, Unix seconds), <code>nbf</code> (not before), <code>iat</code> (issued at) and <code>jti</code> (a unique token id). Applications add their own, such as <code>scope</code> or <code>tenant_id</code>.</p>
+<p>The signing algorithm decides who can verify. <code>HS256</code> is HMAC with a shared secret: whoever can verify can also mint tokens, so it only fits when issuer and verifier are the same service. <code>RS256</code> (RSA) and <code>ES256</code> (ECDSA P-256) use a private key to sign and a public key to verify, so the identity provider keeps the private key and publishes public keys at a <dfn>JWKS</dfn> (JSON Web Key Set) endpoint. Every service fetches and caches them, and the <code>kid</code> header says which key signed a token, which is what makes key rotation possible without downtime.</p>
+
+<h3 id="jwt-validation">Validating a token correctly</h3>
+<p>Most JWT vulnerabilities are validation shortcuts. A correct validator does all of these, in this order:</p>
+<ol class="steps">
+<li><strong>Pin the algorithm.</strong> Accept only the algorithm you expect. Two classic attacks come from trusting the header: <code>"alg": "none"</code> (an unsigned token that weak libraries accepted), and algorithm confusion, where a server expecting RS256 is handed an HS256 token that was HMAC-signed using the server's own <em>public</em> key as the secret.</li>
+<li><strong>Verify the signature</strong> with the key named by <code>kid</code> from your trusted JWKS, using a constant-time comparison for HMAC.</li>
+<li><strong>Check the claims</strong>: <code>exp</code> and <code>nbf</code> with a small clock-skew allowance (30 to 60 seconds), <code>iss</code> equals your identity provider, and <code>aud</code> equals <em>this</em> service. Skipping the audience check means a token issued for a low-value service can be replayed against a high-value one.</li>
+<li><strong>Then authorize</strong>: a valid token proves identity and carries scopes; whether this user may read this specific order is still your service's decision.</li>
+</ol>
+
+<h3 id="jwt-revocation">The revocation problem, and access plus refresh tokens</h3>
+<p>A self-contained token is valid until <code>exp</code>, and no lookup happens, so there is nowhere to say "this one is cancelled." If an employee is fired or a laptop is stolen, a token with a 24-hour expiry keeps working for up to 24 hours. The options:</p>
+<ul>
+<li><strong>Keep access tokens short-lived</strong>, typically 5 to 15 minutes. Revocation then takes effect within one lifetime.</li>
+<li><strong>Pair them with a long-lived <dfn>refresh token</dfn></strong> that the client exchanges for a new access token. The refresh token is checked against a database on every use, so it <em>can</em> be revoked immediately. You get stateless validation on the hot path (every API call) and a stateful check on the cold path (once per 15 minutes per client).</li>
+<li><strong>Rotate refresh tokens</strong>: each use returns a new refresh token and invalidates the old one. If an old one is ever presented again, someone copied it, so revoke the whole family and force a new login.</li>
+<li><strong>A denylist of revoked <code>jti</code> values</strong> for emergencies, held in memory or Redis. It only needs entries until their tokens would have expired anyway, so it stays small. It does reintroduce a lookup, which is the price of instant revocation.</li>
+</ul>
+<p>For browsers, keep tokens out of <code>localStorage</code>, where any injected script can read them. An <code>HttpOnly</code> cookie, or a backend-for-frontend that holds tokens server-side and gives the browser only a session cookie, removes that exposure.</p>
+
+<h3 id="token-code">A signed token in 40 lines</h3>
+<p>The mechanics are simple enough to write with the standard library, which makes the validation rules concrete. This is a <strong>teaching example, not production code</strong>: real systems should use a maintained library and, across services, asymmetric keys.</p>
+<pre><code class="language-python"># TEACHING EXAMPLE ONLY. In production use a vetted library (PyJWT, jose, a platform SDK).
+import base64
+import hashlib
+import hmac
+import json
+
+HEADER = {"alg": "HS256", "typ": "JWT"}
+
+
+def b64url(raw: bytes) -&gt; str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def unb64url(text: str) -&gt; bytes:
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+def sign(claims: dict, key: bytes) -&gt; str:
+    head = b64url(json.dumps(HEADER, separators=(",", ":")).encode())
+    body = b64url(json.dumps(claims, separators=(",", ":")).encode())
+    mac = hmac.new(key, f"{head}.{body}".encode(), hashlib.sha256).digest()
+    return f"{head}.{body}.{b64url(mac)}"
+
+
+def verify(token: str, key: bytes, now: int, audience: str) -&gt; dict:
+    try:
+        head, body, sig = token.split(".")
+    except ValueError:
+        raise ValueError("malformed token")
+    # 1. Pin the algorithm: never let the token choose how it is checked.
+    if json.loads(unb64url(head)) != HEADER:
+        raise ValueError("unexpected header")
+    # 2. Check the signature in constant time BEFORE trusting any claim.
+    expected = hmac.new(key, f"{head}.{body}".encode(), hashlib.sha256).digest()
+    if not hmac.compare_digest(expected, unb64url(sig)):
+        raise ValueError("bad signature")
+    claims = json.loads(unb64url(body))
+    # 3. Only now check the claims.
+    if claims["exp"] &lt;= now:
+        raise ValueError("expired")
+    if claims["aud"] != audience:
+        raise ValueError("wrong audience")
+    return claims
+
+
+key = bytes.fromhex("8f2b6c1e9d4a7f3b0c5e8a1d6f2b9c4e7a0d3f6b1c8e5a2d9f4b7c0e3a6d1f8b")
+now = 1_791_504_000                       # 2026-10-09 00:00:00 UTC
+token = sign({"sub": "user_8412", "aud": "orders-api", "scope": "orders:read",
+              "iat": now, "exp": now + 900}, key)
+print(token)
+print(verify(token, key, now + 60, "orders-api")["sub"])
+
+head, body, sig = token.split(".")
+forged = b64url(unb64url(body).replace(b"orders:read", b"orders:admin"))
+for label, tok, t in [("tampered", f"{head}.{forged}.{sig}", now + 60),
+                      ("expired", token, now + 901),
+                      ("wrong key", sign({"sub": "x", "aud": "orders-api", "exp": now + 900}, b"guess"), now)]:
+    try:
+        verify(tok, key, t, "orders-api")
+    except ValueError as err:
+        print(f"{label:9} -&gt; rejected: {err}")</code></pre>
+<p>Real output:</p>
+<pre><code class="language-text">eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyXzg0MTIiLCJhdWQiOiJvcmRlcnMtYXBpIiwic2NvcGUiOiJvcmRlcnM6cmVhZCIsImlhdCI6MTc5MTUwNDAwMCwiZXhwIjoxNzkxNTA0OTAwfQ.kYYjcc46cOLTXhF5NuL_FEa7CI3qr9PVmfwGb3ZI9vM
+user_8412
+tampered  -&gt; rejected: bad signature
+expired   -&gt; rejected: expired
+wrong key -&gt; rejected: bad signature</code></pre>
+<p>Note the order inside <code>verify</code>: the header is pinned before anything else, the signature is checked before any claim is trusted, and <code>hmac.compare_digest</code> takes the same time whether the first byte or the last byte differs, so an attacker cannot learn the correct signature byte by byte from response timing.</p>
+
+<h2 id="oauth">OAuth 2.0 and OpenID Connect</h2>
+<p><dfn>OAuth 2.0</dfn> (RFC 6749) is a framework for <em>delegated authorization</em>: a user lets an application act on their behalf at some API, without giving the application their password. "Let this budgeting app read my bank transactions" is the canonical case. Four roles take part: the <dfn>resource owner</dfn> (the user), the <dfn>client</dfn> (the app), the <dfn>authorization server</dfn> (which logs the user in and issues tokens) and the <dfn>resource server</dfn> (the API).</p>
+<p>OAuth defines several flows, called grants. For anything with a user, the answer today is the <strong>authorization code grant with PKCE</strong>. The implicit grant (tokens returned directly in the browser URL) and the password grant (the app collects the user's password) should no longer be used, per the OAuth 2.0 Security Best Current Practice (RFC 9700, 2025). For machine-to-machine calls with no user, the <strong>client credentials grant</strong> lets a service authenticate as itself and get a token.</p>
+
+<h3 id="pkce">Authorization code with PKCE</h3>
+<p><dfn>PKCE</dfn> (Proof Key for Code Exchange, RFC 7636, pronounced "pixie") closes a specific hole. The authorization code comes back through a browser redirect, where malicious apps registered for the same custom URL scheme, browser extensions or logs might capture it. PKCE binds the code to a secret that never leaves the client, so a captured code cannot be redeemed. Step through the flow:</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 446" role="img" aria-label="Sequence diagram of the OAuth 2.0 authorization code flow with PKCE between browser, client app, authorization server and API">
+<rect class="n client" x="20" y="16" width="120" height="36" rx="7"/><text class="t sm b mid" x="80" y="39">Browser</text>
+<rect class="n svc" x="190" y="16" width="120" height="36" rx="7"/><text class="t sm b mid" x="250" y="39">Client app</text>
+<rect class="n ext" x="390" y="16" width="120" height="36" rx="7"/><text class="t sm b mid" x="450" y="39">Auth server</text>
+<rect class="n db" x="580" y="16" width="120" height="36" rx="7"/><text class="t sm b mid" x="640" y="39">API</text>
+<path class="line faint" d="M80,52 V392 M250,52 V392 M450,52 V392 M640,52 V392" style="stroke-dasharray:3 4"/>
+<g data-show="1"><rect class="n good" x="135" y="72" width="231" height="42" rx="6"/><text class="t sm mid" x="250" y="91">code_verifier = 64 random chars</text><text class="t sm mid" x="250" y="107">code_challenge = b64url(sha256(v))</text></g>
+<g data-show="2 3 4 5"><rect class="n ghost" x="135" y="72" width="231" height="42" rx="6"/><text class="t sm mid" x="250" y="91">code_verifier = 64 random chars</text><text class="t sm mid" x="250" y="107">code_challenge = b64url(sha256(v))</text></g>
+<g data-show="1"><path class="e accent" d="M250,138 H84"/><rect x="108" y="119" width="113" height="15" rx="3" style="fill:var(--surface)"/><text class="t sm accent mid" x="165" y="131">302 to /authorize</text></g>
+<g data-show="2 3 4 5"><path class="e" d="M250,138 H84"/><rect x="108" y="119" width="113" height="15" rx="3" style="fill:var(--surface)"/><text class="t sm mid" x="165" y="131">302 to /authorize</text></g>
+<g data-show="2"><path class="e accent" d="M80,164 H446"/><rect x="156" y="145" width="219" height="15" rx="3" style="fill:var(--surface)"/><text class="t sm accent mid" x="265" y="157">GET /authorize + challenge + state</text></g>
+<g data-show="3 4 5"><path class="e" d="M80,164 H446"/><rect x="156" y="145" width="219" height="15" rx="3" style="fill:var(--surface)"/><text class="t sm mid" x="265" y="157">GET /authorize + challenge + state</text></g>
+<g data-show="2"><rect class="n good" x="403" y="180" width="94" height="42" rx="6"/><text class="t sm mid" x="450" y="199">user logs in</text><text class="t sm mid" x="450" y="215">and consents</text></g>
+<g data-show="3 4 5"><rect class="n ghost" x="403" y="180" width="94" height="42" rx="6"/><text class="t sm mid" x="450" y="199">user logs in</text><text class="t sm mid" x="450" y="215">and consents</text></g>
+<g data-show="3"><path class="e dash accent" d="M450,238 H84"/><rect x="152" y="219" width="225" height="15" rx="3" style="fill:var(--surface)"/><text class="t sm accent mid" x="265" y="231">302 redirect_uri?code=Splx...&amp;state</text></g>
+<g data-show="4 5"><path class="e dash" d="M450,238 H84"/><rect x="152" y="219" width="225" height="15" rx="3" style="fill:var(--surface)"/><text class="t sm mid" x="265" y="231">302 redirect_uri?code=Splx...&amp;state</text></g>
+<g data-show="3"><path class="e accent" d="M80,268 H246"/><rect x="105" y="249" width="120" height="15" rx="3" style="fill:var(--surface)"/><text class="t sm accent mid" x="165" y="261">GET /callback?code</text></g>
+<g data-show="4 5"><path class="e" d="M80,268 H246"/><rect x="105" y="249" width="120" height="15" rx="3" style="fill:var(--surface)"/><text class="t sm mid" x="165" y="261">GET /callback?code</text></g>
+<g data-show="4"><path class="e accent" d="M250,298 H446"/><rect x="262" y="279" width="175" height="15" rx="3" style="fill:var(--surface)"/><text class="t sm accent mid" x="350" y="291">POST /token code + verifier</text></g>
+<g data-show="5"><path class="e" d="M250,298 H446"/><rect x="262" y="279" width="175" height="15" rx="3" style="fill:var(--surface)"/><text class="t sm mid" x="350" y="291">POST /token code + verifier</text></g>
+<g data-show="4"><path class="e dash accent" d="M450,328 H254"/><rect x="268" y="309" width="163" height="15" rx="3" style="fill:var(--surface)"/><text class="t sm accent mid" x="350" y="321">access, refresh, id token</text></g>
+<g data-show="5"><path class="e dash" d="M450,328 H254"/><rect x="268" y="309" width="163" height="15" rx="3" style="fill:var(--surface)"/><text class="t sm mid" x="350" y="321">access, refresh, id token</text></g>
+<g data-show="5"><path class="e accent" d="M250,358 H636"/><rect x="360" y="339" width="169" height="15" rx="3" style="fill:var(--surface)"/><text class="t sm accent mid" x="445" y="351">GET /orders  Bearer eyJ...</text></g>
+<g data-show="5"><path class="e dash accent" d="M640,384 H254"/><rect x="422" y="365" width="45" height="15" rx="3" style="fill:var(--surface)"/><text class="t sm accent mid" x="445" y="377">200 OK</text></g>
+<g data-show="1"><text class="t sm mid" x="360" y="418">The app creates a one-time secret, the code_verifier, and keeps it. Only its SHA-256 hash,</text><text class="t sm mid" x="360" y="434">the code_challenge, goes into the authorize URL, with a random state value.</text></g>
+<g data-show="2"><text class="t sm mid" x="360" y="418">The user signs in at the authorization server, never inside the app. The server remembers</text><text class="t sm mid" x="360" y="434">the challenge alongside the pending request.</text></g>
+<g data-show="3"><text class="t sm mid" x="360" y="418">The server redirects back with a short-lived, single-use code. The app rejects the</text><text class="t sm mid" x="360" y="434">callback unless state matches what it sent, which blocks login CSRF.</text></g>
+<g data-show="4"><text class="t sm mid" x="360" y="418">The app redeems the code together with the verifier. The server checks that</text><text class="t sm mid" x="360" y="434">b64url(sha256(verifier)) equals the stored challenge, so an intercepted code is useless.</text></g>
+<g data-show="5"><text class="t sm mid" x="360" y="418">The app calls the API with the access token. The API checks signature, issuer,</text><text class="t sm mid" x="360" y="434">audience, expiry and scope on every request, without calling the auth server.</text></g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">1. Challenge</button><button type="button" data-step="2" aria-pressed="false">2. Login</button><button type="button" data-step="3" aria-pressed="false">3. Code</button><button type="button" data-step="4" aria-pressed="false">4. Exchange</button><button type="button" data-step="5" aria-pressed="false">5. Call API</button></div>
+</div>
+<figcaption><b>Authorization code with PKCE.</b> The highlighted messages are the current step. The two secrets travel different paths: the challenge goes through the browser, the verifier goes straight from the app to the authorization server, so intercepting one path is not enough.</figcaption>
+</figure>
+
+<p>Details that interviewers probe:</p>
+<ul>
+<li><strong>The verifier</strong> is 43 to 128 characters of high-entropy randomness. With method <code>S256</code>, the challenge is <code>BASE64URL(SHA256(verifier))</code>. The <code>plain</code> method exists but offers no protection if the authorize request itself is observed.</li>
+<li><strong><code>state</code></strong> is a random value tied to the user's browser session. Without it an attacker can complete a flow with <em>their</em> code in <em>your</em> browser and link your account to theirs.</li>
+<li><strong>Redirect URIs must match exactly</strong> against a pre-registered list. Pattern matching on redirect URIs has caused real token theft.</li>
+<li><strong>Codes are single-use and short-lived.</strong> RFC 6749 recommends a lifetime of at most 10 minutes, and many servers use under a minute. If a code is presented twice, the server should revoke the tokens already issued for it.</li>
+<li><strong>Confidential clients</strong> (a server-side web app that can keep a secret) also send a <code>client_secret</code> at the token endpoint. Public clients (single-page and mobile apps) cannot, which is why PKCE was invented; it is now recommended for every client.</li>
+</ul>
+
+<h3 id="oidc">OpenID Connect: login on top of OAuth</h3>
+<p>OAuth answers "may this app call this API?" It does not, by itself, tell the app who the user is; an access token is meant for the API, not the client. <dfn>OpenID Connect</dfn> (OIDC) adds authentication: request the <code>openid</code> scope and the token response includes an <dfn>ID token</dfn>, a JWT whose audience is the client and whose claims describe the login (<code>sub</code>, <code>iss</code>, <code>auth_time</code>, a <code>nonce</code> echoed from the request to stop replay, optionally <code>email</code> and <code>name</code>). OIDC also standardizes discovery at <code>/.well-known/openid-configuration</code>, which lists the endpoints and the JWKS URL. "Sign in with Google" and corporate single sign-on through Okta or Microsoft Entra ID are OIDC (or its older cousin, SAML).</p>
+<div class="callout warn">
+<div class="callout-title">Common mistake</div>
+<p>Sending the ID token to your API as if it were an access token. The ID token's audience is the client app; the API should only accept access tokens whose <code>aud</code> names the API. Mixing them up is how a token for one app ends up authorizing calls to another.</p>
+</div>
+
+<h2 id="api-keys">API keys</h2>
+<p>An <dfn>API key</dfn> is a long random string that identifies a calling program, typically a customer's backend. Keys are simpler than OAuth and fine for server-to-server integrations, but they are bearer secrets that rarely expire, so treat them like passwords:</p>
+<ul>
+<li><strong>Store only a hash.</strong> A key has 128+ bits of randomness, so a fast hash like SHA-256 is enough (no salt or slow function needed, because there is no dictionary to guess from). Show the key to the customer once, at creation.</li>
+<li><strong>Give keys a recognizable prefix</strong>, as Stripe (<code>sk_live_</code>) and GitHub (<code>ghp_</code>) do. Secret scanners in code hosts can then spot leaked keys and alert or revoke them automatically, and support staff can tell a test key from a live one at a glance.</li>
+<li><strong>Scope and expire them</strong>: per-key permissions, per-key <a href="rate-limiting.html">rate limits</a>, a last-used timestamp, and support for two active keys at once so customers can rotate without downtime.</li>
+</ul>
+
+<h2 id="service-to-service">Service-to-service: TLS and mTLS</h2>
+<p><dfn>TLS</dfn> gives a connection confidentiality, integrity and server authentication. In TLS 1.3 the client sends its key share in the first message, so the handshake completes in one round trip before application data flows; the server proves its identity with a certificate chained to a trusted certificate authority and a signature over the handshake. The <a href="network-protocols.html">TCP, UDP &amp; HTTP</a> chapter covers the round trips and the 0-RTT resumption trade-off.</p>
+<p>Ordinary TLS authenticates only the server. <dfn>Mutual TLS</dfn> (mTLS) makes the client present a certificate too, so both sides know who they are talking to. It replaces "anything inside the VPC is trusted" with "every call carries a verifiable workload identity", the core of <dfn>zero trust</dfn> networking.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 250" role="img" aria-label="Two services with sidecar proxies establish mutual TLS using short-lived certificates issued by a mesh certificate authority; the receiving side checks an authorization policy on the caller identity">
+<rect class="n ext" x="270" y="16" width="180" height="50" rx="8"/><text class="t b mid" x="360" y="38">Mesh CA</text><text class="t xs mute mid" x="360" y="54">issues 24 h certs, auto-rotated</text>
+<rect class="zone" x="20" y="100" width="290" height="110" rx="10"/>
+<text class="t xs mute" x="32" y="118">pod: checkout</text>
+<rect class="n svc" x="36" y="130" width="110" height="54" rx="8"/><text class="t b mid" x="91" y="155">checkout</text><text class="t xs mute mid" x="91" y="171">plain HTTP</text>
+<rect class="n cache" x="184" y="130" width="110" height="54" rx="8"/><text class="t b mid" x="239" y="155">sidecar</text><text class="t xs mute mid" x="239" y="171">holds cert + key</text>
+<rect class="zone" x="410" y="100" width="290" height="110" rx="10"/>
+<text class="t xs mute end" x="688" y="118">pod: payments</text>
+<rect class="n cache" x="426" y="130" width="110" height="54" rx="8"/><text class="t b mid" x="481" y="155">sidecar</text><text class="t xs mute mid" x="481" y="171">checks policy</text>
+<rect class="n svc" x="574" y="130" width="110" height="54" rx="8"/><text class="t b mid" x="629" y="155">payments</text><text class="t xs mute mid" x="629" y="171">plain HTTP</text>
+<path class="e" d="M146,157 H180"/>
+<path class="e both accent" d="M298,157 H422"/>
+<path class="flow" d="M298,157 H422"/>
+<path class="e" d="M536,157 H570"/>
+<path class="e dash" d="M300,66 C280,90 260,104 245,126"/>
+<path class="e dash" d="M420,66 C440,90 460,104 475,126"/>
+<text class="t sm accent mid" x="360" y="148">mTLS</text>
+<text class="t xs mute mid" x="360" y="176">both sides verify</text>
+<text class="t mono mid" x="360" y="232">policy at payments: allow spiffe://prod/ns/shop/sa/checkout → POST /charges</text>
+</svg>
+</div>
+<figcaption><b>mTLS in a service mesh.</b> The application code speaks plain HTTP to its local sidecar. Sidecars hold short-lived certificates that encode the workload identity, encrypt traffic between pods, and enforce which identities may call which endpoints.</figcaption>
+</figure>
+
+<p>The hard part of mTLS is not the handshake, it is certificate lifecycle: issuing a certificate to every workload, rotating it before it expires, and revoking it. Service meshes such as Istio and Linkerd automate this with an internal CA and certificates that live for about a day, so a stolen certificate is useful only briefly and revocation lists are rarely needed. <dfn>SPIFFE</dfn> standardizes the identity format (<code>spiffe://trust-domain/path</code>) so different platforms can agree on who a workload is.</p>
+<p>mTLS authenticates the <em>calling service</em>. When the call is on behalf of a user, also forward the user's identity, usually as a short-lived token, so the downstream service can apply user-level authorization and you avoid the <dfn>confused deputy</dfn> problem, where a privileged service is tricked into acting for a caller who lacks the permission.</p>
+
+<h2 id="authz-models">Authorization models</h2>
+<p>Once you know who is calling, something has to decide what they may do. Three models cover almost every system, and real systems often combine them.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Model</th><th>Decision is based on</th><th>Example rule</th><th>Strength</th><th>Weakness</th></tr></thead>
+<tbody>
+<tr><th>RBAC</th><td>Roles assigned to users</td><td>Users with role <code>support_agent</code> may read tickets</td><td class="yes">Simple to audit; maps to org charts</td><td class="no">Role explosion when access depends on the specific resource or context</td></tr>
+<tr><th>ABAC</th><td>Attributes of user, resource, action and environment</td><td>Allow if <code>user.dept == doc.dept</code> and request is from a managed device during business hours</td><td class="yes">Very expressive, context aware</td><td class="meh">Policies get hard to reason about; "who can see X?" is hard to answer</td></tr>
+<tr><th>ReBAC</th><td>Relationships in a graph</td><td>A user may view a doc if they are a viewer of it, a member of a group that is, or a viewer of its parent folder</td><td class="yes">Natural for sharing, folders, orgs and teams</td><td class="meh">Needs a dedicated, fast, consistent graph service</td></tr>
+</tbody></table></div>
+<p><dfn>Role-based access control</dfn> (RBAC) is the default for internal tools and admin consoles. <dfn>Attribute-based access control</dfn> (ABAC) is usually expressed in a policy language and evaluated by an engine such as Open Policy Agent or AWS Cedar. <dfn>Relationship-based access control</dfn> (ReBAC) is what document sharing in Google Drive, GitHub repository permissions and Notion workspaces need: "can Ana view this doc?" depends on a chain of relationships, not a single role.</p>
+
+<h3 id="zanzibar">Zanzibar and relation tuples</h3>
+<p>Google's <dfn>Zanzibar</dfn> paper (2019) describes the ReBAC system behind Drive, YouTube, Cloud and other products. Permissions are stored as <dfn>relation tuples</dfn> of the form <code>object#relation@subject</code>, and a schema says how relations imply each other ("viewers of a folder are viewers of the documents in it"). A check walks the graph.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 300" role="img" aria-label="Relationship graph: user ana is a member of group eng, eng members are viewers of doc roadmap; user li is a viewer of folder plans, which is the parent of doc roadmap; both resolve to allowed">
+<rect class="n client" x="20" y="40" width="120" height="40" rx="8"/><text class="t b mid" x="80" y="65">user:ana</text>
+<rect class="n svc" x="230" y="40" width="120" height="40" rx="8"/><text class="t b mid" x="290" y="65">group:eng</text>
+<rect class="n client" x="20" y="160" width="120" height="40" rx="8"/><text class="t b mid" x="80" y="185">user:li</text>
+<rect class="n svc" x="230" y="160" width="120" height="40" rx="8"/><text class="t b mid" x="290" y="185">folder:plans</text>
+<rect class="n db" x="460" y="100" width="140" height="40" rx="8"/><text class="t b mid" x="530" y="125">doc:roadmap</text>
+<path class="e" d="M140,60 H226"/><text class="t xs mute mid" x="183" y="52">member</text>
+<path class="e" d="M140,180 H226"/><text class="t xs mute mid" x="183" y="172">viewer</text>
+<path class="e" d="M350,60 C400,60 410,112 456,112"/><text class="t xs mute" x="404" y="74">viewer</text>
+<path class="e" d="M350,180 C400,180 410,128 456,128"/><text class="t xs mute" x="398" y="196">parent of</text>
+<text class="t sm green mid" x="530" y="166">ana: allowed via group</text>
+<text class="t sm green mid" x="530" y="184">li: allowed via folder</text>
+<path class="line faint" d="M20,224 H700"/>
+<text class="t mono" x="20" y="250">doc:roadmap#viewer@group:eng#member</text>
+<text class="t mono" x="380" y="250">group:eng#member@user:ana</text>
+<text class="t mono" x="20" y="274">doc:roadmap#parent@folder:plans</text>
+<text class="t mono" x="380" y="274">folder:plans#viewer@user:li</text>
+</svg>
+</div>
+<figcaption><b>Relationship-based access.</b> Four tuples, two ways to reach the same document. The schema rule "viewers of a parent folder can view the doc" lets the check follow the <code>parent</code> edge. Removing Ana from <code>group:eng</code> revokes her access to every doc the group can see, in one write.</figcaption>
+</figure>
+
+<p>Zanzibar's paper reports trillions of tuples, millions of checks per second, a 95th-percentile check latency under 10 ms and availability above 99.999%. Its most interesting idea is consistency. Imagine Ana removes Raj from a doc and then adds confidential content. If an authorization replica is stale and still lets Raj read the new content, that is the "new enemy" problem. Zanzibar solves it with <dfn>zookies</dfn>, opaque consistency tokens: the content write records a zookie, and later checks must be evaluated at a snapshot at least that fresh. Open-source implementations of the model include SpiceDB and OpenFGA.</p>
+<p>Wherever the decision is made, two design rules hold. <strong>Deny by default</strong>: a missing rule means no access. And <strong>enforce on the server for every request</strong>, on the object being touched; hiding a button in the UI is not authorization.</p>
+
+<h2 id="secrets">Secrets management</h2>
+<p>A <dfn>secret</dfn> is any value that grants access: database passwords, API keys, signing keys, TLS private keys. Most leaked secrets come from the same few places: committed to Git, baked into container images, printed in logs, or shared in chat. The design answer is a secrets manager (HashiCorp Vault, AWS Secrets Manager, GCP Secret Manager, Azure Key Vault) with these properties:</p>
+<ul>
+<li><strong>Central storage, encrypted, with access by workload identity.</strong> A service authenticates as itself (its cloud IAM role, Kubernetes service account or SPIFFE identity) and gets only the secrets its policy allows. No bootstrap password is baked into the image.</li>
+<li><strong>Audit logs</strong> of every read, plus secret scanning in CI so a key pushed by mistake is revoked within minutes.</li>
+<li><strong>Rotation without deploys.</strong> Applications fetch secrets at startup and refresh them, so a rotated password is picked up automatically.</li>
+<li><strong>Dynamic, short-lived credentials</strong> where possible. Vault can create a database user on request with a one-hour lease and drop it afterwards; cloud IAM roles hand out temporary credentials that expire within hours. A credential that expires on its own cannot be leaked for long.</li>
+</ul>
+
+<h2 id="encryption">Encryption in transit and at rest</h2>
+<p><strong>In transit</strong> means TLS on every hop, including internal ones: load balancer to service, service to database, service to cache. "TLS terminates at the load balancer and the inside is plaintext" was common, and is exactly what an attacker who gets onto the internal network hopes for.</p>
+<p><strong>At rest</strong> means data on disks, in backups and in object storage is encrypted with keys the storage medium does not hold. Cloud databases and object stores do this transparently, which protects against stolen disks and careless decommissioning, but not against an attacker who can query the database through the application, because the database decrypts for any authorized reader. For the most sensitive fields (card numbers, national ids, health data) add <dfn>application-level encryption</dfn>, where the service encrypts the field before it reaches the database, or <dfn>tokenization</dfn>, where the field is replaced with a meaningless token and the real value lives in a separate, tightly guarded vault.</p>
+
+<h3 id="envelope">Envelope encryption with a KMS</h3>
+<p>A <dfn>key management service</dfn> (KMS) keeps master keys inside hardware security modules (HSMs) that never export them. But you cannot send terabytes through a KMS API: AWS KMS, for example, encrypts at most 4 KB per direct call, and every call is a network round trip. <dfn>Envelope encryption</dfn> solves this with two levels of keys.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 300" role="img" aria-label="Envelope encryption: the app asks KMS for a data key, receives plaintext and wrapped copies, encrypts data locally, discards the plaintext key and stores ciphertext alongside the wrapped key">
+<rect class="zone" x="20" y="30" width="180" height="200" rx="10"/>
+<text class="t xs mute" x="32" y="48">KMS, inside HSMs</text>
+<rect class="n ext" x="40" y="70" width="140" height="56" rx="8"/><text class="t b mid" x="110" y="94">KMS API</text><text class="t xs mute mid" x="110" y="111">audited, IAM-gated</text>
+<rect class="n bad" x="40" y="156" width="140" height="56" rx="8"/><text class="t b mid" x="110" y="180">KEK</text><text class="t xs mute mid" x="110" y="197">never leaves the HSM</text>
+<path class="line faint" d="M110,126 V156"/>
+<rect class="n svc" x="320" y="80" width="140" height="70" rx="8"/><text class="t b mid" x="390" y="108">App service</text><text class="t xs mute mid" x="390" y="126">AES-256-GCM locally</text>
+<rect class="n db" x="540" y="50" width="160" height="160" rx="8"/><text class="t b mid" x="620" y="74">Object store / DB</text>
+<rect class="n cache" x="556" y="90" width="128" height="44" rx="6"/><text class="t sm b mid" x="620" y="109">ciphertext</text><text class="t xs mute mid" x="620" y="124">encrypted with DEK</text>
+<rect class="n ext" x="556" y="148" width="128" height="44" rx="6"/><text class="t sm b mid" x="620" y="167">wrapped DEK</text><text class="t xs mute mid" x="620" y="182">encrypted with KEK</text>
+<path class="e" d="M316,98 H184"/><text class="t xs mid" x="262" y="90">1 GenerateDataKey</text>
+<path class="e dash accent" d="M184,124 H316"/><text class="t xs accent mid" x="262" y="142">2 DEK + wrapped DEK</text>
+<path class="e" d="M460,115 H536"/><text class="t xs mid" x="498" y="107">4 store</text>
+<text class="t xs mid" x="390" y="172">3 encrypt the data with DEK,</text>
+<text class="t xs mid" x="390" y="186">then wipe the plaintext DEK</text>
+<text class="t sm mid" x="360" y="262">Read: send the wrapped DEK to KMS Decrypt, get the DEK back, decrypt locally.</text>
+<text class="t sm mid" x="360" y="282">Rotating the KEK re-wraps small keys, never the terabytes of data.</text>
+</svg>
+</div>
+<figcaption><b>Envelope encryption.</b> The bulk data is encrypted locally with a per-object data key; only the 32-byte data key ever goes to the KMS. Stealing the storage gets the attacker ciphertext and a wrapped key they cannot unwrap without KMS permission, which is logged.</figcaption>
+</figure>
+
+<p>The service asks KMS for a fresh <dfn>data encryption key</dfn> (DEK) and receives it twice: in plaintext, and wrapped under the <dfn>key encryption key</dfn> (KEK) that never leaves the HSM. It encrypts locally with an authenticated cipher such as AES-256-GCM, wipes the plaintext DEK, and stores the wrapped DEK beside the ciphertext. Services often cache unwrapped DEKs for a few minutes to cut KMS calls and latency.</p>
+<p>The benefits are why the major cloud storage services use this pattern: bulk crypto runs at local speed, the master key stays in hardware, access to data reduces to access to a KMS key (with an audit trail), and <dfn>crypto-shredding</dfn> becomes possible: delete a tenant's KEK and all their data, including old backups, becomes unreadable at once.</p>
+
+<h2 id="owasp">Common vulnerabilities</h2>
+<p>The OWASP Top 10 is the standard shortlist of web application risks. The current 2025 edition is led by broken access control, security misconfiguration and software supply chain failures, with cryptographic failures and injection close behind; server-side request forgery, its own entry in 2021, is now folded into broken access control. Three deserve design-level answers.</p>
+<div class="defs">
+<div><h4>Broken access control</h4><p>The API checks that you are logged in but not that order 77310 is yours, so changing the id in the URL reads someone else's order (an <dfn>IDOR</dfn>, insecure direct object reference). Fix: check ownership or relationship on every object access, deny by default, and test it with a second user account.</p></div>
+<div><h4>Injection</h4><p>User input is concatenated into an SQL query, shell command or template, and becomes code. <code>' OR '1'='1</code> is the classic. Fix: parameterized queries everywhere, never string-building, and least-privilege database users so a successful injection reaches less.</p></div>
+<div><h4>SSRF</h4><p>A feature fetches a user-supplied URL (webhooks, link previews, image import) and the attacker points it at internal addresses such as the cloud metadata endpoint <code>169.254.169.254</code>, which can hand out credentials. The 2019 Capital One breach used this path. Fix: fetch through an egress proxy with an allowlist, block private and link-local ranges after DNS resolution, and require session-based metadata access (AWS IMDSv2).</p></div>
+</div>
+
+<h2 id="defense-in-depth">Defense in depth</h2>
+<p>No single control is perfect, so layer them so that one failure is not a breach. Walk a request inward and name a control at each layer:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Layer</th><th>Controls</th><th>Stops</th></tr></thead>
+<tbody>
+<tr><th>Edge</th><td>WAF, DDoS protection, TLS, <a href="rate-limiting.html">rate limiting</a>, bot detection</td><td>Volumetric attacks, credential stuffing, known exploit patterns</td></tr>
+<tr><th>Gateway</th><td>Token validation (signature, issuer, audience, expiry), coarse scopes</td><td>Unauthenticated and forged requests before they reach services; see <a href="proxies-gateways.html">API gateways</a></td></tr>
+<tr><th>Service</th><td>Fine-grained authorization per object, input validation, parameterized queries</td><td>IDOR, injection, privilege escalation</td></tr>
+<tr><th>Network</th><td>mTLS between services, network policies, egress allowlists</td><td>Lateral movement after one service is compromised, SSRF</td></tr>
+<tr><th>Data</th><td>Encryption at rest, envelope encryption for sensitive fields, least-privilege DB users</td><td>Stolen disks and backups, over-broad queries</td></tr>
+<tr><th>Operations</th><td>Secrets manager, audit logs, alerting on anomalies, patching</td><td>Leaked credentials living forever, undetected intrusions</td></tr>
+</tbody></table></div>
+<p>Two principles tie the layers together. <dfn>Least privilege</dfn>: every user, service and key gets only the permissions it needs, so a compromise is contained. And assume breach: design as if one service is already compromised, and ask what it can reach. Security events also belong in your <a href="observability.html">observability</a> pipeline: failed logins, permission denials and token validation failures are signals, but never log the tokens or passwords themselves.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+<li><strong>Google</strong>: Zanzibar serves authorization for Drive, YouTube and Cloud; BeyondCorp replaced the trusted corporate network with per-request device and user checks, an early zero-trust model.</li>
+<li><strong>AWS</strong>: KMS with envelope encryption underpins S3, EBS and DynamoDB encryption; IAM roles hand out short-lived credentials; IMDSv2 was introduced to blunt SSRF against the metadata service.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>In every design, briefly: "Clients authenticate through our identity provider with OIDC, the gateway validates short-lived JWT access tokens, services authorize per object, internal traffic is mTLS, and sensitive data is encrypted with KMS-managed keys." Go deeper when the problem involves sharing (Google Docs, Dropbox: ReBAC), payments (tokenization, envelope encryption), third-party integrations (OAuth, API keys) or user-supplied URLs (SSRF).</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>How do you revoke a JWT? (Short expiry plus refresh tokens checked against a store; a <code>jti</code> denylist for emergencies.)</li>
+<li>Why PKCE if you already have <code>state</code>? (<code>state</code> stops CSRF; PKCE stops a stolen code from being redeemed.)</li>
+<li>Where is authorization enforced? (Coarse at the gateway, fine-grained in the service that owns the object.)</li>
+<li>How do you store passwords, and how do you upgrade the hashing cost later?</li>
+<li>How would you implement "share this folder with a team" at scale? (Relation tuples, Zanzibar-style checks, consistency tokens.)</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>Storing passwords with SHA-256 or MD5, or encrypting them.</li>
+<li>Long-lived JWTs with no revocation story, or JWTs in <code>localStorage</code> for a high-value app.</li>
+<li>Trusting the JWT <code>alg</code> header, or skipping the audience check.</li>
+<li>Authorization only in the UI, or only "is logged in" checks on object endpoints.</li>
+<li>Secrets in environment files committed to the repository.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://www.rfc-editor.org/rfc/rfc6749" target="_blank" rel="noopener">RFC 6749: The OAuth 2.0 Authorization Framework</a><span>Hardt, IETF, 2012. Roles, grants and the token endpoint.</span></li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc7636" target="_blank" rel="noopener">RFC 7636: Proof Key for Code Exchange by OAuth Public Clients</a><span>Sakimura, Bradley and Agarwal, IETF, 2015. The PKCE extension used in the flow above.</span></li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc7519" target="_blank" rel="noopener">RFC 7519: JSON Web Token (JWT)</a><span>Jones, Bradley and Sakimura, IETF, 2015. Token structure and registered claims.</span></li>
+<li><a href="https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html" target="_blank" rel="noopener">OWASP Password Storage Cheat Sheet</a><span>Current recommended algorithms and parameters for Argon2id, scrypt, bcrypt and PBKDF2.</span></li>
+<li><a href="https://www.usenix.org/conference/atc19/presentation/pang" target="_blank" rel="noopener">Zanzibar: Google's Consistent, Global Authorization System</a><span>Pang et al., USENIX ATC 2019. Relation tuples, zookies and authorization at Google scale.</span></li>
+</ul>

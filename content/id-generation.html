@@ -1,0 +1,433 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">Every row, message, order and event needs a primary key, and on one database server that is a solved problem: an auto-increment column hands out 1, 2, 3. The moment writes spread across many shards, regions or services, nobody owns "the next number" any more. Each node must mint IDs on its own, millions of times per second, and those IDs must never collide.</p>
+<p>The choice of ID format looks like a detail and turns out to touch almost everything: how fast your database inserts (random keys can make a B-tree index several times slower), whether you can sort by ID instead of by timestamp, whether a JavaScript client silently corrupts it, how many bytes every foreign key and secondary index carries, and whether a competitor can count your orders by watching the numbers climb.</p>
+<p>This chapter walks through the options practitioners actually use, from database sequences to UUIDs, ticket servers, Twitter's Snowflake and its descendants, and gives the numbers you need to pick one in an interview.</p>
+
+<h2 id="requirements">What a good ID needs</h2>
+<p>Write the requirements down before picking a scheme, because they pull in different directions.</p>
+<div class="defs">
+<div><h4>Unique</h4><p>Never issued twice, across every node, every restart and every region. This is the only non-negotiable property.</p></div>
+<div><h4>Sortable</h4><p>Later IDs compare greater than earlier ones, at least roughly. Lets you paginate by ID and keeps index inserts at the right edge of a B-tree.</p></div>
+<div><h4>Compact</h4><p>64 bits fits a <code>BIGINT</code>, a CPU register and a hash table slot. 128 bits doubles the size of every index entry and foreign key that holds it.</p></div>
+<div><h4>No coordination</h4><p>Minting an ID should not need a network call on the hot path. A central counter is a bottleneck and a single point of failure.</p></div>
+</div>
+<p>Two more matter case by case. <strong>Opacity</strong>: should an outsider be unable to guess neighbouring IDs or infer volume? <strong>Embedded meaning</strong>: is it useful to read the creation time or the owning shard straight out of the ID? A scheme that is time-sortable is, by construction, not opaque about time. You cannot have both.</p>
+<p>A useful term: an ID scheme is <dfn>k-sortable</dfn> (or roughly time-ordered) when IDs generated far enough apart in time sort correctly, but IDs generated within a small window, on different machines, may come out in either order. Almost every distributed scheme in this chapter is k-sortable, not strictly ordered, because strict global order needs exactly the coordination we are trying to avoid.</p>
+
+<h2 id="auto-increment">Auto-increment and where it stops</h2>
+<p>A database sequence (<code>BIGSERIAL</code> in PostgreSQL, <code>AUTO_INCREMENT</code> in MySQL) is compact, strictly ordered and free. Keep it whenever one primary database owns the table. It breaks down in four ways:</p>
+<ul>
+<li><strong>One writer.</strong> The sequence lives on one node. With sharding, each shard has its own sequence, so shard 1 and shard 2 both issue order 1001. Merging shards, moving rows between them, or querying across them now needs a composite key.</li>
+<li><strong>The ID exists only after the insert.</strong> The client cannot know the ID before the database responds, which makes idempotent retries and building related rows in one batch awkward.</li>
+<li><strong>Multi-region writes.</strong> Two primaries in two regions cannot share one counter without a cross-region round trip per insert.</li>
+<li><strong>Information leak.</strong> Sequential public IDs tell the world your volume. Create an order on Monday and another on Friday, subtract, and you know how many orders the shop took that week. This is the <dfn>German tank problem</dfn>: the Allies estimated German tank production from serial numbers on captured tanks. Sequential IDs also invite enumeration (<code>/invoices/1002</code>, <code>/invoices/1003</code>), which turns any missing authorization check into a data breach.</li>
+</ul>
+<p>A cheap extension for a fixed number of writers is to interleave sequences: MySQL's <code>auto_increment_increment = N</code> and <code>auto_increment_offset = k</code> make server <code>k</code> issue <code>k, k+N, k+2N, ...</code>. Values never collide, but the number of writers is baked into every future ID, so adding a fifth server to a scheme built for four means a migration. The ticket servers below build on this trick.</p>
+
+<h2 id="uuid">UUIDs</h2>
+<p>A <dfn>UUID</dfn> (universally unique identifier) is a 128-bit value, usually written as 36 characters of hex and hyphens, such as <code>3f2b8c1e-9d4a-4f7b-a1c2-5e6d7f8a9b0c</code>. RFC 9562 (2024) defines the versions in use today. The version is stored in 4 bits of the value itself, and 2 more bits mark the variant, so not all 128 bits are free.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 750 322" role="img" aria-label="Bit layouts drawn to scale: Snowflake 64 bits; UUIDv4, UUIDv7 and ULID 128 bits; KSUID 160 bits">
+<text class="t b" x="6" y="35">Snowflake</text><text class="t xs mute" x="6" y="49">8 bytes</text>
+<rect class="n ext" x="104" y="20" width="4" height="32" rx="3"/>
+<rect class="n svc" x="108" y="20" width="164" height="32" rx="3"/>
+<text class="t xs mid" x="190" y="35">ms since custom epoch</text><text class="t xs mute mid" x="190" y="47">41 bits</text>
+<rect class="n db" x="272" y="20" width="40" height="32" rx="3"/>
+<text class="t xs mid" x="292" y="35">node</text><text class="t xs mute mid" x="292" y="47">10</text>
+<rect class="n queue" x="312" y="20" width="48" height="32" rx="3"/>
+<text class="t xs mid" x="336" y="35">seq</text><text class="t xs mute mid" x="336" y="47">12 bits</text>
+<text class="t b" x="6" y="89">UUIDv4</text><text class="t xs mute" x="6" y="103">16 bytes</text>
+<rect class="n cache" x="104" y="74" width="192" height="32" rx="3"/>
+<text class="t xs mid" x="200" y="89">random</text><text class="t xs mute mid" x="200" y="101">48 bits</text>
+<rect class="n ext" x="296" y="74" width="16" height="32" rx="3"/>
+<rect class="n cache" x="312" y="74" width="48" height="32" rx="3"/>
+<text class="t xs mid" x="336" y="89">random</text><text class="t xs mute mid" x="336" y="101">12 bits</text>
+<rect class="n ext" x="360" y="74" width="8" height="32" rx="3"/>
+<rect class="n cache" x="368" y="74" width="248" height="32" rx="3"/>
+<text class="t xs mid" x="492" y="89">random</text><text class="t xs mute mid" x="492" y="101">62 bits</text>
+<text class="t b" x="6" y="143">UUIDv7</text><text class="t xs mute" x="6" y="157">16 bytes</text>
+<rect class="n svc" x="104" y="128" width="192" height="32" rx="3"/>
+<text class="t xs mid" x="200" y="143">Unix ms</text><text class="t xs mute mid" x="200" y="155">48 bits</text>
+<rect class="n ext" x="296" y="128" width="16" height="32" rx="3"/>
+<rect class="n cache" x="312" y="128" width="48" height="32" rx="3"/>
+<text class="t xs mid" x="336" y="143">random</text><text class="t xs mute mid" x="336" y="155">12 bits</text>
+<rect class="n ext" x="360" y="128" width="8" height="32" rx="3"/>
+<rect class="n cache" x="368" y="128" width="248" height="32" rx="3"/>
+<text class="t xs mid" x="492" y="143">random</text><text class="t xs mute mid" x="492" y="155">62 bits</text>
+<text class="t b" x="6" y="197">ULID</text><text class="t xs mute" x="6" y="211">16 bytes</text>
+<rect class="n svc" x="104" y="182" width="192" height="32" rx="3"/>
+<text class="t xs mid" x="200" y="197">Unix ms</text><text class="t xs mute mid" x="200" y="209">48 bits</text>
+<rect class="n cache" x="296" y="182" width="320" height="32" rx="3"/>
+<text class="t xs mid" x="456" y="197">random</text><text class="t xs mute mid" x="456" y="209">80 bits</text>
+<text class="t b" x="6" y="251">KSUID</text><text class="t xs mute" x="6" y="265">20 bytes</text>
+<rect class="n svc" x="104" y="236" width="128" height="32" rx="3"/>
+<text class="t xs mid" x="168" y="251">s since 2014</text><text class="t xs mute mid" x="168" y="263">32 bits</text>
+<rect class="n cache" x="232" y="236" width="512" height="32" rx="3"/>
+<text class="t xs mid" x="488" y="251">random payload</text><text class="t xs mute mid" x="488" y="263">128 bits</text>
+<rect class="n svc" x="104" y="296" width="14" height="14" rx="2"/><text class="t sm" x="124" y="307">time</text>
+<rect class="n db" x="172.4" y="296" width="14" height="14" rx="2"/><text class="t sm" x="192.4" y="307">machine</text>
+<rect class="n queue" x="260.6" y="296" width="14" height="14" rx="2"/><text class="t sm" x="280.6" y="307">sequence</text>
+<rect class="n cache" x="355.40000000000003" y="296" width="14" height="14" rx="2"/><text class="t sm" x="375.40000000000003" y="307">random</text>
+<rect class="n ext" x="437.0" y="296" width="14" height="14" rx="2"/><text class="t sm" x="457.0" y="307">sign, version, variant bits</text>
+</svg>
+</div>
+<figcaption><b>Formats at a glance, drawn to scale.</b> Indigo bits carry time, so any format that starts with them sorts by creation time. UUIDv4 is random from the first bit, which is what makes it unique without coordination and also what makes it hard on indexes.</figcaption>
+</figure>
+
+<h3 id="uuidv4">UUIDv4: random</h3>
+<p>Version 4 fills the remaining 122 bits with random data from a cryptographically secure generator. No state, no coordination, no clock. The only question is collisions, and the birthday bound answers it: with <code>n</code> IDs drawn from <code>N = 2<sup>122</sup></code> values, the chance of any collision is about <code>n<sup>2</sup> / 2N</code>.</p>
+<div class="calc">Space         N = 2^122 ≈ 5.3 × 10^36
+1 trillion IDs           p ≈ (10^12)^2 / (2 × 5.3 × 10^36)   ≈ <span class="r">9.4 × 10^-14</span>
+1 billion IDs/s for a year  (3.2 × 10^16 IDs)                ≈ <span class="r">9.4 × 10^-5</span>
+50% chance of a collision needs                          ≈ <span class="r">2.7 × 10^18 IDs</span>
+                         (1 billion per second for 86 years)</div>
+<p>In practice a collision is far more likely to come from a bug than from the math: a forked process that copies its parent's random state, a VM snapshot cloned with its entropy pool, or someone using a non-cryptographic generator seeded with the time. Use the platform's UUID function (<code>uuid.uuid4()</code>, <code>gen_random_uuid()</code>, <code>crypto.randomUUID()</code>), which reads from the OS random source.</p>
+<p>Still, put a unique constraint on the column. It costs nothing extra on a primary key and turns a one-in-a-quintillion event into a retryable error instead of silent corruption.</p>
+
+<h3 id="index-locality">The index locality problem</h3>
+<p>UUIDv4's weakness is not uniqueness, it is <strong>where new keys land in an index</strong>. A B-tree keeps keys sorted in fixed-size pages (8 KB in PostgreSQL, 16 KB in InnoDB). A random key lands on a random leaf page. With millions of inserts, every leaf in the index is a write target, so the whole index must stay in memory to keep inserts fast. Once the index outgrows the buffer pool, almost every insert reads a page from disk, modifies it, and later writes it back.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 286" role="img" aria-label="B-tree with eight leaf pages: random keys insert into most leaves and leave them partly full; time-ordered keys only touch the rightmost leaf">
+<rect class="n svc" x="310" y="16" width="100" height="36" rx="6"/><text class="t sm b mid" x="360" y="38">root / inner</text>
+<path class="line faint" d="M360,52 L62,104"/>
+<path class="line faint" d="M360,52 L147,104"/>
+<path class="line faint" d="M360,52 L232,104"/>
+<path class="line faint" d="M360,52 L317,104"/>
+<path class="line faint" d="M360,52 L402,104"/>
+<path class="line faint" d="M360,52 L487,104"/>
+<path class="line faint" d="M360,52 L572,104"/>
+<path class="line faint" d="M360,52 L657,104"/>
+<rect class="n ext" x="27" y="104" width="70" height="44" rx="5"/>
+<rect class="n ext" x="112" y="104" width="70" height="44" rx="5"/>
+<rect class="n ext" x="197" y="104" width="70" height="44" rx="5"/>
+<rect class="n ext" x="282" y="104" width="70" height="44" rx="5"/>
+<rect class="n ext" x="367" y="104" width="70" height="44" rx="5"/>
+<rect class="n ext" x="452" y="104" width="70" height="44" rx="5"/>
+<rect class="n ext" x="537" y="104" width="70" height="44" rx="5"/>
+<rect class="n ext" x="622" y="104" width="70" height="44" rx="5"/>
+<g data-show="1"><rect class="n db" x="33" y="124" width="58" height="18" rx="2"/><rect class="n db" x="118" y="116" width="58" height="26" rx="2"/><rect class="n db" x="203" y="122" width="58" height="20" rx="2"/><rect class="n db" x="288" y="112" width="58" height="30" rx="2"/><rect class="n db" x="373" y="126" width="58" height="16" rx="2"/><rect class="n db" x="458" y="120" width="58" height="22" rx="2"/><rect class="n db" x="543" y="115" width="58" height="27" rx="2"/><rect class="n db" x="628" y="123" width="58" height="19" rx="2"/></g>
+<g data-show="2"><rect class="n db" x="33" y="110" width="58" height="32" rx="2"/><rect class="n db" x="118" y="110" width="58" height="32" rx="2"/><rect class="n db" x="203" y="110" width="58" height="32" rx="2"/><rect class="n db" x="288" y="110" width="58" height="32" rx="2"/><rect class="n db" x="373" y="110" width="58" height="32" rx="2"/><rect class="n db" x="458" y="110" width="58" height="32" rx="2"/><rect class="n db" x="543" y="110" width="58" height="32" rx="2"/><rect class="n db" x="628" y="131" width="58" height="11" rx="2"/></g>
+<g data-show="1"><path class="e accent" d="M62,186 V152"/><path class="e accent" d="M147,186 V152"/><path class="e accent" d="M317,186 V152"/><path class="e accent" d="M402,186 V152"/><path class="e accent" d="M572,186 V152"/><path class="e accent" d="M657,186 V152"/></g>
+<g data-show="2"><path class="e accent" d="M657,186 V152"/></g>
+<text class="t sm accent" x="27" y="204" data-show="1">new UUIDv4 keys land on random leaves, splitting them half-full</text>
+<text class="t sm accent end" x="692" y="204" data-show="2">new UUIDv7 keys all append to the rightmost leaf</text>
+<g data-show="1"><path class="line" d="M27,222 V230 H692 V222"/><text class="t sm b mid" x="360" y="250">Hot set: every leaf must stay in memory</text><text class="t sm mute mid" x="360" y="270">1M inserts: 69% average page fill, 84% buffer-pool misses</text></g>
+<g data-show="2"><path class="line" d="M622,222 V230 H692 V222"/><text class="t sm b end" x="692" y="250">Hot set: one leaf</text><text class="t sm mute end" x="692" y="270">1M inserts: full pages, 1% buffer-pool misses</text><text class="t sm mute" x="27" y="250">Older leaves are full and cold;</text><text class="t sm mute" x="27" y="270">they can be evicted safely</text></g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Random keys (UUIDv4)</button><button type="button" data-step="2" aria-pressed="false">Time-ordered keys (UUIDv7, Snowflake)</button></div>
+</div>
+<figcaption><b>Where inserts land.</b> Random keys spread writes across every leaf and leave pages part-empty after splits. Time-ordered keys always append at the right edge, so the hot set is a single page no matter how large the table grows.</figcaption>
+</figure>
+
+<p>To put numbers on it, a small simulation inserted one million keys into leaf pages of 100 keys each, with an LRU buffer pool of 500 pages:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Insert order</th><th class="num">Leaf pages</th><th class="num">Avg fill</th><th class="num">Cache misses</th><th class="num">Pages hit by last 10k</th></tr></thead>
+<tbody>
+<tr><th>Random (UUIDv4)</th><td class="num">14,405</td><td class="num no">69%</td><td class="num no">84%</td><td class="num">7,114</td></tr>
+<tr><th>Time-ordered (UUIDv7)</th><td class="num">10,000</td><td class="num yes">100%</td><td class="num yes">1%</td><td class="num">101</td></tr>
+</tbody></table></div>
+<p>Random inserts split pages in half and leave them about 69% full on average (the classic result for random B-tree insertion is ln 2, about 69%), so the index is 44% larger for the same data. And with a cache holding 3.5% of the index, 84% of inserts miss. Time-ordered inserts only ever touch the rightmost page: each new page is read once, filled, and never touched again. Real engines leave some free space in right-edge splits (PostgreSQL's default B-tree fillfactor is 90), but the shape of the result is the same.</p>
+<p>The effect is worst in MySQL's InnoDB, where the table itself is a B-tree clustered on the primary key: a random primary key scatters the <em>rows</em>, not just an index. Every secondary index also stores the primary key, so a 16-byte UUID instead of an 8-byte <code>BIGINT</code> grows all of them. Storing a UUID as <code>CHAR(36)</code> text instead of 16 binary bytes more than doubles it again.</p>
+
+<h3 id="uuidv7">UUIDv7: time first</h3>
+<p>RFC 9562 added <dfn>UUIDv7</dfn> to fix the locality problem while keeping the UUID format. The first 48 bits are a big-endian Unix timestamp in milliseconds, followed by the version bits and 74 bits of randomness (some of which an implementation may use as a counter for ordering within one millisecond). Because the timestamp comes first, byte order is time order, and v7 values sort correctly as raw bytes, as hex strings, and in a database <code>uuid</code> column.</p>
+<p>v7 keeps every advantage of v4 (no coordination, no machine IDs, any client can mint one) and adds right-edge inserts. Collisions now need two IDs in the same millisecond with the same 74 random bits: even a million IDs inside one millisecond gives a collision chance around 3 × 10<sup>-11</sup>. The cost is that v7 reveals creation time to anyone who can see it. For a new system that wants UUIDs, v7 is the default choice; PostgreSQL 18 ships a built-in <code>uuidv7()</code> function.</p>
+<div class="callout note">
+<div class="callout-title">What about v1 and v6?</div>
+<p>UUIDv1 holds a 60-bit timestamp and the machine's MAC address, but stores the low bits of the timestamp first, so it does not sort by time, and it leaks hardware identity. v6 is v1 with the timestamp reordered to sort. Both exist for legacy compatibility; new designs use v4 or v7.</p>
+</div>
+
+<h2 id="ticket-servers">Ticket servers and range allocation</h2>
+<p>If you want compact 64-bit IDs and do not mind a network call, centralise the counter but make it cheap and redundant. Flickr did exactly this in 2010 with <dfn>ticket servers</dfn>: dedicated MySQL instances whose only job is to hand out numbers. Each ticket server has one table with one row; asking for an ID is a <code>REPLACE INTO</code> that bumps the auto-increment, followed by <code>LAST_INSERT_ID()</code>.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 256" role="img" aria-label="Two ticket servers: A issues odd numbers and B issues even numbers; app servers alternate between them; if B fails, A keeps issuing unique odd numbers">
+<rect class="n client" x="52" y="88" width="130" height="50" rx="8"/>
+<rect class="n client" x="46" y="94" width="130" height="50" rx="8"/>
+<rect class="n client" x="40" y="100" width="130" height="50" rx="8"/>
+<text class="t b mid" x="105" y="122">App servers</text><text class="t xs mute mid" x="105" y="138">200 instances</text>
+
+<rect class="n ext" x="330" y="30" width="200" height="70" rx="8"/>
+<text class="t b mid" x="430" y="54">Ticket server A</text>
+<text class="t mono mid" x="430" y="73">increment=2, offset=1</text>
+<text class="t xs mute mid" x="430" y="90">MySQL</text>
+
+<rect class="n ext" x="330" y="150" width="200" height="70" rx="8"/>
+<g data-show="2"><rect class="n bad" x="330" y="150" width="200" height="70" rx="8"/></g>
+<text class="t b mid" x="430" y="174">Ticket server B</text>
+<text class="t mono mid" x="430" y="193">increment=2, offset=2</text>
+<text class="t xs mute mid" x="430" y="210" data-show="1">MySQL</text>
+<text class="t xs red mid" x="430" y="210" data-show="2">down</text>
+
+<path class="e" d="M186,115 C255,115 250,65 326,65"/>
+<g data-show="1"><path class="e" d="M186,135 C255,135 250,185 326,185"/></g>
+<g data-show="2"><path class="e red dash" d="M186,135 C255,135 250,185 326,185"/></g>
+<text class="t xs mute mid" x="262" y="129">alternate</text>
+
+<g data-show="1"><text class="t mono" x="550" y="62">1, 3, 5, 7, ...</text><text class="t xs mute" x="550" y="80">odd ids</text>
+<text class="t mono" x="550" y="182">2, 4, 6, 8, ...</text><text class="t xs mute" x="550" y="200">even ids</text></g>
+<g data-show="2"><text class="t mono" x="550" y="62">..., 9, 11, 13, 15</text><text class="t xs mute" x="550" y="80">takes all traffic</text>
+<text class="t mono red" x="550" y="182">stopped at 8</text><text class="t xs mute" x="550" y="200">clients skip it</text></g>
+
+<text class="t mono mid" x="360" y="246" data-show="1">REPLACE INTO Tickets64 (stub) VALUES ('a'); SELECT LAST_INSERT_ID();</text>
+<text class="t sm mid" x="360" y="246" data-show="2">Clients fail over to A: IDs stay unique, and A carries twice the load.</text>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Both healthy</button><button type="button" data-step="2" aria-pressed="false">B fails</button></div>
+</div>
+<figcaption><b>Flickr's ticket server pair.</b> Interleaved sequences mean the two servers never need to talk to each other. Losing one halves capacity but never produces a duplicate.</figcaption>
+</figure>
+
+<pre><code class="language-sql">CREATE TABLE Tickets64 (
+  id   BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  stub CHAR(1) NOT NULL DEFAULT '',
+  PRIMARY KEY (id),
+  UNIQUE KEY stub (stub)
+) ENGINE=InnoDB;
+
+-- one round trip per ID; the table never holds more than one row
+REPLACE INTO Tickets64 (stub) VALUES ('a');
+SELECT LAST_INSERT_ID();</code></pre>
+<p>The weak points are visible in the diagram. Every ID costs a network round trip to a ticket server. IDs from A and B interleave by load, not by time, so ID order only roughly tracks creation order. And recovering a failed server needs care: if B is restored from an old backup, its counter is behind and it will reissue numbers. Bump its counter well past the last value it could have issued before putting it back.</p>
+
+<h3 id="range-allocation">Range allocation</h3>
+<p>The fix for the round trip is to ask for many IDs at once. A coordinator (a SQL row updated with <code>UPDATE counters SET next = next + 1000 ... RETURNING next</code>, an etcd key updated with compare-and-swap, or a ZooKeeper node) leases each application server a <strong>block</strong> of, say, 1,000 or 1,000,000 IDs, which the server then hands out from memory. The coordinator sees one request per block instead of one per ID, and a coordinator outage only stops servers once their current block runs out.</p>
+<p>The trade-offs: IDs are only ordered within a server's block, so global order is lost; a server that crashes wastes the rest of its block (harmless with a 64-bit space); and block size trades coordinator load against wasted IDs and against how long servers survive a coordinator outage. The <a href="url-shortener.html">URL shortener</a> case study uses exactly this design to generate short codes. Hibernate's "pooled" and "hi/lo" generators and many in-house ID services are the same idea.</p>
+
+<h2 id="snowflake">Snowflake</h2>
+<p>In 2010 Twitter needed tens of thousands of IDs per second, roughly time-sorted, fitting in 64 bits, with no coordination per ID. The result was <dfn>Snowflake</dfn>, and its layout has been copied so widely that "snowflake ID" is now a generic term. An ID is a 64-bit integer split into three fields: a millisecond timestamp, a machine ID, and a per-millisecond sequence number.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 232" role="img" aria-label="Snowflake bit layout: 1 sign bit, 41-bit timestamp, 10-bit machine id, 12-bit sequence, with an example id decoded">
+<text class="t b mid" x="45" y="30">sign</text><text class="t xs mute mid" x="45" y="46">1 bit</text>
+<text class="t b mid" x="255" y="30">timestamp</text><text class="t xs mute mid" x="255" y="46">41 bits, ms since custom epoch</text>
+<text class="t b mid" x="510" y="30">machine</text><text class="t xs mute mid" x="510" y="46">10 bits</text>
+<text class="t b mid" x="620" y="30">sequence</text><text class="t xs mute mid" x="620" y="46">12 bits</text>
+<rect class="n ext" x="40" y="56" width="10" height="44"/>
+<rect class="n svc" x="50" y="56" width="410" height="44"/>
+<rect class="n db" x="460" y="56" width="100" height="44"/>
+<rect class="n queue" x="560" y="56" width="120" height="44"/>
+<text class="t mono mid" x="45" y="82">0</text>
+<text class="t mono mid" x="255" y="82">502,712,225,343</text>
+<text class="t mono mid" x="510" y="82">37</text>
+<text class="t mono mid" x="620" y="82">0</text>
+<text class="t xs mute mid" x="45" y="117">63</text>
+<text class="t xs mute" x="54" y="117">62</text><text class="t xs mute end" x="456" y="117">22</text>
+<text class="t xs mute" x="464" y="117">21</text><text class="t xs mute end" x="556" y="117">12</text>
+<text class="t xs mute" x="564" y="117">11</text><text class="t xs mute end" x="676" y="117">0</text>
+<text class="t sm mid" x="255" y="146">2⁴¹ ms ≈ 69.7 years of IDs</text>
+<text class="t sm mute mid" x="255" y="163">Twitter's epoch runs out in 2080</text>
+<text class="t sm mid" x="510" y="146">1,024</text>
+<text class="t sm mute mid" x="510" y="163">generators</text>
+<text class="t sm mid" x="620" y="146">4,096 per ms</text>
+<text class="t sm mute mid" x="620" y="163">per generator</text>
+<path class="line faint" d="M40,182 H680"/>
+<text class="t mono mid" x="360" y="204">(502712225343 &lt;&lt; 22) | (37 &lt;&lt; 12) | 0  =  2108527897605197824</text>
+<text class="t sm mute mid" x="360" y="223">machine 37, sequence 0, created 2026-10-09 12:00:00.000 UTC</text>
+</svg>
+</div>
+<figcaption><b>Snowflake bit layout.</b> The timestamp occupies the high bits, so comparing two IDs as integers compares their creation times first. The top bit stays 0 so the value is positive in a signed 64-bit integer.</figcaption>
+</figure>
+
+<p>Each field has a job:</p>
+<ul>
+<li><strong>Timestamp (41 bits)</strong>: milliseconds since a <dfn>custom epoch</dfn> chosen when the system launched, not since 1970. Twitter's epoch is 2010-11-04 01:42:54.657 UTC. Starting the count at launch instead of 1970 buys back four decades of range.</li>
+<li><strong>Machine ID (10 bits)</strong>: unique per running generator. Twitter split it into 5 bits of datacenter and 5 bits of worker. This field is what makes uniqueness possible without coordination: two generators can never produce the same ID because their machine bits differ.</li>
+<li><strong>Sequence (12 bits)</strong>: a counter that resets every millisecond, so one generator can issue many IDs within the same millisecond.</li>
+</ul>
+
+<h3 id="snowflake-capacity">Capacity math</h3>
+<div class="calc">Lifetime     2^41 ms = 2,199,023,255,552 ms ≈ <span class="r">69.7 years</span>
+             epoch 2026-01-01  →  runs out 2095-09-07
+Per node     2^12 = 4,096 ids per ms   = <span class="r">4,096,000 ids/s</span>
+Nodes        2^10 = 1,024 generators
+Fleet        4,096,000 × 1,024         ≈ <span class="r">4.2 billion ids/s</span>
+Size         8 bytes, at most 19 decimal digits, fits a signed BIGINT</div>
+<p>The bit split is a design parameter, not a law. Fewer machine bits and more sequence bits suits a few very busy generators; more machine bits suits thousands of small ones. Instagram, Discord and Sonyflake (below) all made different choices. What you cannot change cheaply after launch is the epoch and the layout, because every stored ID depends on them.</p>
+
+<h3 id="machine-ids">Assigning machine IDs</h3>
+<p>Snowflake moves the coordination problem from "every ID" to "every process start". If two live processes ever share a machine ID, they will issue duplicate IDs whenever they land in the same millisecond, and nothing will warn you. Common ways to assign them:</p>
+<ul>
+<li><strong>Static configuration</strong> per host. Simple, and fragile once hosts are replaced automatically.</li>
+<li><strong>Coordination service</strong>: on startup, register the ID as an ephemeral node in ZooKeeper so a second process cannot claim it (Twitter's original approach: a configured worker ID, claimed as an ephemeral znode at startup) or a key with a lease in etcd. The claim disappears when the process dies, and a new process can take it. See <a href="consensus.html">Consensus</a> for why leases need care.</li>
+<li><strong>Orchestrator identity</strong>: a Kubernetes StatefulSet gives pods stable ordinals (<code>idgen-0</code>, <code>idgen-1</code>) that map directly to machine IDs.</li>
+<li><strong>Derived from the network</strong>: Sonyflake defaults to the low 16 bits of the private IP address. Convenient, but only safe if your address plan guarantees no two live hosts share those bits.</li>
+</ul>
+
+<h3 id="clock-skew">When the clock goes backwards</h3>
+<p>Snowflake trusts the wall clock, and wall clocks are not monotonic. NTP normally <em>slews</em> small errors by running the clock slightly fast or slow, but it <em>steps</em> the clock for large offsets, for example after a VM is paused and resumed, on boot, or when an operator fixes a bad time source. Leap seconds used to cause the same thing, which is why large providers now smear them over many hours.</p>
+<p>If the clock steps back 50 ms and the generator keeps going, it will revisit milliseconds it has already used and can reissue the same timestamp and sequence: a duplicate. The standard defences, roughly in order of how often they appear:</p>
+<ol class="steps">
+<li><strong>Remember the last timestamp</strong> and compare on every call. Twitter's implementation refused to issue IDs and logged an error until the clock caught up.</li>
+<li><strong>Wait out small steps.</strong> If the clock moved back by a few milliseconds, sleep or spin until it passes the last timestamp. Refuse, and alert, beyond a threshold.</li>
+<li><strong>Persist the high-water mark across restarts.</strong> A process that restarts after a big backward step has no memory of the timestamps it used. Writing "last timestamp used" to disk every few seconds, and refusing to start below it, closes that gap.</li>
+<li><strong>Use a monotonic clock.</strong> Read the wall clock once at startup, then advance with the OS monotonic clock, which never goes backwards. The cost is that the generator drifts from real time over long uptimes.</li>
+</ol>
+<p>Clock skew between machines is a separate, milder issue. If node A runs 30 ms ahead of node B, A's IDs sort as if they were created 30 ms later. Uniqueness is unaffected because the machine bits differ; only the ordering across nodes is approximate. That is the "k" in k-sortable, and it is why Snowflake order should never be used to decide which of two concurrent writes happened first.</p>
+
+<h3 id="snowflake-code">Implementation</h3>
+<p>The generator below handles the three tricky cases: several IDs in the same millisecond, the sequence running out within a millisecond, and the clock moving backwards. The clock is injectable so the demo output is deterministic.</p>
+<pre><code class="language-python">import threading
+import time
+
+EPOCH_MS = 1_288_834_974_657          # Twitter's epoch: 2010-11-04 01:42:54.657 UTC
+TIME_BITS, MACHINE_BITS, SEQ_BITS = 41, 10, 12
+MAX_MACHINE = (1 &lt;&lt; MACHINE_BITS) - 1  # 1023
+MAX_SEQ = (1 &lt;&lt; SEQ_BITS) - 1          # 4095
+MAX_BACKWARD_MS = 5                    # wait out small clock steps, refuse big ones
+
+
+class ClockMovedBackwards(Exception):
+    pass
+
+
+class Snowflake:
+    def __init__(self, machine_id, clock=lambda: time.time_ns() // 1_000_000):
+        if not 0 &lt;= machine_id &lt;= MAX_MACHINE:
+            raise ValueError("machine_id must fit in 10 bits")
+        self.machine_id = machine_id
+        self.clock = clock          # injectable so the demo is deterministic
+        self.last_ms = -1
+        self.seq = 0
+        self.lock = threading.Lock()
+
+    def next_id(self) -&gt; int:
+        with self.lock:
+            now = self.clock()
+            if now &lt; self.last_ms:                        # clock went backwards
+                if self.last_ms - now &gt; MAX_BACKWARD_MS:
+                    raise ClockMovedBackwards(f"{self.last_ms - now} ms")
+                while now &lt; self.last_ms:                 # small step: wait it out
+                    now = self.clock()
+            if now == self.last_ms:
+                self.seq = (self.seq + 1) &amp; MAX_SEQ
+                if self.seq == 0:                         # 4,096 ids used this ms
+                    while now &lt;= self.last_ms:            # spin until the next ms
+                        now = self.clock()
+            else:
+                self.seq = 0
+            self.last_ms = now
+            return ((now - EPOCH_MS) &lt;&lt; (MACHINE_BITS + SEQ_BITS)) \
+                | (self.machine_id &lt;&lt; SEQ_BITS) | self.seq
+
+
+def decode(snowflake_id: int) -&gt; dict:
+    ms = (snowflake_id &gt;&gt; (MACHINE_BITS + SEQ_BITS)) + EPOCH_MS
+    return {
+        "utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ms // 1000)) + f".{ms % 1000:03d}",
+        "machine": (snowflake_id &gt;&gt; SEQ_BITS) &amp; MAX_MACHINE,
+        "seq": snowflake_id &amp; MAX_SEQ,
+    }
+
+
+# Deterministic demo: a fake clock that starts at 2026-10-09 12:00:00.000 UTC.
+fake_now = [1_791_547_200_000]
+gen = Snowflake(machine_id=37, clock=lambda: fake_now[0])
+
+a, b = gen.next_id(), gen.next_id()       # same millisecond: seq 0, then 1
+fake_now[0] += 1
+c = gen.next_id()                         # next millisecond: seq resets to 0
+for i in (a, b, c):
+    print(i, decode(i))
+assert a &lt; b &lt; c                          # k-sorted: later ids are larger
+
+fake_now[0] -= 1_000                      # NTP steps the clock back one second
+try:
+    gen.next_id()
+except ClockMovedBackwards as e:
+    print("refused: clock moved back", e)</code></pre>
+<pre><code class="language-text">2108527897605197824 {'utc': '2026-10-09 12:00:00.000', 'machine': 37, 'seq': 0}
+2108527897605197825 {'utc': '2026-10-09 12:00:00.000', 'machine': 37, 'seq': 1}
+2108527897609392128 {'utc': '2026-10-09 12:00:00.001', 'machine': 37, 'seq': 0}
+refused: clock moved back 1000 ms</code></pre>
+<p>Note how the third ID is 4,194,304 (2<sup>22</sup>) above the first: one millisecond in the timestamp field. Run against the real clock, this pure-Python generator produced a million IDs in about a quarter of a second on a laptop, all unique and in increasing order, with the sequence reaching 4,020 in the busiest millisecond, close to the 4,096 limit. A compiled implementation is not limited by the generator itself but by the 4,096-per-millisecond sequence.</p>
+
+<div class="callout warn">
+<div class="callout-title">Common mistake: 64-bit IDs in JavaScript</div>
+<p>JavaScript numbers are 64-bit floats and represent integers exactly only up to 2<sup>53</sup> (about 9 × 10<sup>15</sup>). Any Snowflake ID created more than 25 days after the epoch is larger than that. <code>JSON.parse</code> silently rounds it, and the client then requests a different ID. Twitter's API added a string field, <code>id_str</code>, for this reason. Send 64-bit IDs to browsers as strings.</p>
+</div>
+
+<h3 id="snowflake-variants">Variants</h3>
+<div class="defs">
+<div><h4>Instagram</h4><p>41-bit ms timestamp, 13-bit logical shard ID, 10-bit sequence, generated inside PostgreSQL by a PL/pgSQL function using a per-shard sequence. The shard is in the ID, so any service can route a lookup without a directory.</p></div>
+<div><h4>Discord</h4><p>Twitter's layout with an epoch of 2015-01-01 UTC, split as 5 bits worker, 5 bits process, 12 bits increment. Message IDs double as timestamps for pagination.</p></div>
+<div><h4>Sonyflake</h4><p>39 bits of time in 10 ms units (about 174 years), 8-bit sequence, 16-bit machine ID. Trades per-node throughput (25,600 IDs/s) for more machines and a longer lifetime.</p></div>
+<div><h4>MongoDB ObjectId</h4><p>12 bytes: 4-byte Unix timestamp in seconds, 5 random bytes per process, 3-byte counter. Coordination-free and roughly sortable, at 96 bits.</p></div>
+</div>
+
+<h2 id="ulid-ksuid">ULID and KSUID</h2>
+<p>Snowflake needs machine IDs. UUIDv4 needs nothing but sorts badly. A family of formats sits in between: <strong>timestamp first, then enough randomness that no machine ID is needed</strong>.</p>
+<p>A <dfn>ULID</dfn> (Universally Unique Lexicographically Sortable Identifier) is 128 bits: a 48-bit Unix millisecond timestamp followed by 80 random bits, written as 26 characters of Crockford base32, for example <code>01M4G8HMG0Q7M2N4P6R8T0V2W4</code>, whose first 10 characters encode 2026-10-09 12:00:00.000 UTC. Base32 avoids ambiguous letters (no I, L, O or U) and sorts in the same order as the bytes, so ULIDs sort correctly as plain strings. The spec defines a <em>monotonic</em> mode: within one millisecond, a generator increments the previous random part by one instead of drawing a new one, guaranteeing order for IDs from the same process. UUIDv7 standardised essentially the same idea, so new systems can usually prefer v7 and get native database support.</p>
+<p>A <dfn>KSUID</dfn> (K-Sortable Unique Identifier, from Segment) is 160 bits: a 32-bit timestamp in <em>seconds</em> since a custom epoch of 2014-05-13 16:53:20 UTC, followed by 128 random bits, written as 27 base62 characters. The 128-bit random payload makes collisions even less likely than UUIDv4's, at the cost of 4 extra bytes and only one-second time resolution. Its 32-bit timestamp lasts until 2150.</p>
+
+<h2 id="comparison">Comparison</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Scheme</th><th>Size</th><th>Time-sortable</th><th>Coordination</th><th>Limit</th><th>Leaks</th></tr></thead>
+<tbody>
+<tr><th>Auto-increment</th><td class="yes">8 B</td><td class="yes">Strictly</td><td class="no">Every ID, one writer</td><td>One database's write rate</td><td class="no">Exact volume</td></tr>
+<tr><th>UUIDv4</th><td class="meh">16 B</td><td class="no">No</td><td class="yes">None</td><td>None in practice</td><td class="yes">Nothing</td></tr>
+<tr><th>UUIDv7 / ULID</th><td class="meh">16 B</td><td class="yes">Roughly (ms)</td><td class="yes">None</td><td>None in practice</td><td class="meh">Creation time</td></tr>
+<tr><th>KSUID</th><td class="no">20 B</td><td class="meh">Roughly (s)</td><td class="yes">None</td><td>None in practice</td><td class="meh">Creation time</td></tr>
+<tr><th>Ticket server</th><td class="yes">8 B</td><td class="meh">Roughly</td><td class="no">Every ID, network call</td><td>Ticket DB write rate</td><td class="no">Volume</td></tr>
+<tr><th>Range allocation</th><td class="yes">8 B</td><td class="no">Per server only</td><td class="meh">Once per block</td><td>Effectively none</td><td class="meh">Volume, roughly</td></tr>
+<tr><th>Snowflake</th><td class="yes">8 B</td><td class="yes">Roughly (ms)</td><td class="meh">Once per process start</td><td>4,096/ms per node, 1,024 nodes</td><td class="meh">Time, node, rate</td></tr>
+</tbody></table></div>
+<p>A simple way to choose:</p>
+<ul>
+<li><strong>One database owns the table</strong>: keep auto-increment. Expose a separate random public ID if enumeration or volume leaks matter.</li>
+<li><strong>Many writers, 128 bits is fine</strong>: UUIDv7. No infrastructure, good index behaviour, standard format.</li>
+<li><strong>Many writers, must be 64 bits</strong> (huge tables, many secondary indexes, existing <code>BIGINT</code> columns): Snowflake-style, with a reliable machine ID assignment and clock monitoring.</li>
+<li><strong>IDs must reveal nothing</strong> (password reset tokens, unlisted share links): UUIDv4 or 128+ random bits. A time-ordered ID is not a secret.</li>
+</ul>
+
+<h2 id="worked-example">Worked example: order IDs for a marketplace</h2>
+<p>A marketplace takes 50,000 orders per second at peak, written by 300 stateless order-service pods into 64 PostgreSQL shards. Orders are listed newest first, IDs appear in URLs and in partner APIs, and the orders table plus its five secondary indexes, each ending in the order id for newest-first pagination (for example (customer_id, id)), already reaches several terabytes.</p>
+<div class="calc">Per-pod load      50,000 / 300 pods     ≈ 167 orders/s    (limit 4,096,000/s)
+Machine IDs       300 pods + headroom     fits easily in 1,024
+Lifetime          epoch 2026-01-01        →  2095
+Index savings     8 B vs 16 B key × 6 indexes × 10 billion rows ≈ <span class="r">480 GB</span> smaller</div>
+<p>The decision: Snowflake-style 64-bit IDs, a 2026 epoch, machine IDs leased from etcd at pod start, a 5 ms threshold for clock steps with an alert, and IDs serialised as strings in JSON. Listing newest-first becomes <code>ORDER BY id DESC</code> on the primary key, with no separate timestamp index. Because IDs reveal order volume, public order URLs use the ID only behind authentication; anonymous tracking links use a separate random token. If the team did not want to run machine ID leasing at all, UUIDv7 would be the alternative, at the cost of that 480 GB.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+<li><strong>Twitter</strong> built Snowflake in 2010 when moving tweets off MySQL auto-increment; tweet IDs are still Snowflakes, and you can read a tweet's creation time from its ID.</li>
+<li><strong>Flickr</strong> ran two MySQL ticket servers (odd and even) to give every photo, user and comment a globally unique 64-bit ID across its sharded databases.</li>
+<li><strong>Instagram</strong> generated IDs inside each PostgreSQL logical shard so IDs embed the shard, avoiding a separate ID service entirely.</li>
+<li><strong>Discord</strong> uses Snowflake IDs for users, channels, messages and servers, and its API documentation shows how to extract the timestamp.</li>
+<li><strong>Databases</strong>: MongoDB's default <code>_id</code> is an ObjectId; PostgreSQL offers <code>gen_random_uuid()</code> (v4) and, from version 18, <code>uuidv7()</code>; CockroachDB's <code>unique_rowid()</code> combines a timestamp and node ID for the same reasons as Snowflake.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>Whenever data is sharded or written in more than one place: chat messages, tweets, orders, short URLs. Say what the ID needs (unique, 64-bit, time-sortable) and name a scheme in one sentence ("Snowflake-style IDs: 41-bit timestamp, 10-bit worker, 12-bit sequence, so messages sort by ID") unless the interviewer asks for depth. In <a href="chat-system.html">chat</a> and <a href="news-feed.html">news feed</a> designs, time-sortable IDs make pagination by ID natural.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>Why not just use UUIDv4? Index locality and 16-byte keys; mention v7 as the fix.</li>
+<li>What is the throughput of one Snowflake node, and how long does the scheme last? (4,096 per ms; about 69.7 years from the epoch.)</li>
+<li>What happens if the clock goes backwards? Refuse or wait, persist the high-water mark, alert.</li>
+<li>How are machine IDs assigned, and what if two nodes get the same one? (Leases in ZooKeeper or etcd; duplicates are silent, so this must be airtight.)</li>
+<li>Can you sort events across nodes by ID? Only approximately: skew between clocks reorders IDs created close together.</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>A single auto-increment database as the ID source for a multi-region, high-write system.</li>
+<li>Hashing or truncating a UUID to 64 bits and assuming it stays unique.</li>
+<li>Treating time-ordered IDs as unguessable secrets.</li>
+<li>Ignoring clock behaviour entirely in a timestamp-based scheme.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://www.rfc-editor.org/rfc/rfc9562" target="_blank" rel="noopener">RFC 9562: Universally Unique IDentifiers (UUIDs)</a><span>Davis, Peabody and Leach, IETF, 2024. Defines UUID versions 1 to 8, including the new time-ordered v6 and v7.</span></li>
+<li><a href="https://blog.x.com/engineering/en_us/a/2010/announcing-snowflake" target="_blank" rel="noopener">Announcing Snowflake</a><span>Twitter Engineering, 2010. The requirements that led to the 64-bit timestamp, worker and sequence layout.</span></li>
+<li><a href="https://code.flickr.net/2010/02/08/ticket-servers-distributed-unique-primary-keys-on-the-cheap/" target="_blank" rel="noopener">Ticket Servers: Distributed Unique Primary Keys on the Cheap</a><span>Flickr Engineering, 2010. The odd/even MySQL ticket server design with the full SQL.</span></li>
+<li><a href="https://medium.com/instagram-engineering/sharding-ids-at-instagram-1cf5a71e5a5c" target="_blank" rel="noopener">Sharding &amp; IDs at Instagram</a><span>Instagram Engineering, 2011. Compares the alternatives and describes shard-embedded IDs generated inside PostgreSQL.</span></li>
+<li><a href="https://github.com/ulid/spec" target="_blank" rel="noopener">ULID specification</a><span>The canonical format, encoding and monotonicity rules for ULIDs.</span></li>
+</ul>

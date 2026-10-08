@@ -1,0 +1,723 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">Some questions get expensive at scale only because the answer has to be exact. "Have I crawled this URL before?" over 5 billion URLs, "how many distinct users opened the app today?" across 100 million users, "which 10 products are viewed most this minute?" over a million events per second. Exact answers need memory that grows with the number of items. Probabilistic data structures answer the same questions in a fixed, small amount of memory, in exchange for a small, bounded error that you choose up front, and for Bloom filters and Count-Min Sketch that error only goes in one direction.</p>
+<p>A web crawler that remembers 5 billion seen URLs in a hash set needs hundreds of gigabytes: the URLs alone average around 80 bytes, before pointers and hash-table overhead. A <dfn>Bloom filter</dfn> answering the same question with a 1% false-positive rate needs about 6 GB and fits on one machine. Counting unique visitors exactly for one day means storing every visitor id, about 800 MB for 100 million 8-byte ids, per counter. A HyperLogLog does it in 12 KB with under 1% error, and you can keep one per page per day.</p>
+<p>The three structures in this chapter each answer one kind of question:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Structure</th><th>Question</th><th>Error</th><th>Memory</th></tr></thead>
+<tbody>
+<tr><th>Bloom filter</th><td>Is <code>x</code> in the set?</td><td>False positives at a chosen rate, never false negatives</td><td>~9.6 bits per item at 1%</td></tr>
+<tr><th>HyperLogLog</th><td>How many distinct items have I seen?</td><td>About 1.04/√m relative error (0.81% at 12 KB)</td><td>Fixed, independent of the count</td></tr>
+<tr><th>Count-Min Sketch</th><td>How often has <code>x</code> occurred? What are the top k?</td><td>Overestimates by at most εN, with probability 1 - δ</td><td>Fixed, set by ε and δ</td></tr>
+</tbody></table></div>
+<p>The common trick is hashing. Each structure hashes items into a small array and keeps only a summary per slot, so collisions are the source of the error, and the maths of collisions lets you size the array for the error you can tolerate.</p>
+
+<h2 id="bloom">Bloom filters: is this item in the set?</h2>
+<p>A Bloom filter is an array of <code>m</code> bits, all 0 at the start, plus <code>k</code> independent hash functions that each map an item to one of the <code>m</code> positions.</p>
+<ul>
+<li><strong>Add</strong> an item: compute its <code>k</code> positions and set those bits to 1.</li>
+<li><strong>Query</strong> an item: compute its <code>k</code> positions. If any of those bits is 0, the item was <em>definitely never added</em>. If all are 1, the item was <em>probably</em> added.</li>
+</ul>
+<p>Step through the figure: two inserts, one query that the filter answers correctly, and one false positive.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 285" role="img" aria-label="Bloom filter with 16 bits and 3 hash functions: inserting alice and bob, a true negative for carol and a false positive for dave">
+<text class="t xs mute" x="72" y="160">bit array, m = 16</text>
+<rect x="72" y="170" width="36" height="36" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<g data-show="1 2 3 4 5"><text class="t mono mute mid" x="90.0" y="193">0</text></g>
+<text class="t xs mute mid" x="90.0" y="222">0</text>
+<rect x="108" y="170" width="36" height="36" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<g data-show="2 3 4 5"><rect x="111" y="173" width="30" height="30" rx="3" class="n svc"/><text class="t mono b mid" x="126.0" y="193">1</text></g>
+<g data-show="1"><text class="t mono mute mid" x="126.0" y="193">0</text></g>
+<text class="t xs mute mid" x="126.0" y="222">1</text>
+<rect x="144" y="170" width="36" height="36" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<g data-show="1 2 3 4 5"><text class="t mono mute mid" x="162.0" y="193">0</text></g>
+<text class="t xs mute mid" x="162.0" y="222">2</text>
+<rect x="180" y="170" width="36" height="36" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<g data-show="1 2 3 4 5"><text class="t mono mute mid" x="198.0" y="193">0</text></g>
+<text class="t xs mute mid" x="198.0" y="222">3</text>
+<rect x="216" y="170" width="36" height="36" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<g data-show="3 4 5"><rect x="219" y="173" width="30" height="30" rx="3" class="n svc"/><text class="t mono b mid" x="234.0" y="193">1</text></g>
+<g data-show="1 2"><text class="t mono mute mid" x="234.0" y="193">0</text></g>
+<text class="t xs mute mid" x="234.0" y="222">4</text>
+<rect x="252" y="170" width="36" height="36" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<g data-show="1 2 3 4 5"><text class="t mono mute mid" x="270.0" y="193">0</text></g>
+<text class="t xs mute mid" x="270.0" y="222">5</text>
+<rect x="288" y="170" width="36" height="36" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<g data-show="2 3 4 5"><rect x="291" y="173" width="30" height="30" rx="3" class="n svc"/><text class="t mono b mid" x="306.0" y="193">1</text></g>
+<g data-show="1"><text class="t mono mute mid" x="306.0" y="193">0</text></g>
+<text class="t xs mute mid" x="306.0" y="222">6</text>
+<rect x="324" y="170" width="36" height="36" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<g data-show="1 2 3 4 5"><text class="t mono mute mid" x="342.0" y="193">0</text></g>
+<text class="t xs mute mid" x="342.0" y="222">7</text>
+<rect x="360" y="170" width="36" height="36" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<g data-show="1 2 3 4 5"><text class="t mono mute mid" x="378.0" y="193">0</text></g>
+<text class="t xs mute mid" x="378.0" y="222">8</text>
+<rect x="396" y="170" width="36" height="36" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<g data-show="1 2 3 4 5"><text class="t mono mute mid" x="414.0" y="193">0</text></g>
+<text class="t xs mute mid" x="414.0" y="222">9</text>
+<rect x="432" y="170" width="36" height="36" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<g data-show="1 2 3 4 5"><text class="t mono mute mid" x="450.0" y="193">0</text></g>
+<text class="t xs mute mid" x="450.0" y="222">10</text>
+<rect x="468" y="170" width="36" height="36" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<g data-show="2 3 4 5"><rect x="471" y="173" width="30" height="30" rx="3" class="n svc"/><text class="t mono b mid" x="486.0" y="193">1</text></g>
+<g data-show="1"><text class="t mono mute mid" x="486.0" y="193">0</text></g>
+<text class="t xs mute mid" x="486.0" y="222">11</text>
+<rect x="504" y="170" width="36" height="36" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<g data-show="1 2 3 4 5"><text class="t mono mute mid" x="522.0" y="193">0</text></g>
+<text class="t xs mute mid" x="522.0" y="222">12</text>
+<rect x="540" y="170" width="36" height="36" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<g data-show="1 2 3 4 5"><text class="t mono mute mid" x="558.0" y="193">0</text></g>
+<text class="t xs mute mid" x="558.0" y="222">13</text>
+<rect x="576" y="170" width="36" height="36" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<g data-show="3 4 5"><rect x="579" y="173" width="30" height="30" rx="3" class="n svc"/><text class="t mono b mid" x="594.0" y="193">1</text></g>
+<g data-show="1 2"><text class="t mono mute mid" x="594.0" y="193">0</text></g>
+<text class="t xs mute mid" x="594.0" y="222">14</text>
+<rect x="612" y="170" width="36" height="36" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<g data-show="1 2 3 4 5"><text class="t mono mute mid" x="630.0" y="193">0</text></g>
+<text class="t xs mute mid" x="630.0" y="222">15</text>
+<g data-show="2">
+<rect class="n client" x="240" y="30" width="240" height="50" rx="8"/>
+<text class="t mono b mid" x="360" y="51">add("alice")</text>
+<text class="t xs mute mid" x="360" y="68">h1, h2, h3 = 1, 6, 11</text>
+<path class="e accent" d="M300,82 L126,166"/>
+<path class="e accent" d="M360,82 L306,166"/>
+<path class="e accent" d="M420,82 L486,166"/>
+</g>
+<g data-show="3">
+<rect class="n client" x="240" y="30" width="240" height="50" rx="8"/>
+<text class="t mono b mid" x="360" y="51">add("bob")</text>
+<text class="t xs mute mid" x="360" y="68">h1, h2, h3 = 4, 11, 14</text>
+<path class="e accent" d="M300,82 L234,166"/>
+<path class="e accent" d="M360,82 L486,166"/>
+<path class="e accent" d="M420,82 L594,166"/>
+</g>
+<g data-show="4">
+<rect class="n ext" x="240" y="30" width="240" height="50" rx="8"/>
+<text class="t mono b mid" x="360" y="51">contains("carol")</text>
+<text class="t xs mute mid" x="360" y="68">h1, h2, h3 = 1, 9, 14</text>
+<path class="e" d="M300,82 L126,166"/>
+<path class="e red" d="M360,82 L414,166"/>
+<path class="e" d="M420,82 L594,166"/>
+</g>
+<g data-show="5">
+<rect class="n ext" x="240" y="30" width="240" height="50" rx="8"/>
+<text class="t mono b mid" x="360" y="51">contains("dave")</text>
+<text class="t xs mute mid" x="360" y="68">h1, h2, h3 = 4, 6, 14</text>
+<path class="e" d="M300,82 L234,166"/>
+<path class="e" d="M360,82 L306,166"/>
+<path class="e" d="M420,82 L594,166"/>
+</g>
+<g data-show="1"><text class="t sm mid" x="360" y="252">Empty filter: all 16 bits are 0. Each item is hashed by k = 3 functions.</text></g>
+<g data-show="2"><text class="t sm mid" x="360" y="252">Insert: set the 3 bits the hashes point to.</text></g>
+<g data-show="3"><text class="t sm mid" x="360" y="252">Bits are shared: bit 11 is set by both alice and bob.</text><text class="t xs mute mid" x="360" y="270">No bit records which item set it, so nothing can be removed.</text></g>
+<g data-show="4"><text class="t sm mid green" x="360" y="252">Bit 9 is 0, so carol was definitely never added.</text><text class="t xs mute mid" x="360" y="270">One 0 bit is proof of absence: no false negatives.</text></g>
+<g data-show="5"><text class="t sm mid red" x="360" y="252">All 3 bits are 1, but dave was never added: a false positive.</text><text class="t xs mute mid" x="360" y="270">Bits 4, 6 and 14 were set by alice and bob.</text></g>
+<g data-show="1"><text class="t sm mute mid" x="360" y="60">empty filter</text></g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Empty</button><button type="button" data-step="2" aria-pressed="false">Add alice</button><button type="button" data-step="3" aria-pressed="false">Add bob</button><button type="button" data-step="4" aria-pressed="false">Query carol</button><button type="button" data-step="5" aria-pressed="false">Query dave</button></div>
+</div>
+<figcaption><b>Bloom filter, m = 16 bits, k = 3.</b> A query is a "no" as soon as it finds one 0 bit. A "yes" only means every bit happens to be set, possibly by other items, which is how dave becomes a false positive.</figcaption>
+</figure>
+
+<h3 id="one-sided-error">Why the error only goes one way</h3>
+<p>Bits only ever go from 0 to 1. If an item was added, its <code>k</code> bits were set and stay set, so a query for it always finds all 1s. A <dfn>false negative</dfn> is impossible. A <dfn>false positive</dfn> happens when other items have, between them, set all <code>k</code> bits of an item that was never added.</p>
+<p>That asymmetry decides where a Bloom filter fits. It works as a cheap <strong>pre-check in front of an expensive exact lookup</strong>: a "no" skips the lookup entirely, a "maybe" falls through to the real data, which gives the exact answer. The false-positive rate is then just the fraction of wasted lookups. It does not work where a false "yes" is acted on without checking, for example deciding a username is taken and refusing it, unless an occasional wrong refusal is acceptable.</p>
+
+<h3 id="sizing">Sizing: m and k from n and p</h3>
+<p>You pick two numbers: <code>n</code>, how many items you expect to add, and <code>p</code>, the false-positive rate you can accept. Everything else follows from the probability that a given bit is still 0.</p>
+<ul>
+<li>One hash sets a given bit with probability <code>1/m</code>. After <code>n</code> items with <code>k</code> hashes each, a bit is still 0 with probability <code>(1 - 1/m)<sup>kn</sup> ≈ e<sup>-kn/m</sup></code>.</li>
+<li>A false positive needs all <code>k</code> bits of a new item to be 1: <code>p ≈ (1 - e<sup>-kn/m</sup>)<sup>k</sup></code>.</li>
+<li>For fixed <code>m</code> and <code>n</code>, that is smallest when <code>k = (m/n) ln 2</code>. At that point exactly half the bits are 1, and <code>p = (1/2)<sup>k</sup></code>.</li>
+<li>Substituting back and solving for <code>m</code> gives the sizing formula.</li>
+</ul>
+<div class="calc">m = -n · ln p / (ln 2)²        bits in the array
+k = (m / n) · ln 2             hash functions, rounded to an integer</div>
+<p>Notice that <code>m/n</code>, the bits per item, depends only on <code>p</code>. The size of the items does not matter at all: a filter of 100-byte URLs and a filter of 8-byte ids cost the same per item.</p>
+<p><strong>Worked example.</strong> A crawler wants to remember 1 billion URLs with a 1% false-positive rate.</p>
+<div class="calc">n = 1,000,000,000     p = 0.01
+m = 1e9 × ln(100) / (ln 2)²  = 1e9 × 4.605 / 0.4805  = 9.585e9 bits  ≈ <span class="r">1.2 GB</span>
+k = 9.585 × 0.693            = 6.64                                 → <span class="r">7 hashes</span>
+Exact set: 1e9 URLs × ~80 B = 80 GB of strings, before hash-table overhead
+Cost of a false positive: 1 in 100 new URLs is wrongly skipped as "seen"</div>
+<p>Each tenfold improvement in <code>p</code> costs the same 4.79 extra bits per item, because <code>ln 10 / (ln 2)² ≈ 4.79</code>:</p>
+<div class="table-wrap"><table>
+<thead><tr><th class="num">Target false-positive rate</th><th class="num">Bits per item</th><th class="num">Optimal k</th><th class="num">1 billion items</th></tr></thead>
+<tbody>
+<tr><td class="num">10%</td><td class="num">4.79</td><td class="num">3</td><td class="num">0.6 GB</td></tr>
+<tr><td class="num">1%</td><td class="num">9.59</td><td class="num">7</td><td class="num">1.2 GB</td></tr>
+<tr><td class="num">0.1%</td><td class="num">14.38</td><td class="num">10</td><td class="num">1.8 GB</td></tr>
+<tr><td class="num">0.01%</td><td class="num">19.17</td><td class="num">13</td><td class="num">2.4 GB</td></tr>
+</tbody></table></div>
+<div class="callout note">
+<div class="callout-title">Rule of thumb</div>
+<p>About 10 bits per item gives about 1% false positives. RocksDB exposes exactly this knob as "bits per key", and 10 is the commonly recommended value.</p>
+</div>
+
+<h3 id="overfill">What happens when the filter overfills</h3>
+<p>A Bloom filter cannot grow. If you size it for 100,000 items and insert more, more bits turn to 1 and the false-positive rate climbs steeply. Nothing fails loudly: the filter just says "maybe" more and more often until it says it about everything.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 300" role="img" aria-label="False-positive rate rises from 0.025% at 50k items to 1% at 100k, 15.7% at 200k and 43.6% at 300k for a filter sized for 100k">
+<path class="line faint" d="M80,250.0 H680"/><text class="t xs mute end" x="72" y="254.0">0.001%</text>
+<path class="line faint" d="M80,206.0 H680"/><text class="t xs mute end" x="72" y="210.0">0.01%</text>
+<path class="line faint" d="M80,162.0 H680"/><text class="t xs mute end" x="72" y="166.0">0.1%</text>
+<path class="line faint" d="M80,118.0 H680"/><text class="t xs mute end" x="72" y="122.0">1%</text>
+<path class="line faint" d="M80,74.0 H680"/><text class="t xs mute end" x="72" y="78.0">10%</text>
+<path class="line faint" d="M80,30.0 H680"/><text class="t xs mute end" x="72" y="34.0">100%</text>
+<path class="line faint" d="M80.0,250 V255"/><text class="t xs mute mid" x="80.0" y="269">0k</text>
+<path class="line faint" d="M180.0,250 V255"/><text class="t xs mute mid" x="180.0" y="269">50k</text>
+<path class="line faint" d="M280.0,250 V255"/><text class="t xs mute mid" x="280.0" y="269">100k</text>
+<path class="line faint" d="M380.0,250 V255"/><text class="t xs mute mid" x="380.0" y="269">150k</text>
+<path class="line faint" d="M480.0,250 V255"/><text class="t xs mute mid" x="480.0" y="269">200k</text>
+<path class="line faint" d="M580.0,250 V255"/><text class="t xs mute mid" x="580.0" y="269">250k</text>
+<path class="line faint" d="M680.0,250 V255"/><text class="t xs mute mid" x="680.0" y="269">300k</text>
+<path class="line" d="M80,250 H680"/>
+<path class="line" style="stroke:var(--accent);stroke-width:2" d="M140.0,247.5 L142.0,243.6 L144.0,239.8 L146.0,236.1 L148.0,232.6 L150.0,229.2 L152.0,225.9 L154.0,222.7 L156.0,219.6 L158.0,216.6 L160.0,213.7 L162.0,210.8 L164.0,208.1 L166.0,205.4 L168.0,202.8 L170.0,200.2 L172.0,197.8 L174.0,195.3 L176.0,193.0 L178.0,190.7 L180.0,188.4 L182.0,186.2 L184.0,184.1 L186.0,182.0 L188.0,180.0 L190.0,178.0 L192.0,176.0 L194.0,174.1 L196.0,172.2 L198.0,170.4 L200.0,168.6 L202.0,166.8 L204.0,165.1 L206.0,163.4 L208.0,161.8 L210.0,160.2 L212.0,158.6 L214.0,157.0 L216.0,155.5 L218.0,154.0 L220.0,152.5 L222.0,151.0 L224.0,149.6 L226.0,148.2 L228.0,146.8 L230.0,145.5 L232.0,144.2 L234.0,142.9 L236.0,141.6 L238.0,140.3 L240.0,139.1 L242.0,137.8 L244.0,136.6 L246.0,135.5 L248.0,134.3 L250.0,133.2 L252.0,132.0 L254.0,130.9 L256.0,129.8 L258.0,128.8 L260.0,127.7 L262.0,126.7 L264.0,125.6 L266.0,124.6 L268.0,123.6 L270.0,122.6 L272.0,121.7 L274.0,120.7 L276.0,119.8 L278.0,118.8 L280.0,117.9 L282.0,117.0 L284.0,116.1 L286.0,115.3 L288.0,114.4 L290.0,113.5 L292.0,112.7 L294.0,111.9 L296.0,111.0 L298.0,110.2 L300.0,109.4 L302.0,108.7 L304.0,107.9 L306.0,107.1 L308.0,106.4 L310.0,105.6 L312.0,104.9 L314.0,104.1 L316.0,103.4 L318.0,102.7 L320.0,102.0 L322.0,101.3 L324.0,100.6 L326.0,100.0 L328.0,99.3 L330.0,98.6 L332.0,98.0 L334.0,97.3 L336.0,96.7 L338.0,96.1 L340.0,95.5 L342.0,94.8 L344.0,94.2 L346.0,93.6 L348.0,93.0 L350.0,92.5 L352.0,91.9 L354.0,91.3 L356.0,90.7 L358.0,90.2 L360.0,89.6 L362.0,89.1 L364.0,88.6 L366.0,88.0 L368.0,87.5 L370.0,87.0 L372.0,86.5 L374.0,85.9 L376.0,85.4 L378.0,84.9 L380.0,84.4 L382.0,84.0 L384.0,83.5 L386.0,83.0 L388.0,82.5 L390.0,82.1 L392.0,81.6 L394.0,81.1 L396.0,80.7 L398.0,80.2 L400.0,79.8 L402.0,79.4 L404.0,78.9 L406.0,78.5 L408.0,78.1 L410.0,77.7 L412.0,77.2 L414.0,76.8 L416.0,76.4 L418.0,76.0 L420.0,75.6 L422.0,75.2 L424.0,74.8 L426.0,74.4 L428.0,74.1 L430.0,73.7 L432.0,73.3 L434.0,72.9 L436.0,72.6 L438.0,72.2 L440.0,71.8 L442.0,71.5 L444.0,71.1 L446.0,70.8 L448.0,70.4 L450.0,70.1 L452.0,69.8 L454.0,69.4 L456.0,69.1 L458.0,68.8 L460.0,68.4 L462.0,68.1 L464.0,67.8 L466.0,67.5 L468.0,67.1 L470.0,66.8 L472.0,66.5 L474.0,66.2 L476.0,65.9 L478.0,65.6 L480.0,65.3 L482.0,65.0 L484.0,64.7 L486.0,64.5 L488.0,64.2 L490.0,63.9 L492.0,63.6 L494.0,63.3 L496.0,63.1 L498.0,62.8 L500.0,62.5 L502.0,62.2 L504.0,62.0 L506.0,61.7 L508.0,61.5 L510.0,61.2 L512.0,60.9 L514.0,60.7 L516.0,60.4 L518.0,60.2 L520.0,59.9 L522.0,59.7 L524.0,59.5 L526.0,59.2 L528.0,59.0 L530.0,58.7 L532.0,58.5 L534.0,58.3 L536.0,58.1 L538.0,57.8 L540.0,57.6 L542.0,57.4 L544.0,57.2 L546.0,56.9 L548.0,56.7 L550.0,56.5 L552.0,56.3 L554.0,56.1 L556.0,55.9 L558.0,55.7 L560.0,55.5 L562.0,55.3 L564.0,55.1 L566.0,54.9 L568.0,54.7 L570.0,54.5 L572.0,54.3 L574.0,54.1 L576.0,53.9 L578.0,53.7 L580.0,53.5 L582.0,53.3 L584.0,53.1 L586.0,52.9 L588.0,52.8 L590.0,52.6 L592.0,52.4 L594.0,52.2 L596.0,52.0 L598.0,51.9 L600.0,51.7 L602.0,51.5 L604.0,51.4 L606.0,51.2 L608.0,51.0 L610.0,50.9 L612.0,50.7 L614.0,50.5 L616.0,50.4 L618.0,50.2 L620.0,50.1 L622.0,49.9 L624.0,49.7 L626.0,49.6 L628.0,49.4 L630.0,49.3 L632.0,49.1 L634.0,49.0 L636.0,48.8 L638.0,48.7 L640.0,48.5 L642.0,48.4 L644.0,48.2 L646.0,48.1 L648.0,48.0 L650.0,47.8 L652.0,47.7 L654.0,47.5 L656.0,47.4 L658.0,47.3 L660.0,47.1 L662.0,47.0 L664.0,46.9 L666.0,46.7 L668.0,46.6 L670.0,46.5 L672.0,46.4 L674.0,46.2 L676.0,46.1 L678.0,46.0 L680.0,45.9"/>
+<path class="line faint" style="stroke-dasharray:4 4" d="M280.0,117.9 V250"/>
+<circle class="dot accent" cx="280.0" cy="117.9" r="4.5"/>
+<text class="t sm b" x="290.0" y="135.9">design point: 100k items, 1.0%</text>
+<circle class="dot" cx="480.0" cy="65.3" r="4"/>
+<text class="t sm " x="490.0" y="96">200k: 15.7%</text>
+<circle class="dot" cx="680.0" cy="45.9" r="4"/>
+<text class="t sm end" x="676.0" y="96">300k: 43.6%</text>
+<text class="t xs mute mid" x="380.0" y="288">items inserted into a filter sized for 100,000 (m = 958,506 bits, k = 7)</text>
+<text class="t xs mute" x="10" y="18">false-positive rate (log scale)</text>
+</svg>
+</div>
+<figcaption><b>Overfilling a Bloom filter.</b> Sized for 100,000 items at 1%. At half the design load it gives 0.025%, at double the load 15.7%, at triple 43.6%. Size for the peak item count, and monitor the fraction of set bits: at the design load it is about 50%.</figcaption>
+</figure>
+<p>For sets that grow without a known bound, a <dfn>scalable Bloom filter</dfn> chains filters: when the current one reaches its design load, it starts a new, larger one with a tighter target rate. Queries check every filter in the chain, and the total false-positive rate converges to a chosen bound. RedisBloom's <code>BF.ADD</code> works this way when a filter fills up. The other common fix is rotation: a new filter per day or per hour, so old entries age out with the filter.</p>
+
+<h3 id="bloom-code">Implementation</h3>
+<p>Computing <code>k</code> independent hashes is wasteful. Kirsch and Mitzenmacher showed that two hashes are enough: position <code>i</code> is <code>h1 + i · h2 mod m</code>, with no loss in false-positive rate. The filter below uses one 128-bit BLAKE2 hash split into two 64-bit halves, packs bits into a <code>bytearray</code>, and measures the false-positive rate against the formula.</p>
+<pre><code class="language-python">import hashlib
+import math
+
+
+class BloomFilter:
+    def __init__(self, n: int, p: float):
+        self.m = math.ceil(-n * math.log(p) / math.log(2) ** 2)   # bits
+        self.k = max(1, round(self.m / n * math.log(2)))           # hash functions
+        self.bits = bytearray((self.m + 7) // 8)
+
+    def _positions(self, item: str):
+        # Kirsch-Mitzenmacher: k positions from two 64-bit hashes, g_i = h1 + i*h2
+        d = hashlib.blake2b(item.encode(), digest_size=16).digest()
+        h1, h2 = int.from_bytes(d[:8], "big"), int.from_bytes(d[8:], "big") | 1
+        return [(h1 + i * h2) % self.m for i in range(self.k)]
+
+    def add(self, item: str):
+        for pos in self._positions(item):
+            self.bits[pos &gt;&gt; 3] |= 1 &lt;&lt; (pos &amp; 7)
+
+    def __contains__(self, item: str) -&gt; bool:
+        return all(self.bits[pos &gt;&gt; 3] &amp; (1 &lt;&lt; (pos &amp; 7)) for pos in self._positions(item))
+
+
+n, p = 100_000, 0.01
+bf = BloomFilter(n, p)
+for i in range(n):
+    bf.add(f"user:{i}")
+
+assert all(f"user:{i}" in bf for i in range(n))            # no false negatives, ever
+trials = 200_000
+fp = sum(f"other:{i}" in bf for i in range(trials))         # keys never inserted
+theory = (1 - math.exp(-bf.k * n / bf.m)) ** bf.k
+print(f"m = {bf.m:,} bits ({bf.m / 8 / 1024:.0f} KiB), k = {bf.k}")
+print(f"false positives: measured {fp / trials:.3%}, theory {theory:.3%}")
+
+# m = 958,506 bits (117 KiB), k = 7
+# false positives: measured 0.988%, theory 1.004%</code></pre>
+<p>The measured rate matches the theory to within sampling noise, and 100,000 items cost 117 KiB. A Python <code>set</code> of the same 100,000 strings takes about 9 MB.</p>
+
+<h3 id="deletion">Deletion: counting Bloom filters and cuckoo filters</h3>
+<p>You cannot delete from a plain Bloom filter. Clearing an item's bits would also clear bits shared with other items (bit 11 in the step-through belongs to both alice and bob), and those items would then return false negatives, breaking the one guarantee the filter makes.</p>
+<p>A <dfn>counting Bloom filter</dfn> replaces each bit with a small counter, typically 4 bits. Add increments the <code>k</code> counters, delete decrements them, and a query checks that all <code>k</code> are non-zero. The cost is 4 times the memory. Fan et al. showed that 4-bit counters overflow with negligible probability at sensible loads, but deleting an item that was never added still corrupts the filter, so deletes must be of items you know were inserted.</p>
+<p>A <dfn>cuckoo filter</dfn> stores a short fingerprint of each item in one of two candidate buckets, moving existing fingerprints around cuckoo-hashing style when both are full. It supports deletion directly, and for false-positive rates below about 3% it uses less space than a Bloom filter. The catch is that inserts can fail when the table is nearly full, so it must be sized with headroom.</p>
+
+<h2 id="hyperloglog">HyperLogLog: how many distinct items?</h2>
+<p>Counting distinct items, the <dfn>cardinality</dfn> of a set, exactly requires remembering every item seen, because you cannot tell a repeat from a new item otherwise. HyperLogLog estimates it from a few kilobytes no matter whether the true answer is a thousand or a billion.</p>
+
+<h3 id="leading-zeros">The intuition: leading zeros</h3>
+<p>Hash every item to a uniformly random bit string. A hash starts with <code>0</code> half the time, with <code>00</code> a quarter of the time, and with <code>r</code> zeros followed by a 1 with probability <code>2<sup>-(r+1)</sup></code>. So if the longest run of leading zeros you have seen is 20, you have probably hashed around a million distinct items: seeing a 1-in-2<sup>21</sup> pattern needs that many tries. Duplicates do not matter, because the same item always produces the same hash and cannot set a new record.</p>
+<p>One such estimate is very noisy: a single lucky hash with 30 leading zeros makes it a billion. HyperLogLog fixes the noise with two moves.</p>
+<ul>
+<li><strong>Stochastic averaging.</strong> Use the first <code>p</code> bits of the hash to pick one of <code>m = 2<sup>p</sup></code> <dfn>registers</dfn>, and the rest of the hash to compute a <dfn>rank</dfn>: the position of the first 1 bit. Each register keeps the largest rank it has seen. Each register is now an independent estimator over about <code>1/m</code> of the items.</li>
+<li><strong>Harmonic mean.</strong> Combine registers with the harmonic mean of <code>2<sup>M[j]</sup></code>, which damps the effect of the few registers that got an unusually high rank. Multiply by <code>m</code> (for the number of registers) and a bias-correcting constant <code>α ≈ 0.7213 / (1 + 1.079/m)</code>.</li>
+</ul>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 310" role="img" aria-label="HyperLogLog update: the first 14 bits of a 64-bit hash pick register 9,168; three leading zeros give rank 4, and the register keeps the maximum rank seen">
+<text class="t sm" x="40" y="24"><tspan class="b">hash("visitor-7")</tspan>, 64 bits</text>
+<rect x="40" y="58" width="10" height="22" style="fill:var(--d-svc);stroke:var(--d-svc-s)"/>
+<text class="t xs mono mid" x="45" y="73" style="font-size:9.5px">1</text>
+<rect x="50" y="58" width="10" height="22" style="fill:var(--d-svc);stroke:var(--d-svc-s)"/>
+<text class="t xs mono mid" x="55" y="73" style="font-size:9.5px">0</text>
+<rect x="60" y="58" width="10" height="22" style="fill:var(--d-svc);stroke:var(--d-svc-s)"/>
+<text class="t xs mono mid" x="65" y="73" style="font-size:9.5px">0</text>
+<rect x="70" y="58" width="10" height="22" style="fill:var(--d-svc);stroke:var(--d-svc-s)"/>
+<text class="t xs mono mid" x="75" y="73" style="font-size:9.5px">0</text>
+<rect x="80" y="58" width="10" height="22" style="fill:var(--d-svc);stroke:var(--d-svc-s)"/>
+<text class="t xs mono mid" x="85" y="73" style="font-size:9.5px">1</text>
+<rect x="90" y="58" width="10" height="22" style="fill:var(--d-svc);stroke:var(--d-svc-s)"/>
+<text class="t xs mono mid" x="95" y="73" style="font-size:9.5px">1</text>
+<rect x="100" y="58" width="10" height="22" style="fill:var(--d-svc);stroke:var(--d-svc-s)"/>
+<text class="t xs mono mid" x="105" y="73" style="font-size:9.5px">1</text>
+<rect x="110" y="58" width="10" height="22" style="fill:var(--d-svc);stroke:var(--d-svc-s)"/>
+<text class="t xs mono mid" x="115" y="73" style="font-size:9.5px">1</text>
+<rect x="120" y="58" width="10" height="22" style="fill:var(--d-svc);stroke:var(--d-svc-s)"/>
+<text class="t xs mono mid" x="125" y="73" style="font-size:9.5px">0</text>
+<rect x="130" y="58" width="10" height="22" style="fill:var(--d-svc);stroke:var(--d-svc-s)"/>
+<text class="t xs mono mid" x="135" y="73" style="font-size:9.5px">1</text>
+<rect x="140" y="58" width="10" height="22" style="fill:var(--d-svc);stroke:var(--d-svc-s)"/>
+<text class="t xs mono mid" x="145" y="73" style="font-size:9.5px">0</text>
+<rect x="150" y="58" width="10" height="22" style="fill:var(--d-svc);stroke:var(--d-svc-s)"/>
+<text class="t xs mono mid" x="155" y="73" style="font-size:9.5px">0</text>
+<rect x="160" y="58" width="10" height="22" style="fill:var(--d-svc);stroke:var(--d-svc-s)"/>
+<text class="t xs mono mid" x="165" y="73" style="font-size:9.5px">0</text>
+<rect x="170" y="58" width="10" height="22" style="fill:var(--d-svc);stroke:var(--d-svc-s)"/>
+<text class="t xs mono mid" x="175" y="73" style="font-size:9.5px">0</text>
+<rect x="180" y="58" width="10" height="22" style="fill:var(--d-cache);stroke:var(--d-cache-s)"/>
+<text class="t xs mono mid" x="185" y="73" style="font-size:9.5px">0</text>
+<rect x="190" y="58" width="10" height="22" style="fill:var(--d-cache);stroke:var(--d-cache-s)"/>
+<text class="t xs mono mid" x="195" y="73" style="font-size:9.5px">0</text>
+<rect x="200" y="58" width="10" height="22" style="fill:var(--d-cache);stroke:var(--d-cache-s)"/>
+<text class="t xs mono mid" x="205" y="73" style="font-size:9.5px">0</text>
+<rect x="210" y="58" width="10" height="22" style="fill:var(--accent);stroke:var(--accent)"/>
+<text class="t xs mono mid" x="215" y="73" style="font-size:9.5px;fill:var(--surface)">1</text>
+<rect x="220" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="225" y="73" style="font-size:9.5px">0</text>
+<rect x="230" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="235" y="73" style="font-size:9.5px">0</text>
+<rect x="240" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="245" y="73" style="font-size:9.5px">1</text>
+<rect x="250" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="255" y="73" style="font-size:9.5px">1</text>
+<rect x="260" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="265" y="73" style="font-size:9.5px">1</text>
+<rect x="270" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="275" y="73" style="font-size:9.5px">1</text>
+<rect x="280" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="285" y="73" style="font-size:9.5px">0</text>
+<rect x="290" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="295" y="73" style="font-size:9.5px">1</text>
+<rect x="300" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="305" y="73" style="font-size:9.5px">0</text>
+<rect x="310" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="315" y="73" style="font-size:9.5px">0</text>
+<rect x="320" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="325" y="73" style="font-size:9.5px">1</text>
+<rect x="330" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="335" y="73" style="font-size:9.5px">0</text>
+<rect x="340" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="345" y="73" style="font-size:9.5px">0</text>
+<rect x="350" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="355" y="73" style="font-size:9.5px">1</text>
+<rect x="360" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="365" y="73" style="font-size:9.5px">1</text>
+<rect x="370" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="375" y="73" style="font-size:9.5px">1</text>
+<rect x="380" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="385" y="73" style="font-size:9.5px">0</text>
+<rect x="390" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="395" y="73" style="font-size:9.5px">1</text>
+<rect x="400" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="405" y="73" style="font-size:9.5px">1</text>
+<rect x="410" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="415" y="73" style="font-size:9.5px">0</text>
+<rect x="420" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="425" y="73" style="font-size:9.5px">0</text>
+<rect x="430" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="435" y="73" style="font-size:9.5px">0</text>
+<rect x="440" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="445" y="73" style="font-size:9.5px">1</text>
+<rect x="450" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="455" y="73" style="font-size:9.5px">1</text>
+<rect x="460" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="465" y="73" style="font-size:9.5px">0</text>
+<rect x="470" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="475" y="73" style="font-size:9.5px">0</text>
+<rect x="480" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="485" y="73" style="font-size:9.5px">0</text>
+<rect x="490" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="495" y="73" style="font-size:9.5px">1</text>
+<rect x="500" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="505" y="73" style="font-size:9.5px">0</text>
+<rect x="510" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="515" y="73" style="font-size:9.5px">1</text>
+<rect x="520" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="525" y="73" style="font-size:9.5px">0</text>
+<rect x="530" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="535" y="73" style="font-size:9.5px">1</text>
+<rect x="540" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="545" y="73" style="font-size:9.5px">1</text>
+<rect x="550" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="555" y="73" style="font-size:9.5px">1</text>
+<rect x="560" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="565" y="73" style="font-size:9.5px">1</text>
+<rect x="570" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="575" y="73" style="font-size:9.5px">0</text>
+<rect x="580" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="585" y="73" style="font-size:9.5px">1</text>
+<rect x="590" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="595" y="73" style="font-size:9.5px">1</text>
+<rect x="600" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="605" y="73" style="font-size:9.5px">0</text>
+<rect x="610" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="615" y="73" style="font-size:9.5px">1</text>
+<rect x="620" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="625" y="73" style="font-size:9.5px">1</text>
+<rect x="630" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="635" y="73" style="font-size:9.5px">1</text>
+<rect x="640" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="645" y="73" style="font-size:9.5px">1</text>
+<rect x="650" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="655" y="73" style="font-size:9.5px">1</text>
+<rect x="660" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="665" y="73" style="font-size:9.5px">0</text>
+<rect x="670" y="58" width="10" height="22" style="fill:var(--surface);stroke:var(--line-strong)"/>
+<text class="t xs mono mid mute" x="675" y="73" style="font-size:9.5px">0</text>
+<path class="line" d="M40,86 V92 H180 V86"/>
+<text class="t sm b mid" x="110.0" y="108">first p = 14 bits</text>
+<text class="t xs mute mid" x="110.0" y="122">register index 9,168</text>
+<path class="line" d="M180,86 V92 H220 V86"/>
+<text class="t sm b" x="180" y="108">rank 4</text>
+<text class="t xs mute" x="180" y="122">3 zeros, then a 1</text>
+<text class="t xs mute" x="360" y="108">remaining bits are ignored</text>
+<rect class="n ext" x="40" y="200" width="62" height="36" rx="5"/>
+<text class="t mono mid" x="71.0" y="223">3</text>
+<text class="t xs mute mid" x="71.0" y="252">0</text>
+<rect class="n ext" x="110" y="200" width="62" height="36" rx="5"/>
+<text class="t mono mid" x="141.0" y="223">0</text>
+<text class="t xs mute mid" x="141.0" y="252">1</text>
+<rect class="n ext" x="180" y="200" width="62" height="36" rx="5"/>
+<text class="t mono mid" x="211.0" y="223">5</text>
+<text class="t xs mute mid" x="211.0" y="252">2</text>
+<text class="t mute mid" x="281.0" y="224">…</text>
+<rect class="n ext" x="320" y="200" width="62" height="36" rx="5"/>
+<text class="t mono mid" x="351.0" y="223">1</text>
+<text class="t xs mute mid" x="351.0" y="252">9,167</text>
+<rect class="n good" x="390" y="200" width="62" height="36" rx="5"/>
+<text class="t mono b mid" x="421.0" y="223">2→4</text>
+<text class="t xs mute mid" x="421.0" y="252">9,168</text>
+<rect class="n ext" x="460" y="200" width="62" height="36" rx="5"/>
+<text class="t mono mid" x="491.0" y="223">6</text>
+<text class="t xs mute mid" x="491.0" y="252">9,169</text>
+<text class="t mute mid" x="561.0" y="224">…</text>
+<rect class="n ext" x="600" y="200" width="62" height="36" rx="5"/>
+<text class="t mono mid" x="631.0" y="223">2</text>
+<text class="t xs mute mid" x="631.0" y="252">16,383</text>
+<path class="e accent" d="M110,140 C110,170 421.0,165 421.0,196"/>
+<text class="t xs accent" x="431.0" y="178">M[9168] = max(2, 4)</text>
+<text class="t xs mute" x="40" y="186">16,384 registers × 6 bits = 12 KB</text>
+<text class="t sm mid" x="360" y="296">estimate = α · m² / Σ 2<tspan dy="-5" style="font-size:9px">-M[j]</tspan><tspan dy="5">   (harmonic mean of 2</tspan><tspan dy="-5" style="font-size:9px">M[j]</tspan><tspan dy="5">, times m)</tspan></text>
+</svg>
+</div>
+<figcaption><b>One HyperLogLog update.</b> The first 14 bits of the hash choose register 9,168. The next bits are <code>0001</code>, so the rank is 4. The register held 2, so it becomes 4. Adding <code>visitor-7</code> again changes nothing, which is why duplicates are free.</figcaption>
+</figure>
+<p>When most registers are still 0 (small cardinalities), the formula is biased, so implementations switch to <dfn>linear counting</dfn>: with <code>V</code> empty registers, estimate <code>m · ln(m/V)</code>. Google's HyperLogLog++ goes further with a 64-bit hash, an empirical bias-correction table, and a sparse representation that stores only non-zero registers while the count is small.</p>
+
+<h3 id="hll-error">Error and memory</h3>
+<p>The relative standard error is <code>1.04 / √m</code>. Each register needs only 6 bits: with a 64-bit hash and <code>p = 14</code>, the rank is at most 64 - 14 + 1 = 51, well under the 63 that 6 bits can hold. Quadrupling memory halves the error:</p>
+<div class="table-wrap"><table>
+<thead><tr><th class="num">p (index bits)</th><th class="num">Registers m</th><th class="num">Memory at 6 bits</th><th class="num">Standard error</th></tr></thead>
+<tbody>
+<tr><td class="num">10</td><td class="num">1,024</td><td class="num">768 B</td><td class="num">3.25%</td></tr>
+<tr><td class="num">12</td><td class="num">4,096</td><td class="num">3 KB</td><td class="num">1.63%</td></tr>
+<tr><td class="num">14</td><td class="num">16,384</td><td class="num">12 KB</td><td class="num">0.81%</td></tr>
+<tr><td class="num">16</td><td class="num">65,536</td><td class="num">48 KB</td><td class="num">0.41%</td></tr>
+</tbody></table></div>
+<p>Redis uses <code>p = 14</code>: 16,384 six-bit registers, 12 KB per key in its dense encoding, 0.81% standard error. Standard error means about two thirds of estimates land within 0.81% of the truth and about 95% within 1.6%.</p>
+<pre><code class="language-python">import hashlib
+import math
+
+
+class HyperLogLog:
+    def __init__(self, p: int = 14):
+        self.p, self.m = p, 1 &lt;&lt; p                 # 2^14 = 16,384 registers
+        self.reg = bytearray(self.m)               # one byte each here; Redis packs 6 bits
+        self.alpha = 0.7213 / (1 + 1.079 / self.m)
+
+    def add(self, item: str):
+        x = int.from_bytes(hashlib.blake2b(item.encode(), digest_size=8).digest(), "big")
+        idx = x &gt;&gt; (64 - self.p)                   # first p bits pick the register
+        rest = x &amp; ((1 &lt;&lt; (64 - self.p)) - 1)      # remaining 50 bits
+        rank = (64 - self.p) - rest.bit_length() + 1   # position of the first 1 bit
+        self.reg[idx] = max(self.reg[idx], rank)
+
+    def count(self) -&gt; int:
+        est = self.alpha * self.m ** 2 / sum(2.0 ** -r for r in self.reg)
+        zeros = self.reg.count(0)
+        if est &lt;= 2.5 * self.m and zeros:          # small range: fall back to linear counting
+            est = self.m * math.log(self.m / zeros)
+        return round(est)
+
+
+hll = HyperLogLog()
+for n in range(1, 2_000_001):
+    hll.add(f"visitor-{n}")
+    if n in (1_000, 100_000, 2_000_000):
+        print(f"true {n:&gt;9,}  estimate {hll.count():&gt;9,}  error {hll.count() / n - 1:+.2%}")
+print(f"standard error 1.04/sqrt(m) = {1.04 / math.sqrt(hll.m):.2%}")
+
+# true     1,000  estimate     1,000  error +0.00%
+# true   100,000  estimate    99,842  error -0.16%
+# true 2,000,000  estimate 2,004,223  error +0.21%
+# standard error 1.04/sqrt(m) = 0.81%</code></pre>
+<p>Errors of 0.16% and 0.21% are well inside one standard error. At 1,000 items almost every register is empty, so the linear-counting branch is used, and it is close to exact.</p>
+
+<h3 id="hll-merge">Merging is the superpower</h3>
+<p>Two HyperLogLogs built with the same hash and the same <code>m</code> merge by taking the register-wise maximum. The result is exactly the sketch you would have built from the union of both streams. That makes them ideal for distributed counting and rollups:</p>
+<ul>
+<li>Each of 50 web servers keeps its own sketch for a page; a central job merges them. No coordination per event.</li>
+<li>Store one sketch per page per day. Monthly unique visitors is the merge of 30 daily sketches. Adding 30 daily unique counts would double-count everyone who visited on more than one day; merging does not.</li>
+<li>Sketches are mergeable in any order and any grouping, so they work as pre-aggregated values in OLAP stores and stream processors (see <a href="batch-stream.html">Batch vs Stream Processing</a>).</li>
+</ul>
+<div class="callout warn">
+<div class="callout-title">Intersections are not free</div>
+<p>There is no register-wise operation for intersection. You can estimate <code>|A ∩ B| = |A| + |B| - |A ∪ B|</code>, but the absolute error of each term is relative to the large sets, so a small overlap between two big sets can come out wildly wrong or even negative. If you need set intersections, look at theta sketches (Apache DataSketches) instead.</p>
+</div>
+
+<h2 id="count-min">Count-Min Sketch: how often has each item occurred?</h2>
+<p>A <dfn>Count-Min Sketch</dfn> estimates the frequency of any item in a stream. It is a grid of counters with <code>d</code> rows and <code>w</code> columns, and one independent hash function per row.</p>
+<ul>
+<li><strong>Add</strong> an item with count <code>c</code>: in every row, hash the item to a column and add <code>c</code> to that counter.</li>
+<li><strong>Estimate</strong> an item: read its counter in every row and return the <strong>minimum</strong>.</li>
+</ul>
+<p>Every counter for an item includes all of that item's occurrences, plus whatever other items collided into the same cell. Collisions can only add, so each row overestimates, and the minimum is the row with the least collision noise.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 235" role="img" aria-label="Count-Min Sketch with 3 rows of 8 counters: adding /home and /cart, then estimating /cart correctly and /new as an overestimate">
+<text class="t xs mute mid" x="276.0" y="40">0</text>
+<text class="t xs mute mid" x="328.0" y="40">1</text>
+<text class="t xs mute mid" x="380.0" y="40">2</text>
+<text class="t xs mute mid" x="432.0" y="40">3</text>
+<text class="t xs mute mid" x="484.0" y="40">4</text>
+<text class="t xs mute mid" x="536.0" y="40">5</text>
+<text class="t xs mute mid" x="588.0" y="40">6</text>
+<text class="t xs mute mid" x="640.0" y="40">7</text>
+<text class="t sm mono end" x="238" y="75">h0</text>
+<rect x="250" y="50" width="52" height="40" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<rect x="302" y="50" width="52" height="40" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<rect x="354" y="50" width="52" height="40" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<rect x="406" y="50" width="52" height="40" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<rect x="458" y="50" width="52" height="40" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<rect x="510" y="50" width="52" height="40" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<rect x="562" y="50" width="52" height="40" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<rect x="614" y="50" width="52" height="40" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<text class="t sm mono end" x="238" y="115">h1</text>
+<rect x="250" y="90" width="52" height="40" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<rect x="302" y="90" width="52" height="40" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<rect x="354" y="90" width="52" height="40" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<rect x="406" y="90" width="52" height="40" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<rect x="458" y="90" width="52" height="40" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<rect x="510" y="90" width="52" height="40" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<rect x="562" y="90" width="52" height="40" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<rect x="614" y="90" width="52" height="40" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<text class="t sm mono end" x="238" y="155">h2</text>
+<rect x="250" y="130" width="52" height="40" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<rect x="302" y="130" width="52" height="40" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<rect x="354" y="130" width="52" height="40" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<rect x="406" y="130" width="52" height="40" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<rect x="458" y="130" width="52" height="40" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<rect x="510" y="130" width="52" height="40" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<rect x="562" y="130" width="52" height="40" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<rect x="614" y="130" width="52" height="40" style="fill:var(--surface);stroke:var(--d-ext-s)"/>
+<g data-show="1"><text class="t mono mid mute" x="276.0" y="75">0</text><text class="t mono mid mute" x="328.0" y="75">0</text><rect class="n cache" x="357" y="53" width="46" height="34" rx="4"/><text class="t mono mid b" x="380.0" y="75">3</text><text class="t mono mid mute" x="432.0" y="75">0</text><text class="t mono mid mute" x="484.0" y="75">0</text><text class="t mono mid mute" x="536.0" y="75">0</text><text class="t mono mid mute" x="588.0" y="75">0</text><text class="t mono mid mute" x="640.0" y="75">0</text><text class="t mono mid mute" x="276.0" y="115">0</text><text class="t mono mid mute" x="328.0" y="115">0</text><text class="t mono mid mute" x="380.0" y="115">0</text><text class="t mono mid mute" x="432.0" y="115">0</text><text class="t mono mid mute" x="484.0" y="115">0</text><rect class="n cache" x="513" y="93" width="46" height="34" rx="4"/><text class="t mono mid b" x="536.0" y="115">3</text><text class="t mono mid mute" x="588.0" y="115">0</text><text class="t mono mid mute" x="640.0" y="115">0</text><rect class="n cache" x="253" y="133" width="46" height="34" rx="4"/><text class="t mono mid b" x="276.0" y="155">3</text><text class="t mono mid mute" x="328.0" y="155">0</text><text class="t mono mid mute" x="380.0" y="155">0</text><text class="t mono mid mute" x="432.0" y="155">0</text><text class="t mono mid mute" x="484.0" y="155">0</text><text class="t mono mid mute" x="536.0" y="155">0</text><text class="t mono mid mute" x="588.0" y="155">0</text><text class="t mono mid mute" x="640.0" y="155">0</text></g>
+<g data-show="2"><text class="t mono mid mute" x="276.0" y="75">0</text><text class="t mono mid mute" x="328.0" y="75">0</text><rect class="n cache" x="357" y="53" width="46" height="34" rx="4"/><text class="t mono mid b" x="380.0" y="75">4</text><text class="t mono mid mute" x="432.0" y="75">0</text><text class="t mono mid mute" x="484.0" y="75">0</text><text class="t mono mid mute" x="536.0" y="75">0</text><text class="t mono mid mute" x="588.0" y="75">0</text><text class="t mono mid mute" x="640.0" y="75">0</text><text class="t mono mid mute" x="276.0" y="115">0</text><rect class="n cache" x="305" y="93" width="46" height="34" rx="4"/><text class="t mono mid b" x="328.0" y="115">1</text><text class="t mono mid mute" x="380.0" y="115">0</text><text class="t mono mid mute" x="432.0" y="115">0</text><text class="t mono mid mute" x="484.0" y="115">0</text><text class="t mono mid b" x="536.0" y="115">3</text><text class="t mono mid mute" x="588.0" y="115">0</text><text class="t mono mid mute" x="640.0" y="115">0</text><text class="t mono mid b" x="276.0" y="155">3</text><text class="t mono mid mute" x="328.0" y="155">0</text><text class="t mono mid mute" x="380.0" y="155">0</text><text class="t mono mid mute" x="432.0" y="155">0</text><text class="t mono mid mute" x="484.0" y="155">0</text><text class="t mono mid mute" x="536.0" y="155">0</text><rect class="n cache" x="565" y="133" width="46" height="34" rx="4"/><text class="t mono mid b" x="588.0" y="155">1</text><text class="t mono mid mute" x="640.0" y="155">0</text></g>
+<g data-show="3"><text class="t mono mid mute" x="276.0" y="75">0</text><text class="t mono mid mute" x="328.0" y="75">0</text><rect class="n cache" x="357" y="53" width="46" height="34" rx="4"/><text class="t mono mid b" x="380.0" y="75">4</text><text class="t mono mid mute" x="432.0" y="75">0</text><text class="t mono mid mute" x="484.0" y="75">0</text><text class="t mono mid mute" x="536.0" y="75">0</text><text class="t mono mid mute" x="588.0" y="75">0</text><text class="t mono mid mute" x="640.0" y="75">0</text><text class="t mono mid mute" x="276.0" y="115">0</text><rect class="n cache" x="305" y="93" width="46" height="34" rx="4"/><text class="t mono mid b" x="328.0" y="115">1</text><text class="t mono mid mute" x="380.0" y="115">0</text><text class="t mono mid mute" x="432.0" y="115">0</text><text class="t mono mid mute" x="484.0" y="115">0</text><text class="t mono mid b" x="536.0" y="115">3</text><text class="t mono mid mute" x="588.0" y="115">0</text><text class="t mono mid mute" x="640.0" y="115">0</text><text class="t mono mid b" x="276.0" y="155">3</text><text class="t mono mid mute" x="328.0" y="155">0</text><text class="t mono mid mute" x="380.0" y="155">0</text><text class="t mono mid mute" x="432.0" y="155">0</text><text class="t mono mid mute" x="484.0" y="155">0</text><text class="t mono mid mute" x="536.0" y="155">0</text><rect class="n cache" x="565" y="133" width="46" height="34" rx="4"/><text class="t mono mid b" x="588.0" y="155">1</text><text class="t mono mid mute" x="640.0" y="155">0</text></g>
+<g data-show="4"><text class="t mono mid mute" x="276.0" y="75">0</text><text class="t mono mid mute" x="328.0" y="75">0</text><rect class="n cache" x="357" y="53" width="46" height="34" rx="4"/><text class="t mono mid b" x="380.0" y="75">4</text><text class="t mono mid mute" x="432.0" y="75">0</text><text class="t mono mid mute" x="484.0" y="75">0</text><text class="t mono mid mute" x="536.0" y="75">0</text><text class="t mono mid mute" x="588.0" y="75">0</text><text class="t mono mid mute" x="640.0" y="75">0</text><text class="t mono mid mute" x="276.0" y="115">0</text><text class="t mono mid b" x="328.0" y="115">1</text><text class="t mono mid mute" x="380.0" y="115">0</text><text class="t mono mid mute" x="432.0" y="115">0</text><text class="t mono mid mute" x="484.0" y="115">0</text><rect class="n cache" x="513" y="93" width="46" height="34" rx="4"/><text class="t mono mid b" x="536.0" y="115">3</text><text class="t mono mid mute" x="588.0" y="115">0</text><text class="t mono mid mute" x="640.0" y="115">0</text><text class="t mono mid b" x="276.0" y="155">3</text><text class="t mono mid mute" x="328.0" y="155">0</text><text class="t mono mid mute" x="380.0" y="155">0</text><text class="t mono mid mute" x="432.0" y="155">0</text><text class="t mono mid mute" x="484.0" y="155">0</text><text class="t mono mid mute" x="536.0" y="155">0</text><rect class="n cache" x="565" y="133" width="46" height="34" rx="4"/><text class="t mono mid b" x="588.0" y="155">1</text><text class="t mono mid mute" x="640.0" y="155">0</text></g>
+<g data-show="1"><rect class="n client" x="20" y="80" width="150" height="56" rx="8"/><text class="t mono b mid" x="95" y="104">add("/home", 3)</text><text class="t xs mute mid" x="95" y="122">cols 2, 5, 0</text></g>
+<g data-show="2"><rect class="n client" x="20" y="80" width="150" height="56" rx="8"/><text class="t mono b mid" x="95" y="104">add("/cart", 1)</text><text class="t xs mute mid" x="95" y="122">cols 2, 1, 6</text></g>
+<g data-show="3"><rect class="n ext" x="20" y="80" width="150" height="56" rx="8"/><text class="t mono b mid" x="95" y="104">estimate("/cart")</text><text class="t xs mute mid" x="95" y="122">cols 2, 1, 6</text></g>
+<g data-show="4"><rect class="n ext" x="20" y="80" width="150" height="56" rx="8"/><text class="t mono b mid" x="95" y="104">estimate("/new")</text><text class="t xs mute mid" x="95" y="122">cols 2, 5, 6</text></g>
+<g data-show="1"><text class="t sm mid " x="360" y="200">Add: increment one counter in every row.</text></g>
+<g data-show="2"><text class="t sm mid " x="360" y="200">/cart collides with /home in row 0, so that cell now holds 4.</text><text class="t xs mute mid" x="360" y="218">Rows 1 and 2 use independent hashes, so the collision is unlikely to repeat.</text></g>
+<g data-show="3"><text class="t sm mid green" x="360" y="200">estimate = min(4, 1, 1) = 1</text><text class="t xs mute mid" x="360" y="218">Correct: the minimum picks the row with no collision.</text></g>
+<g data-show="4"><text class="t sm mid red" x="360" y="200">estimate = min(4, 3, 1) = 1, but /new was never added</text><text class="t xs mute mid" x="360" y="218">Every row collided: an overestimate. Never an underestimate.</text></g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Add /home ×3</button><button type="button" data-step="2" aria-pressed="false">Add /cart</button><button type="button" data-step="3" aria-pressed="false">Estimate /cart</button><button type="button" data-step="4" aria-pressed="false">Estimate /new</button></div>
+</div>
+<figcaption><b>Count-Min Sketch, d = 3 rows, w = 8 columns.</b> Highlighted cells are the item's counter in each row. Taking the minimum filters out collisions that hit only some rows; an item whose every row collides is overestimated.</figcaption>
+</figure>
+
+<h3 id="cms-bounds">Error bounds and sizing</h3>
+<p>Let <code>N</code> be the total of all counts added. Cormode and Muthukrishnan proved that with</p>
+<div class="calc">w = ⌈e / ε⌉       columns
+d = ⌈ln(1/δ)⌉    rows
+the estimate â of any item with true count a satisfies
+    a ≤ â ≤ a + ε·N    with probability at least 1 - δ</div>
+<p>For example, to keep the error under 0.05% of the stream with 99% confidence: <code>ε = 0.0005</code> gives <code>w = 5,437</code>, and <code>δ = 0.01</code> gives <code>d = 5</code>. That is 27,185 counters, about 106 KB at 4 bytes each, whether the stream has a thousand distinct keys or a hundred million. On a stream of one million page views the error bound is 500 views.</p>
+<p>The error is relative to the whole stream, not to the item. An item seen 80,000 times with an error of up to 500 is measured well. An item seen 3 times can read as 300. So Count-Min Sketch is the right tool for finding and measuring <strong>heavy hitters</strong>, and a poor one for the long tail.</p>
+<p>A cheap improvement is <dfn>conservative update</dfn>: on add, raise only the counters that are below the new estimate, instead of incrementing all <code>d</code> of them. It cuts overestimation noticeably on skewed data, at the cost of no longer supporting decrements.</p>
+
+<h3 id="top-k">Heavy hitters and top-k</h3>
+<p>A sketch answers "how often has <code>x</code> occurred?" but cannot list its keys, because it does not store them. To find the top <code>k</code>, pair it with a small candidate set: after each add, look up the item's estimate, and if it beats the smallest candidate, swap it in. Memory is the sketch plus <code>k</code> keys. This is the standard pattern for trending hashtags, most-requested URLs, top talkers in network traffic, and hot keys in a cache cluster. The <a href="autocomplete.html">autocomplete</a> case study uses the same idea to keep popular queries per prefix.</p>
+<p>The implementation below sizes a sketch for <code>ε = 0.0005, δ = 0.01</code>, feeds it a million page views drawn from a Zipf-like popularity curve over 200,000 URLs, checks the error bound against exact counts, and tracks the top 5 while streaming.</p>
+<pre><code class="language-python">import hashlib
+import math
+import random
+from collections import Counter
+
+
+class CountMinSketch:
+    def __init__(self, eps: float, delta: float):
+        self.w = math.ceil(math.e / eps)           # columns: error &lt;= eps * N
+        self.d = math.ceil(math.log(1 / delta))    # rows: with probability &gt;= 1 - delta
+        self.rows = [[0] * self.w for _ in range(self.d)]
+
+    def _cols(self, item: str):
+        for r in range(self.d):
+            h = hashlib.blake2b(item.encode(), digest_size=8, salt=r.to_bytes(16, "big")).digest()
+            yield r, int.from_bytes(h, "big") % self.w
+
+    def add(self, item: str, count: int = 1):
+        for r, c in self._cols(item):
+            self.rows[r][c] += count
+
+    def estimate(self, item: str) -&gt; int:
+        return min(self.rows[r][c] for r, c in self._cols(item))   # never below the true count
+
+
+random.seed(7)
+urls = [f"/product/{i}" for i in range(200_000)]
+weights = [1 / (rank + 1) for rank in range(len(urls))]           # Zipf-like popularity
+stream = random.choices(urls, weights, k=1_000_000)
+
+cms = CountMinSketch(eps=0.0005, delta=0.01)
+top = {}                                   # candidate heavy hitters, at most K entries
+K = 5
+for url in stream:
+    cms.add(url)
+    est = cms.estimate(url)
+    if url in top or len(top) &lt; K:
+        top[url] = est
+    else:
+        smallest = min(top, key=top.get)       # O(K) scan; use a heap for large K
+        if est &gt; top[smallest]:
+            del top[smallest]
+            top[url] = est
+
+true = Counter(stream)
+N = len(stream)
+errors = [cms.estimate(u) - true[u] for u in urls]
+assert min(errors) &gt;= 0                                           # only ever overestimates
+print(f"sketch: {cms.d} x {cms.w} = {cms.d * cms.w:,} counters vs {len(true):,} distinct keys")
+print(f"bound eps*N = {0.0005 * N:.0f}; keys over it: {sum(e &gt; 0.0005 * N for e in errors) / len(urls):.2%}")
+print(f"mean overestimate {sum(errors) / len(errors):.1f}, max {max(errors)}")
+
+for url, est in sorted(top.items(), key=lambda kv: -kv[1]):
+    print(f"{url:13} estimate {est:6,}  true {true[url]:6,}")
+
+# sketch: 5 x 5437 = 27,185 counters vs 120,865 distinct keys
+# bound eps*N = 500; keys over it: 0.00%
+# mean overestimate 46.0, max 373
+# /product/0    estimate 77,858  true 77,826
+# /product/1    estimate 39,333  true 39,291
+# /product/2    estimate 26,146  true 26,101
+# /product/3    estimate 19,747  true 19,720
+# /product/4    estimate 15,676  true 15,648</code></pre>
+<p>No item exceeded the 500-view bound, the average overestimate was 46 views, and the streaming top 5 is exactly the true top 5, each within 0.2% of its real count. The exact <code>Counter</code> here is only for checking; in production it is what the sketch replaces.</p>
+
+<h2 id="real-world">In the real world</h2>
+
+<h3 id="lsm-filters">Bloom filters in storage engines</h3>
+<p>The most important production use of Bloom filters is in <a href="indexing.html">LSM-tree</a> databases. A key can live in any of many immutable SSTable files on disk, so a point lookup for a key that is not in a file would cost a disk read per file. Each SSTable carries a Bloom filter of its keys, held in memory, and a lookup skips every file whose filter says no.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 240" role="img" aria-label="LSM read path: a GET checks the memtable, then each SSTable's in-memory Bloom filter; two filters answer no and are skipped, the third answers maybe and costs one disk read">
+<rect class="n client" x="20" y="85" width="110" height="50" rx="8"/><text class="t mono b mid" x="75" y="108">GET user:42</text><text class="t xs mute mid" x="75" y="124">point lookup</text>
+<rect class="n cache" x="160" y="85" width="110" height="50" rx="8"/><text class="t b mid" x="215" y="108">Memtable</text><text class="t xs mute mid" x="215" y="124">in memory: miss</text>
+<rect class="n ext" x="300" y="85" width="110" height="50" rx="8"/><text class="t b mid" x="355" y="108">SSTable 3</text><text class="t xs mute mid" x="355" y="124">newest</text>
+<rect class="n ext" x="440" y="85" width="110" height="50" rx="8"/><text class="t b mid" x="495" y="115">SSTable 2</text>
+<rect class="n ext" x="580" y="85" width="110" height="50" rx="8"/><text class="t b mid" x="635" y="108">SSTable 1</text><text class="t xs mute mid" x="635" y="124">oldest</text>
+<path class="e" d="M130,110 H156"/>
+<path class="e" d="M270,110 H296"/>
+<path class="e" d="M410,110 H436"/>
+<path class="e" d="M550,110 H576"/>
+<text class="t xs mute mid" x="355" y="48">Bloom filter (RAM)</text>
+<text class="t sm b red mid" x="355" y="70">no</text>
+<text class="t xs mute mid" x="495" y="48">Bloom filter (RAM)</text>
+<text class="t sm b red mid" x="495" y="70">no</text>
+<text class="t xs mute mid" x="635" y="48">Bloom filter (RAM)</text>
+<text class="t sm b green mid" x="635" y="70">maybe</text>
+<text class="t xs mute mid" x="355" y="156">skipped, no I/O</text>
+<text class="t xs mute mid" x="495" y="156">skipped, no I/O</text>
+<path class="e" d="M635,135 V171"/>
+<rect class="n db" x="580" y="175" width="110" height="46" rx="8"/><text class="t sm b mid" x="635" y="195">1 disk read</text><text class="t xs mute mid" x="635" y="211">row found</text>
+<text class="t sm" x="20" y="195">Without filters: up to 3 disk reads.</text>
+<text class="t sm" x="20" y="214">With 1% filters: 1 read, plus 0.02 wasted reads on average.</text>
+</svg>
+</div>
+<figcaption><b>Read path in an LSM store.</b> Filters turn "read every SSTable that might hold the key" into "read the one that does", plus a 1% chance per file of a wasted read. They do nothing for range scans, which must visit every file.</figcaption>
+</figure>
+<ul>
+<li><strong>Apache Cassandra</strong> keeps a Bloom filter per SSTable, off the JVM heap, tunable per table with <code>bloom_filter_fp_chance</code>. Lowering it trades memory for fewer wasted disk reads on tables with many SSTables.</li>
+<li><strong>RocksDB</strong> (and LevelDB before it) builds a filter per SST file, configured in bits per key. RocksDB also offers Ribbon filters, which reach the same false-positive rate in about 30% less memory at some extra CPU cost.</li>
+<li><strong>HBase</strong> stores row-level Bloom filters in its store files, and <strong>PostgreSQL</strong> ships a <code>bloom</code> index extension for equality queries over many columns.</li>
+</ul>
+
+<h3 id="other-uses">Other well-known uses</h3>
+<ul>
+<li><strong>Redis</strong>: <code>PFADD</code>, <code>PFCOUNT</code> and <code>PFMERGE</code> implement HyperLogLog with 12 KB per key and 0.81% standard error, using a compact sparse encoding while the count is small. The RedisBloom module adds Bloom filters (<code>BF.*</code>), cuckoo filters (<code>CF.*</code>), Count-Min Sketch (<code>CMS.*</code>) and a top-k structure (<code>TOPK.*</code>).</li>
+<li><strong>Analytics engines</strong>: BigQuery's <code>APPROX_COUNT_DISTINCT</code> and <code>HLL_COUNT</code> functions use HyperLogLog++, and Spark, Presto/Trino, Druid and ClickHouse all offer approximate distinct counts built on HLL-style sketches. A dashboard of daily active users is almost always an HLL underneath.</li>
+<li><strong>CDNs</strong>: Akamai uses a Bloom filter to avoid caching "one-hit wonders", objects requested once and never again. An object is cached only on its second request, when the filter already contains it, which keeps disk space for content that will be reused. See <a href="cdn.html">CDNs</a>.</li>
+<li><strong>Crawlers</strong>: a Bloom filter of seen URLs (or of content fingerprints) in front of the URL frontier, so the common case of "already seen" is answered from memory. See the <a href="web-crawler.html">web crawler</a> case study.</li>
+<li><strong>Browsers</strong>: early versions of Chrome's Safe Browsing checked URLs against a local Bloom filter of hash prefixes of known-bad URLs, and only contacted Google on a "maybe". It was later replaced by a more compact prefix set, but the pattern (local probabilistic check, remote exact check) is unchanged.</li>
+<li><strong>Short links</strong>: the <a href="url-shortener.html">URL shortener</a> uses a Bloom filter so bots probing random codes never reach the cache or the database.</li>
+</ul>
+
+<h2 id="tradeoffs">Trade-offs and alternatives</h2>
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Bloom filter</th><th>Counting Bloom</th><th>Cuckoo filter</th><th>HyperLogLog</th><th>Count-Min Sketch</th></tr></thead>
+<tbody>
+<tr><th>Answers</th><td>Membership</td><td>Membership</td><td>Membership</td><td>Distinct count</td><td>Frequency, top-k</td></tr>
+<tr><th>Error</th><td class="meh">False positives only</td><td class="meh">False positives only</td><td class="meh">False positives only</td><td class="meh">± about 1.04/√m</td><td class="meh">Overestimates, ≤ εN</td></tr>
+<tr><th>Delete</th><td class="no">No</td><td class="yes">Yes</td><td class="yes">Yes</td><td class="no">No</td><td class="meh">Decrement, if no conservative update</td></tr>
+<tr><th>Merge</th><td class="yes">Bitwise OR (same m, k)</td><td class="yes">Add counters</td><td class="no">Not simply</td><td class="yes">Register-wise max</td><td class="yes">Add counters</td></tr>
+<tr><th>Memory</th><td>~9.6 bits/item at 1%</td><td>~4× Bloom</td><td>Less than Bloom below ~3%</td><td>12 KB for 0.81%</td><td><code>(e/ε) · ln(1/δ)</code> counters</td></tr>
+<tr><th>Grows with</th><td>Items</td><td>Items</td><td>Items</td><td>Nothing</td><td>Nothing</td></tr>
+</tbody></table></div>
+<p>When choosing, start from the question, then ask three more:</p>
+<ul>
+<li><strong>Which error direction can you live with?</strong> Bloom filters never miss a member; Count-Min never undercounts. Design the caller so that the safe direction is the one that matters.</li>
+<li><strong>Do you need to merge?</strong> Bloom filters, HLLs and Count-Min Sketches built with the same parameters merge cheaply, which is what makes them useful across shards, servers and time windows. Fix the parameters and hash function once, system-wide.</li>
+<li><strong>Is the set small enough to be exact?</strong> A million 8-byte ids is 8 MB. If an exact hash set fits comfortably, use it: no error, no tuning, deletes work. Probabilistic structures pay off at hundreds of millions of items, or when you keep thousands of independent sketches (one per page, per day, per customer).</li>
+</ul>
+<p>Other structures worth knowing by name: <strong>quotient</strong> and <strong>xor filters</strong> (more compact static membership filters), <strong>theta sketches</strong> (distinct counts with set intersection and difference), and <strong>t-digest</strong> or DDSketch (approximate percentiles, the latency version of the same idea, used by metrics systems; see <a href="observability.html">Observability</a>).</p>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>Whenever an exact set or counter would need memory proportional to a huge number of items, and an approximate answer is acceptable. Typical prompts: "has this crawler seen this URL", "skip disk reads for missing keys" (<a href="key-value-store.html">key-value store</a>), "unique visitors per page per day", "trending topics in the last five minutes", "detect hot keys". State the error budget out loud: "a Bloom filter at 1% costs about 10 bits per URL, so 1.2 GB for a billion URLs, and a false positive only means we skip one new page".</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>Size this Bloom filter for <code>n</code> items at rate <code>p</code>. Give <code>m = -n ln p / (ln 2)²</code> and <code>k = (m/n) ln 2</code>, or the 10-bits-per-key shortcut.</li>
+<li>Can you delete from it? No; counting Bloom filters or cuckoo filters can, at a memory cost.</li>
+<li>What happens if more items arrive than planned? The false-positive rate rises sharply; rotate or chain filters.</li>
+<li>How do you get monthly uniques from daily counts? Merge daily HLL sketches, never add daily counts.</li>
+<li>Why does Count-Min take the minimum, and why is it bad for rare items? Collisions only add; the error is relative to the total stream.</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>Saying a Bloom filter can return false negatives, or using its "yes" as a final answer where a wrong yes is harmful.</li>
+<li>Reaching for a probabilistic structure when the exact set fits in a few megabytes.</li>
+<li>Summing per-shard or per-day distinct counts instead of merging sketches.</li>
+<li>Promising exact top-k from a sketch without saying the counts are upper bounds.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://doi.org/10.1145/362686.362692" target="_blank" rel="noopener">Space/Time Trade-offs in Hash Coding with Allowable Errors</a><span>Burton H. Bloom, Communications of the ACM, 1970. The original Bloom filter paper.</span></li>
+<li><a href="http://algo.inria.fr/flajolet/Publications/FlFuGaMe07.pdf" target="_blank" rel="noopener">HyperLogLog: the analysis of a near-optimal cardinality estimation algorithm</a><span>Flajolet, Fusy, Gandouet and Meunier, 2007. The algorithm, the 1.04/√m bound and the small-range correction.</span></li>
+<li><a href="https://doi.org/10.1016/j.jalgor.2003.12.001" target="_blank" rel="noopener">An Improved Data Stream Summary: The Count-Min Sketch and its Applications</a><span>Cormode and Muthukrishnan, Journal of Algorithms, 2005. Defines the sketch and proves the εN bound.</span></li>
+<li><a href="https://antirez.com/news/75" target="_blank" rel="noopener">Redis new data structure: the HyperLogLog</a><span>Salvatore Sanfilippo, 2014. How Redis implements HLL in 12 KB, with sparse and dense encodings.</span></li>
+<li><a href="https://www.cs.cmu.edu/~dga/papers/cuckoo-conext2014.pdf" target="_blank" rel="noopener">Cuckoo Filter: Practically Better Than Bloom</a><span>Fan, Andersen, Kaminsky and Mitzenmacher, CoNEXT 2014. Deletable membership filters and when they beat Bloom filters.</span></li>
+</ul>

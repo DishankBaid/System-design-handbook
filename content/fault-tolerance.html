@@ -1,0 +1,631 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">In a distributed system something is always broken: a host is rebooting, a disk is slow, a network link drops one packet in a thousand. Outages rarely come from that first failure. They come from how the rest of the system reacts to it: threads pile up behind a slow dependency, clients retry in lockstep, and a 2% problem in one service becomes a 100% outage everywhere.</p>
+<p>Consider a checkout service that calls a recommendations service to show "you may also like" items. Recommendations normally answers in 40 ms. One day a bad deploy makes it take 30 seconds. Checkout has 200 worker threads and no timeout on that call. At 100 checkouts per second, every thread is stuck waiting within two seconds, and checkout stops answering entirely, including for the payment step that never needed recommendations. A non-essential feature just took down the revenue path.</p>
+<p>The patterns in this chapter exist to stop that chain. <strong>Timeouts</strong> bound how long you wait. <strong>Retries</strong> recover from transient errors, and <strong>backoff, jitter and budgets</strong> stop retries from becoming the attack. <strong>Circuit breakers</strong> stop calling something that is clearly broken. <strong>Bulkheads</strong> keep one dependency from consuming every resource. <strong>Load shedding</strong> keeps an overloaded server doing useful work. <strong>Fallbacks</strong> decide what users see when a piece is missing. The common goal is <dfn>fault containment</dfn>: a failure should stay as small as the component that failed.</p>
+
+<h2 id="failure-types">How things fail</h2>
+<p>Each failure mode needs a different defence, so name them precisely. The classic taxonomy comes from distributed systems theory, with one modern addition that causes most real incidents.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Failure</th><th>What the caller sees</th><th>Example</th><th>Main defence</th></tr></thead>
+<tbody>
+<tr><th>Crash (fail-stop)</th><td>Connection refused, or no reply at all</td><td>Process killed by the OOM killer, host loses power</td><td>Health checks, redundancy, failover</td></tr>
+<tr><th>Omission</th><td>Some requests or replies silently vanish</td><td>Full socket buffer drops packets, a queue discards messages</td><td>Timeouts plus retries</td></tr>
+<tr><th>Timing (performance)</th><td>Correct answers, too late to be useful</td><td>GC pause, noisy neighbour, disk at 100% utilisation</td><td>Timeouts, hedging, load shedding</td></tr>
+<tr><th>Byzantine</th><td>Wrong or contradictory answers</td><td>Bit flip in memory, corrupted cache entry, malicious node</td><td>Checksums, validation; full BFT protocols only in adversarial settings</td></tr>
+<tr><th>Gray failure</th><td>Some callers see failures, health checks see a healthy node</td><td>NIC dropping 5% of packets, one bad disk in a RAID set, a deadlocked thread pool behind a working <code>/health</code></td><td>Health checks that exercise the real path, outlier detection from the caller's view</td></tr>
+</tbody></table></div>
+<p>A <dfn>gray failure</dfn> is a partial failure that the system's own failure detector does not see. Microsoft's study of Azure incidents named the root cause <em>differential observability</em>: the health checker and the real clients observe the component through different paths, so they disagree about whether it works. Many of the hardest real outages start as gray failures, because clean crashes are already handled well by load balancers and orchestrators.</p>
+<p>One rule follows from the table: <strong>a slow dependency is more dangerous than a dead one</strong>. A dead service fails fast and frees the caller's resources immediately. A slow service holds a thread, a connection and memory in every caller for as long as the caller is willing to wait. That is why timeouts come first.</p>
+
+<h2 id="timeouts">Timeouts</h2>
+<p>Every network call needs a timeout, and most libraries do not set one for you. Python's <code>requests</code> waits forever by default, as do many JDBC drivers and raw sockets. A missing timeout is the single most common cause of the thread-exhaustion story above.</p>
+<p>There are usually two separate settings. The <dfn>connect timeout</dfn> bounds the TCP (and TLS) handshake. It can be short, tens to a few hundred milliseconds inside a data centre, because a healthy peer accepts connections almost instantly. The <dfn>request timeout</dfn> (or read timeout) bounds the wait for the response and has to reflect how long the work really takes.</p>
+
+<h3 id="choosing-timeouts">Choosing a timeout from latency percentiles</h3>
+<p>A timeout is a trade-off between two errors. Too long, and callers waste resources waiting on requests that will never succeed. Too short, and you cancel requests that would have succeeded, then retry them, adding load exactly when the dependency is struggling. The way to choose is to measure the dependency's latency distribution under normal load and pick a point in its tail. The AWS Builders' Library describes the usual practice: pick an acceptable rate of false timeouts, such as 0.1%, and set the timeout at the matching percentile, here p99.9, plus some headroom.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 240" role="img" aria-label="Histogram of 200,000 request latencies on a log count scale, with p50 at 38 ms, p99 at 223 ms, p99.9 at 450 ms and a timeout at 500 ms">
+<rect x="71" y="170.6" width="8" height="39.4" style="fill:var(--d-svc-s)"/>
+<rect x="81" y="87.6" width="8" height="122.4" style="fill:var(--d-svc-s)"/>
+<rect x="91" y="61.9" width="8" height="148.1" style="fill:var(--d-svc-s)"/>
+<rect x="101" y="57.1" width="8" height="152.9" style="fill:var(--d-svc-s)"/>
+<rect x="111" y="61.4" width="8" height="148.6" style="fill:var(--d-svc-s)"/>
+<rect x="121" y="70.0" width="8" height="140.0" style="fill:var(--d-svc-s)"/>
+<rect x="131" y="80.9" width="8" height="129.1" style="fill:var(--d-svc-s)"/>
+<rect x="141" y="92.5" width="8" height="117.5" style="fill:var(--d-svc-s)"/>
+<rect x="151" y="104.7" width="8" height="105.3" style="fill:var(--d-svc-s)"/>
+<rect x="161" y="116.7" width="8" height="93.3" style="fill:var(--d-svc-s)"/>
+<rect x="171" y="126.9" width="8" height="83.1" style="fill:var(--d-svc-s)"/>
+<rect x="181" y="134.3" width="8" height="75.7" style="fill:var(--d-svc-s)"/>
+<rect x="191" y="137.9" width="8" height="72.1" style="fill:var(--d-svc-s)"/>
+<rect x="201" y="138.9" width="8" height="71.1" style="fill:var(--d-svc-s)"/>
+<rect x="211" y="138.5" width="8" height="71.5" style="fill:var(--d-svc-s)"/>
+<rect x="221" y="139.6" width="8" height="70.4" style="fill:var(--d-svc-s)"/>
+<rect x="231" y="140.9" width="8" height="69.1" style="fill:var(--d-svc-s)"/>
+<rect x="241" y="137.9" width="8" height="72.1" style="fill:var(--d-svc-s)"/>
+<rect x="251" y="139.1" width="8" height="70.9" style="fill:var(--d-svc-s)"/>
+<rect x="261" y="137.5" width="8" height="72.5" style="fill:var(--d-svc-s)"/>
+<rect x="271" y="137.4" width="8" height="72.6" style="fill:var(--d-svc-s)"/>
+<rect x="281" y="141.5" width="8" height="68.5" style="fill:var(--d-svc-s)"/>
+<rect x="291" y="139.6" width="8" height="70.4" style="fill:var(--d-svc-s)"/>
+<rect x="301" y="139.8" width="8" height="70.2" style="fill:var(--d-svc-s)"/>
+<rect x="311" y="141.9" width="8" height="68.1" style="fill:var(--d-svc-s)"/>
+<rect x="321" y="140.7" width="8" height="69.3" style="fill:var(--d-svc-s)"/>
+<rect x="331" y="141.4" width="8" height="68.6" style="fill:var(--d-svc-s)"/>
+<rect x="341" y="144.5" width="8" height="65.5" style="fill:var(--d-svc-s)"/>
+<rect x="351" y="144.3" width="8" height="65.7" style="fill:var(--d-svc-s)"/>
+<rect x="361" y="146.0" width="8" height="64.0" style="fill:var(--d-svc-s)"/>
+<rect x="371" y="147.2" width="8" height="62.8" style="fill:var(--d-svc-s)"/>
+<rect x="381" y="148.1" width="8" height="61.9" style="fill:var(--d-svc-s)"/>
+<rect x="391" y="150.0" width="8" height="60.0" style="fill:var(--d-svc-s)"/>
+<rect x="401" y="148.8" width="8" height="61.2" style="fill:var(--d-svc-s)"/>
+<rect x="411" y="152.2" width="8" height="57.8" style="fill:var(--d-svc-s)"/>
+<rect x="421" y="155.4" width="8" height="54.6" style="fill:var(--d-svc-s)"/>
+<rect x="431" y="154.3" width="8" height="55.7" style="fill:var(--d-svc-s)"/>
+<rect x="441" y="157.1" width="8" height="52.9" style="fill:var(--d-svc-s)"/>
+<rect x="451" y="157.7" width="8" height="52.3" style="fill:var(--d-svc-s)"/>
+<rect x="461" y="157.1" width="8" height="52.9" style="fill:var(--d-svc-s)"/>
+<rect x="471" y="157.7" width="8" height="52.3" style="fill:var(--d-svc-s)"/>
+<rect x="481" y="163.7" width="8" height="46.3" style="fill:var(--d-svc-s)"/>
+<rect x="491" y="160.2" width="8" height="49.8" style="fill:var(--d-svc-s)"/>
+<rect x="501" y="161.8" width="8" height="48.2" style="fill:var(--d-svc-s)"/>
+<rect x="511" y="164.7" width="8" height="45.3" style="fill:var(--d-svc-s)"/>
+<rect x="521" y="173.3" width="8" height="36.7" style="fill:var(--d-svc-s)"/>
+<rect x="531" y="173.3" width="8" height="36.7" style="fill:var(--d-svc-s)"/>
+<rect x="541" y="174.4" width="8" height="35.6" style="fill:var(--d-svc-s)"/>
+<rect x="551" y="176.7" width="8" height="33.3" style="fill:var(--d-svc-s)"/>
+<rect x="561" y="179.5" width="8" height="30.5" style="fill:var(--d-svc-s)"/>
+<rect x="571" y="172.4" width="8" height="37.6" style="fill:var(--d-svc-s)"/>
+<rect x="581" y="175.5" width="8" height="34.5" style="fill:var(--d-svc-s)"/>
+<rect x="591" y="181.1" width="8" height="28.9" style="fill:var(--d-svc-s)"/>
+<rect x="601" y="179.5" width="8" height="30.5" style="fill:var(--d-svc-s)"/>
+<rect x="611" y="179.5" width="8" height="30.5" style="fill:var(--d-svc-s)"/>
+<rect x="621" y="183.0" width="8" height="27.0" style="fill:var(--d-svc-s)"/>
+<rect x="631" y="185.1" width="8" height="24.9" style="fill:var(--d-svc-s)"/>
+<rect x="641" y="183.0" width="8" height="27.0" style="fill:var(--d-svc-s)"/>
+<rect x="651" y="187.6" width="8" height="22.4" style="fill:var(--d-svc-s)"/>
+<rect x="661" y="178.0" width="8" height="32.0" style="fill:var(--d-svc-s)"/>
+<path class="line faint" d="M70,210 H670"/>
+<text class="t xs mute end" x="62" y="213.5">1</text>
+<text class="t xs mute end" x="62" y="181.5">10</text>
+<text class="t xs mute end" x="62" y="149.5">100</text>
+<text class="t xs mute end" x="62" y="117.5">1k</text>
+<text class="t xs mute end" x="62" y="85.5">10k</text>
+<text class="t xs mute end" x="62" y="53.5">100k</text>
+<text class="t xs mute mid" x="70" y="226">0 ms</text>
+<text class="t xs mute mid" x="170" y="226">100 ms</text>
+<text class="t xs mute mid" x="270" y="226">200 ms</text>
+<text class="t xs mute mid" x="370" y="226">300 ms</text>
+<text class="t xs mute mid" x="470" y="226">400 ms</text>
+<text class="t xs mute mid" x="570" y="226">500 ms</text>
+<text class="t xs mute mid" x="670" y="226">600 ms</text>
+<path class="line" d="M108,44 V210" style="stroke-dasharray:4 3"/><text class="t xs b mid" x="108" y="36">p50 38 ms</text>
+<path class="line" d="M293,44 V210" style="stroke-dasharray:4 3"/><text class="t xs b mid" x="293" y="36">p99 223 ms</text>
+<path class="line" d="M520,44 V210" style="stroke-dasharray:4 3"/><text class="t xs b end" x="514" y="36">p99.9 450 ms</text>
+<path class="line" d="M570,44 V210" style="stroke:var(--accent);stroke-width:2"/><text class="t xs b accent" x="576" y="36">timeout 500 ms</text>
+<text class="t xs mute" x="330" y="104">slow but healthy path</text>
+<text class="t xs mute" x="330" y="118">(2% of requests miss a cache)</text>
+<text class="t xs mute" x="0" y="20">requests per 10 ms bin (log scale)</text>
+</svg>
+</div>
+<figcaption><b>Where to put the timeout.</b> 200,000 simulated calls: 98% are fast, 2% take a slower cache-miss path. A timeout at 100 ms (more than twice the median) would cancel 2.2% of perfectly healthy requests. At 500 ms only 0.07% time out.</figcaption>
+</figure>
+
+<p>Three refinements matter in practice:</p>
+<ul>
+<li><strong>Look at the shape, not one number.</strong> Latency is often bimodal, as in the figure: a fast path and a slow path (cache miss, cold partition, cross-zone hop). A timeout set just above the fast mode turns every slow-path request into a failure plus a retry.</li>
+<li><strong>Measure from the caller.</strong> The server's own latency metric excludes network time, queueing in the kernel and connection setup. Use the client-side histogram.</li>
+<li><strong>Revisit after changes.</strong> A timeout chosen two years ago against a dependency that has since doubled its p99 is a latent outage. Alert when the timeout rate rises above its expected level.</li>
+</ul>
+
+<h3 id="deadlines">Deadlines and timeout budgets</h3>
+<p>Timeouts must shrink as a request goes deeper. If the user-facing edge gives up after 2 seconds but a backend three hops down waits 10 seconds on the database, the backend keeps doing work that nobody will ever read. The fix is a <dfn>deadline</dfn>: an absolute time by which the whole request must finish, set once at the edge and passed along with every downstream call. Each service computes its remaining budget (<code>deadline - now</code>), subtracts a small margin for its own work, and uses that as the timeout for its calls. A service that receives a request whose deadline has already passed drops it without doing any work.</p>
+<p>gRPC builds this in: a client deadline is sent as the <code>grpc-timeout</code> header and servers can propagate it to their own outgoing calls. With HTTP you add a header yourself and honour it in middleware.</p>
+
+<h2 id="retries">Retries</h2>
+<p>Many failures are transient: a connection reset during a deploy, a leader election in the database, one overloaded replica behind a load balancer. Retrying turns those into successes the user never notices. Retrying is also the most effective way to multiply load on a system that is already overloaded. Every retry policy has to answer three questions: what to retry, when, and how much in total.</p>
+
+<h3 id="what-to-retry">What is safe to retry</h3>
+<ul>
+<li><strong>Only idempotent operations</strong>, or operations made idempotent with an idempotency key. A timed-out <code>POST /payments</code> may have succeeded on the server; retrying it blindly charges the customer twice. See <a href="idempotency.html">Idempotency</a>.</li>
+<li><strong>Only retryable errors.</strong> Connection failures, timeouts, <code>503 Service Unavailable</code> and <code>429 Too Many Requests</code> (respecting any <code>Retry-After</code> header) are candidates. A <code>400</code>, <code>401</code>, <code>403</code> or <code>404</code> will fail identically every time.</li>
+<li><strong>Not when the caller has already given up.</strong> If the remaining deadline is shorter than a typical call, a retry only adds load.</li>
+</ul>
+
+<h3 id="backoff-jitter">Exponential backoff and jitter</h3>
+<p>Retrying immediately hits a struggling server again before it has had any chance to recover. <dfn>Exponential backoff</dfn> waits longer after each failure: <code>base × 2<sup>attempt</sup></code>, capped at some maximum. With a 100 ms base the waits are 100, 200, 400, 800 ms and so on.</p>
+<p>Backoff alone does not solve the real problem, which is <em>correlation</em>. When a server restarts or a network blip ends, thousands of clients failed at the same moment. With pure exponential backoff they all wait exactly 100 ms and retry together, then all wait 200 ms and retry together again. The server sees a quiet period followed by a spike, over and over. <dfn>Jitter</dfn> adds randomness to break the synchronisation. The variants described by Marc Brooker on the AWS Architecture Blog:</p>
+<div class="defs">
+<div><h4>Full jitter</h4><p><code>sleep = random(0, min(cap, base × 2<sup>n</sup>))</code>. Spreads retries over the whole window. Usually the best choice: least total work, short completion time.</p></div>
+<div><h4>Equal jitter</h4><p>Half fixed, half random: <code>t = min(cap, base × 2<sup>n</sup>); sleep = t/2 + random(0, t/2)</code>. Guarantees some minimum wait.</p></div>
+<div><h4>Decorrelated jitter</h4><p><code>sleep = min(cap, random(base, previous_sleep × 3))</code>. Each wait depends on the last one rather than the attempt number.</p></div>
+</div>
+<p>The simulation below models 1,000 clients that all hit a server at the moment it comes back up. The server can serve 50 requests per 10 ms slot and rejects the rest. Every rejected client backs off and tries again.</p>
+<pre><code class="language-python">import heapq
+import random
+from collections import Counter
+
+CLIENTS = 1000        # all send at t = 0, e.g. right after the server restarts
+CAPACITY = 50         # requests served per 10 ms slot; the rest are rejected
+BASE, CAP = 100, 5000 # backoff base and ceiling, in ms
+
+
+def no_jitter(attempt, rng):
+    return min(CAP, BASE * 2 ** attempt)
+
+
+def full_jitter(attempt, rng):
+    return rng.uniform(0, min(CAP, BASE * 2 ** attempt))
+
+
+def simulate(backoff, seed=7):
+    rng = random.Random(seed)
+    events = [(0.0, i, 0) for i in range(CLIENTS)]   # (send time ms, client, attempt)
+    served, offered = Counter(), Counter()
+    calls = done_at = 0
+    while events:
+        t, client, attempt = heapq.heappop(events)
+        slot = int(t // 10)
+        calls += 1
+        offered[slot] += 1
+        if served[slot] &lt; CAPACITY:
+            served[slot] += 1
+            done_at = t
+        else:
+            heapq.heappush(events, (t + backoff(attempt, rng), client, attempt + 1))
+    peak_retry = max(n for s, n in offered.items() if s &gt; 0)
+    return calls, peak_retry, done_at
+
+
+for name, fn in (("no jitter", no_jitter), ("full jitter", full_jitter)):
+    calls, peak, done = simulate(fn)
+    print(f"{name:11}  calls={calls:6,}  worst retry spike={peak:4} req/slot  all served after {done / 1000:5.2f} s")
+# no jitter    calls=10,500  worst retry spike= 950 req/slot  all served after 71.30 s
+# full jitter  calls= 2,616  worst retry spike= 136 req/slot  all served after  0.53 s</code></pre>
+<p>Same clients, same server, same backoff formula. Adding randomness cut total calls by a factor of four and recovery time from over a minute to half a second. Without jitter, each retry wave is 950, then 900, then 850 requests landing in one 10 ms slot, and only 50 of each wave succeed. The waits grow to the 5-second cap, so the tail of clients takes over a minute to get through.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 330" role="img" aria-label="Requests arriving per 10 millisecond slot over the first 800 ms. Without jitter, spikes of 950, 900 and 850 at 100, 300 and 700 ms. With full jitter, at most 136 per slot after the initial burst">
+<text class="t sm b" x="80" y="22">No jitter: every failed client retries at the same instant</text>
+<path class="line faint" d="M80,144 H680.0"/>
+<text class="t xs mute end" x="72" y="147.5">0</text>
+<text class="t xs mute end" x="72" y="92.5">600</text>
+<text class="t xs mute end" x="72" y="37.5">1200</text>
+<rect x="80.75" y="52.3" width="6.0" height="91.7" style="fill:var(--d-svc-s)"/>
+<rect x="155.75" y="56.9" width="6.0" height="87.1" style="fill:var(--d-svc-s)"/>
+<rect x="305.75" y="61.5" width="6.0" height="82.5" style="fill:var(--d-svc-s)"/>
+<rect x="605.75" y="66.1" width="6.0" height="77.9" style="fill:var(--d-svc-s)"/>
+<path class="line" d="M80,139.4 H680.0" style="stroke:var(--d-red);stroke-dasharray:4 3"/>
+<text class="t xs mid" x="158.8" y="51.9">950</text>
+<text class="t xs mid" x="308.8" y="56.5">900</text>
+<text class="t xs mid" x="608.8" y="61.1">850</text>
+<text class="t xs red end" x="680.0" y="134.4">capacity 50</text>
+<text class="t sm b" x="80" y="182">Full jitter: retries spread across the backoff window</text>
+<path class="line faint" d="M80,304 H680.0"/>
+<text class="t xs mute end" x="72" y="307.5">0</text>
+<text class="t xs mute end" x="72" y="252.5">600</text>
+<text class="t xs mute end" x="72" y="197.5">1200</text>
+<rect x="80.75" y="202.8" width="6.0" height="101.2" style="fill:var(--d-svc-s)"/>
+<rect x="88.25" y="294.1" width="6.0" height="9.9" style="fill:var(--d-svc-s)"/>
+<rect x="95.75" y="292.0" width="6.0" height="12.0" style="fill:var(--d-svc-s)"/>
+<rect x="103.25" y="293.3" width="6.0" height="10.7" style="fill:var(--d-svc-s)"/>
+<rect x="110.75" y="294.2" width="6.0" height="9.8" style="fill:var(--d-svc-s)"/>
+<rect x="118.25" y="294.7" width="6.0" height="9.3" style="fill:var(--d-svc-s)"/>
+<rect x="125.75" y="295.3" width="6.0" height="8.7" style="fill:var(--d-svc-s)"/>
+<rect x="133.25" y="295.0" width="6.0" height="9.0" style="fill:var(--d-svc-s)"/>
+<rect x="140.75" y="293.1" width="6.0" height="10.9" style="fill:var(--d-svc-s)"/>
+<rect x="148.25" y="291.5" width="6.0" height="12.5" style="fill:var(--d-svc-s)"/>
+<rect x="155.75" y="301.1" width="6.0" height="2.9" style="fill:var(--d-svc-s)"/>
+<rect x="163.25" y="301.5" width="6.0" height="2.5" style="fill:var(--d-svc-s)"/>
+<rect x="170.75" y="301.6" width="6.0" height="2.4" style="fill:var(--d-svc-s)"/>
+<rect x="178.25" y="300.7" width="6.0" height="3.3" style="fill:var(--d-svc-s)"/>
+<rect x="185.75" y="301.0" width="6.0" height="3.0" style="fill:var(--d-svc-s)"/>
+<rect x="193.25" y="301.5" width="6.0" height="2.5" style="fill:var(--d-svc-s)"/>
+<rect x="200.75" y="301.2" width="6.0" height="2.8" style="fill:var(--d-svc-s)"/>
+<rect x="208.25" y="301.2" width="6.0" height="2.8" style="fill:var(--d-svc-s)"/>
+<rect x="215.75" y="301.6" width="6.0" height="2.4" style="fill:var(--d-svc-s)"/>
+<rect x="223.25" y="301.2" width="6.0" height="2.8" style="fill:var(--d-svc-s)"/>
+<rect x="230.75" y="301.1" width="6.0" height="2.9" style="fill:var(--d-svc-s)"/>
+<rect x="238.25" y="301.2" width="6.0" height="2.8" style="fill:var(--d-svc-s)"/>
+<rect x="245.75" y="302.1" width="6.0" height="1.9" style="fill:var(--d-svc-s)"/>
+<rect x="253.25" y="303.0" width="6.0" height="1.0" style="fill:var(--d-svc-s)"/>
+<rect x="260.75" y="302.7" width="6.0" height="1.3" style="fill:var(--d-svc-s)"/>
+<rect x="268.25" y="302.8" width="6.0" height="1.2" style="fill:var(--d-svc-s)"/>
+<rect x="275.75" y="302.6" width="6.0" height="1.4" style="fill:var(--d-svc-s)"/>
+<rect x="283.25" y="302.9" width="6.0" height="1.1" style="fill:var(--d-svc-s)"/>
+<rect x="290.75" y="303.4" width="6.0" height="0.6" style="fill:var(--d-svc-s)"/>
+<rect x="298.25" y="303.6" width="6.0" height="0.4" style="fill:var(--d-svc-s)"/>
+<rect x="305.75" y="303.9" width="6.0" height="0.1" style="fill:var(--d-svc-s)"/>
+<rect x="313.25" y="303.9" width="6.0" height="0.1" style="fill:var(--d-svc-s)"/>
+<rect x="320.75" y="303.9" width="6.0" height="0.1" style="fill:var(--d-svc-s)"/>
+<rect x="328.25" y="303.8" width="6.0" height="0.2" style="fill:var(--d-svc-s)"/>
+<rect x="335.75" y="303.6" width="6.0" height="0.4" style="fill:var(--d-svc-s)"/>
+<rect x="343.25" y="303.5" width="6.0" height="0.5" style="fill:var(--d-svc-s)"/>
+<rect x="350.75" y="303.9" width="6.0" height="0.1" style="fill:var(--d-svc-s)"/>
+<rect x="358.25" y="303.6" width="6.0" height="0.4" style="fill:var(--d-svc-s)"/>
+<rect x="373.25" y="303.7" width="6.0" height="0.3" style="fill:var(--d-svc-s)"/>
+<rect x="380.75" y="303.4" width="6.0" height="0.6" style="fill:var(--d-svc-s)"/>
+<rect x="388.25" y="303.9" width="6.0" height="0.1" style="fill:var(--d-svc-s)"/>
+<rect x="395.75" y="303.8" width="6.0" height="0.2" style="fill:var(--d-svc-s)"/>
+<rect x="403.25" y="303.7" width="6.0" height="0.3" style="fill:var(--d-svc-s)"/>
+<rect x="410.75" y="303.8" width="6.0" height="0.2" style="fill:var(--d-svc-s)"/>
+<rect x="418.25" y="303.8" width="6.0" height="0.2" style="fill:var(--d-svc-s)"/>
+<rect x="425.75" y="303.9" width="6.0" height="0.1" style="fill:var(--d-svc-s)"/>
+<rect x="440.75" y="303.9" width="6.0" height="0.1" style="fill:var(--d-svc-s)"/>
+<rect x="478.25" y="303.9" width="6.0" height="0.1" style="fill:var(--d-svc-s)"/>
+<path class="line" d="M80,299.4 H680.0" style="stroke:var(--d-red);stroke-dasharray:4 3"/>
+<text class="t xs" x="170.0" y="283.5">at most 136 per slot after t = 0</text>
+<text class="t xs red end" x="680.0" y="294.4">capacity 50</text>
+<text class="t xs mute mid" x="80.0" y="320">0 ms</text>
+<text class="t xs mute mid" x="155.0" y="320">100 ms</text>
+<text class="t xs mute mid" x="230.0" y="320">200 ms</text>
+<text class="t xs mute mid" x="305.0" y="320">300 ms</text>
+<text class="t xs mute mid" x="380.0" y="320">400 ms</text>
+<text class="t xs mute mid" x="455.0" y="320">500 ms</text>
+<text class="t xs mute mid" x="530.0" y="320">600 ms</text>
+<text class="t xs mute mid" x="605.0" y="320">700 ms</text>
+<text class="t xs mute mid" x="680.0" y="320">800 ms</text>
+</svg>
+</div>
+<figcaption><b>Retry arrivals per 10 ms, from the simulation above.</b> The dashed red line is server capacity. Without jitter, retries arrive as synchronized waves that are 19 times capacity. With full jitter the same retries are spread out, so most of them succeed on their first or second attempt.</figcaption>
+</figure>
+
+<h3 id="retry-amplification">Retry amplification across layers</h3>
+<p>Retries compose multiplicatively. Suppose a mobile app, an API gateway, an order service and an inventory service each make one attempt plus up to three retries, and the database at the bottom is failing. One user tap becomes up to 4 attempts at the gateway, 4 × 4 = 16 at the order service, 64 at the inventory service and 4<sup>4</sup> = <strong>256 queries</strong> at the database, which is the component that is already in trouble.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 200" role="img" aria-label="Chain of client, gateway, order service, inventory service and database; each of four layers retries three times, so the database receives up to 256 calls for one user request">
+<rect class="n client" x="10" y="50" width="110" height="52" rx="8"/><text class="t b mid" x="65" y="73">Mobile app</text><text class="t xs mute mid" x="65" y="89">1 + 3 retries</text>
+<rect class="n ext" x="152" y="50" width="110" height="52" rx="8"/><text class="t b mid" x="207" y="73">Gateway</text><text class="t xs mute mid" x="207" y="89">1 + 3 retries</text>
+<rect class="n svc" x="294" y="50" width="110" height="52" rx="8"/><text class="t b mid" x="349" y="73">Orders</text><text class="t xs mute mid" x="349" y="89">1 + 3 retries</text>
+<rect class="n svc" x="436" y="50" width="110" height="52" rx="8"/><text class="t b mid" x="491" y="73">Inventory</text><text class="t xs mute mid" x="491" y="89">1 + 3 retries</text>
+<rect class="n bad" x="578" y="50" width="120" height="52" rx="8"/><text class="t b mid" x="638" y="73">Database</text><text class="t xs mute mid" x="638" y="89">failing</text>
+<path class="e" d="M120,76 H148"/><path class="e" d="M262,76 H290"/><path class="e" d="M404,76 H432"/><path class="e" d="M546,76 H574"/>
+<text class="t xs mute" x="10" y="30">calls received per user tap, worst case</text>
+<text class="t b mid" x="65" y="134">1</text>
+<text class="t b mid" x="207" y="134">4</text>
+<text class="t b mid" x="349" y="134">16</text>
+<text class="t b mid" x="491" y="134">64</text>
+<text class="t b red mid" x="638" y="134">256</text>
+<text class="t xs mute mid" x="207" y="152">4¹</text><text class="t xs mute mid" x="349" y="152">4²</text><text class="t xs mute mid" x="491" y="152">4³</text><text class="t xs mute mid" x="638" y="152">4⁴</text>
+<text class="t sm mid" x="360" y="188">Retry at one layer only (or use budgets) and the database sees at most 4 calls, not 256.</text>
+</svg>
+</div>
+<figcaption><b>Retry amplification.</b> Four layers that each "helpfully" retry three times turn one failing request into 256 database calls. The load multiplier is highest exactly when the bottom layer is weakest.</figcaption>
+</figure>
+<p>Two fixes, often combined:</p>
+<ul>
+<li><strong>Retry at one layer.</strong> Usually the layer closest to the failing call, or the outermost layer that knows the user's deadline. Intermediate services return the error and let the chosen layer decide. Some teams add a response header such as "already retried, do not retry" so upstream layers can tell.</li>
+<li><strong>Retry budgets.</strong> Instead of a fixed count per request, cap retries as a fraction of normal traffic.</li>
+</ul>
+
+<h3 id="retry-budgets">Retry budgets</h3>
+<p>A <dfn>retry budget</dfn> limits retries to a ratio of first attempts, for example 10%, usually implemented as a token bucket: each successful request adds 0.1 tokens, each retry spends one, and when the bucket is empty retries are simply not sent. When failures are rare, every failed call can be retried. When the dependency is failing hard, retries stop automatically and the extra load is capped at 10%. Google's SRE book describes this pair of limits (at most three attempts per request, and a client-wide retry ratio of 10%), and gRPC implements the same idea as <em>retry throttling</em> in its retry policy.</p>
+<div class="calc">Fixed 3 retries per layer, 4 layers    (1 + 3)^4  = <span class="r">256×</span> load at the bottom in the worst case
+10% retry budget per layer, 4 layers    1.1^4      ≈ <span class="r">1.46×</span> load at the bottom in the worst case</div>
+<p>Related: <dfn>hedged requests</dfn> send a second copy of a slow request to another replica after, say, the p95 latency has passed, and use whichever answer comes first. Hedging cuts tail latency for idempotent reads at the cost of a few percent extra load. It needs the same discipline as retries: cap hedges with a budget, or a slow cluster gets twice the traffic.</p>
+
+<h2 id="circuit-breakers">Circuit breakers</h2>
+<p>Timeouts bound the cost of one call. When a dependency is clearly down, though, paying even a 500 ms timeout on every call is a waste: callers burn threads waiting for an answer they can predict, and the dependency gets a steady stream of load while trying to recover. A <dfn>circuit breaker</dfn> wraps calls to a dependency, watches their outcomes, and stops making calls once failures cross a threshold. The term comes from Michael Nygard's <em>Release It!</em> and was popularised by Martin Fowler and Netflix Hystrix.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 340" role="img" aria-label="Circuit breaker state machine with closed, open and half-open states, stepping through normal operation, tripping, failing fast, probing and recovery">
+<rect class="n good" x="40" y="70" width="140" height="56" rx="10"/><text class="t b mid" x="110" y="94">Closed</text><text class="t xs mute mid" x="110" y="111">calls pass through</text>
+<rect class="n bad" x="540" y="70" width="140" height="56" rx="10"/><text class="t b mid" x="610" y="94">Open</text><text class="t xs mute mid" x="610" y="111">fail fast, no call</text>
+<rect class="n cache" x="290" y="232" width="140" height="56" rx="10"/><text class="t b mid" x="360" y="256">Half-open</text><text class="t xs mute mid" x="360" y="273">one trial call</text>
+<path class="e" d="M180,86 C300,30 420,30 536,86"/>
+<text class="t xs mid" x="360" y="30">≥ 50% of last 20 calls failed</text>
+<path class="e" d="M640,126 C640,210 560,270 434,270"/>
+<text class="t xs" x="612" y="234">5 s later</text>
+<path class="e" d="M410,228 L560,130"/>
+<text class="t xs end" x="478" y="166">probe fails</text>
+<path class="e" d="M286,260 C200,260 120,210 110,130"/>
+<text class="t xs end" x="140" y="238">probe succeeds</text>
+
+<g data-show="1"><rect x="36" y="66" width="148" height="64" rx="12" style="fill:none;stroke:var(--accent);stroke-width:2.5"/>
+<text class="t sm mid" x="360" y="326">Closed: every call goes through. The breaker records success or failure in a sliding window.</text></g>
+<g data-show="2"><path class="e accent" d="M180,86 C300,30 420,30 536,86" style="stroke-width:2.5"/>
+<text class="t sm mid" x="360" y="326">Trip: the window is full and the failure rate crosses the threshold, so the breaker opens.</text></g>
+<g data-show="3"><rect x="536" y="66" width="148" height="64" rx="12" style="fill:none;stroke:var(--accent);stroke-width:2.5"/>
+<text class="t sm mid" x="360" y="326">Open: calls fail in microseconds with a fallback. The dependency gets room to recover.</text></g>
+<g data-show="4"><path class="e accent" d="M640,126 C640,210 560,270 434,270" style="stroke-width:2.5"/><rect x="286" y="228" width="148" height="64" rx="12" style="fill:none;stroke:var(--accent);stroke-width:2.5"/>
+<text class="t sm mid" x="360" y="326">Half-open: after the cooldown, a small number of trial calls are let through.</text></g>
+<g data-show="5"><path class="e green" d="M286,260 C200,260 120,210 110,130" style="stroke-width:2.5"/><path class="e red" d="M410,228 L560,130" style="stroke-width:2.5"/>
+<text class="t sm mid" x="360" y="326">Trials succeed: close and resume. Trials fail: open again for another cooldown.</text></g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Closed</button><button type="button" data-step="2" aria-pressed="false">Trip</button><button type="button" data-step="3" aria-pressed="false">Open</button><button type="button" data-step="4" aria-pressed="false">Half-open</button><button type="button" data-step="5" aria-pressed="false">Decide</button></div>
+</div>
+<figcaption><b>Circuit breaker states.</b> The thresholds match the code below and are close to Hystrix's defaults, which trip at a 50% error rate once at least 20 requests arrived in a 10-second window, then wait 5 seconds before probing.</figcaption>
+</figure>
+
+<p>A minimal implementation shows how little machinery is involved. It uses a count-based window and an injectable clock so it can be tested without sleeping.</p>
+<pre><code class="language-python">import time
+
+
+class CircuitOpen(Exception):
+    pass
+
+
+class CircuitBreaker:
+    """Count-based breaker: trips when at least `threshold` of the last `window` calls failed."""
+
+    def __init__(self, window=20, threshold=0.5, cooldown=5.0, clock=time.monotonic):
+        self.window, self.threshold, self.cooldown, self.clock = window, threshold, cooldown, clock
+        self.results = []          # True = success, most recent last
+        self.state = "closed"
+        self.opened_at = 0.0
+
+    def call(self, fn):
+        if self.state == "open":
+            if self.clock() - self.opened_at &lt; self.cooldown:
+                raise CircuitOpen("failing fast")          # no network call at all
+            self.state = "half-open"                       # cooldown over: let one probe through
+        try:
+            result = fn()
+        except Exception:
+            self._record(False)
+            raise
+        self._record(True)
+        return result
+
+    def _record(self, ok):
+        if self.state == "half-open":                      # the probe decides
+            self.state = "closed" if ok else "open"
+            self.opened_at = self.clock()
+            self.results = []
+            return
+        self.results = (self.results + [ok])[-self.window:]
+        failures = self.results.count(False)
+        if len(self.results) == self.window and failures / self.window &gt;= self.threshold:
+            self.state, self.opened_at = "open", self.clock()
+
+
+now = [0.0]
+cb = CircuitBreaker(clock=lambda: now[0])
+healthy = [True]
+
+def payments():
+    if not healthy[0]:
+        raise TimeoutError("payments timed out")
+    return "ok"
+
+healthy[0] = False
+for _ in range(20):                       # 20 failures in a row: the window fills and trips
+    try: cb.call(payments)
+    except TimeoutError: pass
+print(cb.state)                           # open
+try: cb.call(payments)
+except CircuitOpen as e: print(e)         # failing fast
+now[0] = 6.0; healthy[0] = True           # cooldown passed, dependency recovered
+print(cb.call(payments), cb.state)        # ok closed</code></pre>
+<p>Design decisions that separate a useful breaker from a harmful one:</p>
+<ul>
+<li><strong>Granularity.</strong> One breaker per dependency per host (or per endpoint) beats one per service. If one of twelve payment replicas is broken, a service-wide breaker either never trips (8% errors) or trips for all twelve. Per-host breakers overlap with load balancer <dfn>outlier detection</dfn>, which ejects individual bad hosts from the pool; Envoy does this based on consecutive 5xx responses.</li>
+<li><strong>Count the right errors.</strong> Timeouts, connection errors and 5xx responses indicate an unhealthy dependency. A 404 or a validation error is the caller's problem and must not trip the breaker.</li>
+<li><strong>Minimum volume.</strong> Without one, two failures out of three calls at 3 a.m. open the circuit. Hystrix requires 20 requests in the window before it evaluates the error rate.</li>
+<li><strong>Limit probes.</strong> In half-open, allow a fixed small number of trial calls, not every caller that happens to arrive. The simple class above is single-threaded; a concurrent version must hand out probe permits.</li>
+<li><strong>Have something to return when open.</strong> A breaker without a fallback just converts slow errors into fast errors. Fast errors are still much better: threads are freed and the dependency gets breathing room.</li>
+</ul>
+
+<h2 id="bulkheads">Bulkheads</h2>
+<p>A ship's hull is divided into watertight compartments so one breach floods one compartment, not the whole ship. A <dfn>bulkhead</dfn> in software partitions resources (threads, connections, memory, even whole server pools) so one misbehaving dependency or tenant can only exhaust its own share.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 250" role="img" aria-label="Left: one shared pool of 20 threads all blocked on slow recommendations, starving payments and inventory. Right: separate pools per dependency, where only the recommendations pool is full">
+<rect class="zone" x="10" y="10" width="340" height="230" rx="10"/>
+<rect class="zone" x="370" y="10" width="340" height="230" rx="10"/>
+<text class="t sm b" x="30" y="34">One shared pool of 20 threads</text>
+<text class="t sm b" x="390" y="34">A pool per dependency</text>
+<rect class="n bad" x="40" y="50" width="24" height="24" rx="4"/>
+<rect class="n bad" x="68" y="50" width="24" height="24" rx="4"/>
+<rect class="n bad" x="96" y="50" width="24" height="24" rx="4"/>
+<rect class="n bad" x="124" y="50" width="24" height="24" rx="4"/>
+<rect class="n bad" x="152" y="50" width="24" height="24" rx="4"/>
+<rect class="n bad" x="180" y="50" width="24" height="24" rx="4"/>
+<rect class="n bad" x="208" y="50" width="24" height="24" rx="4"/>
+<rect class="n bad" x="236" y="50" width="24" height="24" rx="4"/>
+<rect class="n bad" x="264" y="50" width="24" height="24" rx="4"/>
+<rect class="n bad" x="292" y="50" width="24" height="24" rx="4"/>
+<rect class="n bad" x="40" y="78" width="24" height="24" rx="4"/>
+<rect class="n bad" x="68" y="78" width="24" height="24" rx="4"/>
+<rect class="n bad" x="96" y="78" width="24" height="24" rx="4"/>
+<rect class="n bad" x="124" y="78" width="24" height="24" rx="4"/>
+<rect class="n bad" x="152" y="78" width="24" height="24" rx="4"/>
+<rect class="n bad" x="180" y="78" width="24" height="24" rx="4"/>
+<rect class="n bad" x="208" y="78" width="24" height="24" rx="4"/>
+<rect class="n bad" x="236" y="78" width="24" height="24" rx="4"/>
+<rect class="n bad" x="264" y="78" width="24" height="24" rx="4"/>
+<rect class="n bad" x="292" y="78" width="24" height="24" rx="4"/>
+<rect class="n bad" x="395" y="50" width="24" height="24" rx="4"/>
+<rect class="n bad" x="423" y="50" width="24" height="24" rx="4"/>
+<rect class="n bad" x="451" y="50" width="24" height="24" rx="4"/>
+<rect class="n bad" x="395" y="78" width="24" height="24" rx="4"/>
+<rect class="n bad" x="423" y="78" width="24" height="24" rx="4"/>
+<rect class="n bad" x="451" y="78" width="24" height="24" rx="4"/>
+<rect class="n good" x="505" y="50" width="24" height="24" rx="4"/>
+<rect class="n good" x="533" y="50" width="24" height="24" rx="4"/>
+<rect class="n ghost" x="561" y="50" width="24" height="24" rx="4"/>
+<rect class="n ghost" x="505" y="78" width="24" height="24" rx="4"/>
+<rect class="n ghost" x="533" y="78" width="24" height="24" rx="4"/>
+<rect class="n ghost" x="561" y="78" width="24" height="24" rx="4"/>
+<rect class="n good" x="615" y="50" width="24" height="24" rx="4"/>
+<rect class="n ghost" x="643" y="50" width="24" height="24" rx="4"/>
+<rect class="n ghost" x="671" y="50" width="24" height="24" rx="4"/>
+<rect class="n ghost" x="615" y="78" width="24" height="24" rx="4"/>
+<rect class="n ghost" x="643" y="78" width="24" height="24" rx="4"/>
+<rect class="n ghost" x="671" y="78" width="24" height="24" rx="4"/>
+<rect class="n bad" x="30" y="150" width="90" height="40" rx="7"/><text class="t sm b mid" x="75" y="168">Recs</text><text class="t xs mid" x="75" y="182">30 s latency</text>
+<rect class="n svc" x="130" y="150" width="90" height="40" rx="7"/><text class="t sm b mid" x="175" y="174">Payments</text>
+<rect class="n svc" x="230" y="150" width="90" height="40" rx="7"/><text class="t sm b mid" x="275" y="174">Inventory</text>
+<path class="e" d="M75,110 V146"/><path class="e dash" d="M175,110 V146"/><path class="e dash" d="M275,110 V146"/>
+<text class="t xs red" x="30" y="212">All 20 threads wait on Recs.</text>
+<text class="t xs red" x="30" y="227">Payments and Inventory get none: checkout fails.</text>
+<rect class="n bad" x="390" y="150" width="90" height="40" rx="7"/><text class="t sm b mid" x="435" y="168">Recs</text><text class="t xs mid" x="435" y="182">30 s latency</text>
+<rect class="n svc" x="500" y="150" width="90" height="40" rx="7"/><text class="t sm b mid" x="545" y="174">Payments</text>
+<rect class="n svc" x="610" y="150" width="90" height="40" rx="7"/><text class="t sm b mid" x="655" y="174">Inventory</text>
+<path class="e" d="M435,110 V146"/><path class="e" d="M545,110 V146"/><path class="e" d="M655,110 V146"/>
+<text class="t xs green" x="390" y="212">Recs pool full: extra calls rejected at once.</text>
+<text class="t xs green" x="390" y="227">Payments and Inventory keep their own threads.</text>
+</svg>
+</div>
+<figcaption><b>Bulkheads.</b> Red slots are threads blocked on the slow dependency, green slots are threads doing useful work. With partitioned pools the damage stops at the recommendations widget.</figcaption>
+</figure>
+
+<p>Bulkheads appear at every scale:</p>
+<ul>
+<li><strong>Per-dependency thread or connection pools</strong>, as in the figure. Hystrix gave every dependency its own thread pool (10 threads by default) or a semaphore limit. In async runtimes the equivalent is a per-dependency concurrency limit.</li>
+<li><strong>Separate server pools per traffic class.</strong> Serve internal batch jobs and user-facing requests from different instances, so a runaway report cannot starve checkout.</li>
+<li><strong>Cells and shuffle sharding.</strong> AWS splits large services into independent cells, each serving a subset of customers. Shuffle sharding assigns each customer a random small combination of workers, so one poisonous customer only shares all of its workers with a tiny fraction of others.</li>
+</ul>
+<p>The cost is utilisation: a partitioned pool can reject work while other partitions sit idle. Size each partition from that dependency's expected concurrency (rate × latency, by Little's law) with some headroom, and accept that some spare capacity is the price of isolation.</p>
+
+<h2 id="load-shedding">Load shedding and admission control</h2>
+<p>When requests arrive faster than a server can process them, queues grow, every request waits longer, clients time out, and the server ends up spending all its capacity on requests whose callers have already left. Throughput of <em>useful</em> work (<dfn>goodput</dfn>) falls towards zero even though the CPU is at 100%. <dfn>Load shedding</dfn> rejects some requests early and cheaply so the rest can complete within their deadlines.</p>
+<ul>
+<li><strong>Bound every queue.</strong> An unbounded queue converts overload into unbounded latency. A bounded queue converts it into fast rejections, which callers can handle.</li>
+<li><strong>Reject cheaply and early.</strong> Return <code>503</code> or <code>429</code> before parsing the body or touching the database. A rejection must cost a small fraction of a real request, or shedding itself becomes the overload.</li>
+<li><strong>Drop work that is already late.</strong> If a request waited in the queue past its deadline, skip it. Some servers switch the queue to LIFO under pressure: the newest requests still have time left, the oldest are probably abandoned.</li>
+<li><strong>Shed by priority.</strong> Classify traffic (checkout over browsing, user requests over prefetching and batch jobs) and shed the lowest class first.</li>
+<li><strong>Adaptive concurrency limits.</strong> Instead of a hand-tuned limit, measure latency and adjust the allowed concurrency the way TCP adjusts its congestion window: grow while latency stays flat, shrink when it rises. Netflix's <code>concurrency-limits</code> library and Envoy's adaptive concurrency filter work this way.</li>
+</ul>
+<p><dfn>Admission control</dfn> is the same idea applied at the front door: a gateway or <a href="rate-limiting.html">rate limiter</a> refuses work the system cannot take, per client or globally, before it consumes any backend resources.</p>
+
+<h2 id="degradation">Graceful degradation and fallbacks</h2>
+<p>When a dependency fails, the question is what the user should see. <dfn>Graceful degradation</dfn> means losing a feature rather than the page. Typical fallbacks, from best to worst user experience:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Fallback</th><th>Example</th><th>Watch out for</th></tr></thead>
+<tbody>
+<tr><th>Stale data</th><td>Serve the last cached product price list when the pricing service is down</td><td>How stale is acceptable; never for balances or inventory you must not oversell</td></tr>
+<tr><th>Generic default</th><td>Show globally popular items instead of personalised recommendations</td><td>Users may not notice, so make sure your dashboards do</td></tr>
+<tr><th>Hide the feature</th><td>Drop the reviews widget, render the rest of the page</td><td>The page must work with the section missing</td></tr>
+<tr><th>Queue for later</th><td>Accept an order, confirm by email once payment processing recovers</td><td>Needs durable storage and a clear user message</td></tr>
+<tr><th>Fail fast with a clear error</th><td>"Payments are temporarily unavailable, try again in a few minutes"</td><td>Better than a spinner that times out after 60 seconds</td></tr>
+</tbody></table></div>
+<p>Two warnings. First, a fallback that calls <em>another</em> remote service is a new dependency that will be needed at the worst possible moment and has probably never carried full load. AWS's guidance is to prefer making the primary path more reliable over adding rarely exercised fallback paths. Second, decide which features are critical before the incident. "Checkout must work without recommendations, reviews and search suggestions" is a design decision, and it needs tests and drills to stay true.</p>
+
+<h2 id="health-checks">Health checks: liveness and readiness</h2>
+<p>Load balancers and orchestrators route around failed instances using <dfn>health checks</dfn>. Kubernetes distinguishes two questions, and mixing them up causes outages.</p>
+<div class="defs">
+<div><h4>Liveness</h4><p>"Is this process stuck beyond repair?" Failure means restart the container. Check only things the process can fix by restarting: a deadlocked event loop, a wedged thread pool.</p></div>
+<div><h4>Readiness</h4><p>"Should this instance receive traffic right now?" Failure removes it from the Service's endpoints but does not restart it. Use it during startup, cache warm-up, and when the instance is shedding load.</p></div>
+<div><h4>Startup</h4><p>Holds off the other probes until a slow-starting app has finished booting, so liveness does not kill it mid-start.</p></div>
+</div>
+<div class="callout warn">
+<div class="callout-title">Common mistake: dependencies in the liveness probe</div>
+<p>If every instance's liveness check calls the database, a database blip fails every check at once and Kubernetes restarts the entire fleet. Now the database is back, but nothing is running, and every instance is cold-starting at the same time. Keep liveness shallow. Put dependency checks, if anywhere, in readiness, and even there be careful: if all instances become unready together, there is nothing left to serve even a degraded response.</p>
+</div>
+<p>Load balancers guard against the same trap by <strong>failing open</strong>. AWS load balancers route to all targets if every target is unhealthy, and Envoy has a <em>panic threshold</em> (50% by default): when fewer than that fraction of hosts are healthy, it ignores health status and balances across all of them. The reasoning is that a health check that fails everywhere is more likely broken than the fleet. See <a href="load-balancing.html">Load Balancing</a>.</p>
+
+<h2 id="cascading">Cascading and metastable failures</h2>
+<p>A <dfn>cascading failure</dfn> spreads by moving load. One instance in a pool of ten fails; its traffic goes to the other nine, raising their load by about 11%. If they were already at 90% utilisation, they are now at 100%, latency rises, one more falls over, and each failure makes the next one more likely. The same happens across services when a caller's thread pool fills behind a slow dependency, as in the opening example. The defences are everything above: headroom (N+1 or N+2 capacity), timeouts, bulkheads and load shedding so an overloaded instance stays up and serves some requests instead of crashing and pushing everything onto its neighbours.</p>
+<p>A <dfn>metastable failure</dfn> is a worse variant: the system stays broken after the original trigger is gone. Bronson and colleagues described the pattern (HotOS 2021): a system runs in a state that is stable but vulnerable, a trigger pushes it over capacity briefly, and a <em>sustaining effect</em>, usually retries, keeps load above capacity indefinitely.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 230" role="img" aria-label="Feedback loop: a trigger raises latency, timeouts fire, clients retry, load rises above capacity, latency rises further">
+<rect class="n ext" x="20" y="92" width="130" height="50" rx="8"/><text class="t sm b mid" x="85" y="113">Trigger</text><text class="t xs mute mid" x="85" y="129">bad deploy, spike</text>
+<rect class="n svc" x="210" y="30" width="150" height="46" rx="8"/><text class="t sm b mid" x="285" y="58">Latency rises</text>
+<rect class="n svc" x="450" y="30" width="150" height="46" rx="8"/><text class="t sm b mid" x="525" y="58">Timeouts fire</text>
+<rect class="n svc" x="450" y="160" width="150" height="46" rx="8"/><text class="t sm b mid" x="525" y="188">Clients retry</text>
+<rect class="n bad" x="210" y="160" width="150" height="46" rx="8"/><text class="t sm b mid" x="285" y="181">Load &gt; capacity</text><text class="t xs mid" x="285" y="196">queues grow</text>
+<path class="e" d="M150,105 C178,105 182,53 206,53"/>
+<path class="e red" d="M360,53 H446"/>
+<path class="e red" d="M525,76 V156"/>
+<path class="e red" d="M450,183 H364"/>
+<path class="e red" d="M285,160 V80"/>
+<path class="flow" d="M360,53 H446"/><path class="flow" d="M525,76 V156"/><path class="flow" d="M450,183 H364"/><path class="flow" d="M285,160 V80"/>
+<text class="t sm b mid" x="405" y="112">sustaining loop</text>
+<text class="t xs mute mid" x="405" y="128">keeps running after the</text>
+<text class="t xs mute mid" x="405" y="141">trigger is removed</text>
+<text class="t xs mute" x="620" y="110">Break it by:</text>
+<text class="t xs" x="620" y="126">shedding load</text>
+<text class="t xs" x="620" y="141">retry budgets</text>
+<text class="t xs" x="620" y="156">jittered backoff</text>
+</svg>
+</div>
+<figcaption><b>A metastable failure.</b> The trigger only needs to push the system over the edge once. From then on, retries of timed-out requests generate enough load to keep requests timing out. Rolling back the deploy does not fix it; removing the extra load does.</figcaption>
+</figure>
+<p>Recovery from a metastable state usually means cutting load well below normal for a while (blocking traffic at the edge, disabling retries, shedding aggressively) and then letting it back in gradually. Caches can create the same loop: a cold cache sends every request to the database, the database slows down, cache fills time out, and the cache never warms.</p>
+
+<h2 id="chaos">Chaos engineering</h2>
+<p>All of these mechanisms are code paths that only run during failures, which means they are rarely exercised and often broken. <dfn>Chaos engineering</dfn> runs controlled experiments in production (or production-like environments) to find out how the system really behaves. The method from Netflix's <em>Principles of Chaos Engineering</em>:</p>
+<ol class="steps">
+<li><strong>Define steady state</strong> in terms of a business metric, such as successful checkouts per minute, not CPU usage.</li>
+<li><strong>Form a hypothesis</strong>: "if one payment replica is killed, steady state does not change."</li>
+<li><strong>Inject a real-world failure</strong>: kill instances, add 300 ms of latency to a dependency, drop packets, fill a disk, block a zone.</li>
+<li><strong>Look for a difference</strong> between the experiment and a control group, and keep the blast radius small with an automatic abort if metrics move.</li>
+</ol>
+<p>Netflix's Chaos Monkey randomly terminates production instances during business hours so engineers are forced to build services that tolerate it; Chaos Kong evacuates an entire AWS region. Other teams run <em>game days</em>, scheduled drills where a failure is injected and the on-call team responds as if it were real. Cloud providers offer managed fault injection, for example AWS Fault Injection Service.</p>
+
+<h2 id="worked-example">Worked example: configuring a checkout path</h2>
+<p>A checkout request enters at the gateway with a 2-second deadline. The checkout service calls payments (critical), inventory (critical) and recommendations (optional). Client-side measured latencies and the resulting settings:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Call</th><th class="num">p50 / p99.9</th><th>Timeout</th><th>Retries</th><th>Breaker</th><th>On failure</th></tr></thead>
+<tbody>
+<tr><th>Gateway → checkout</th><td class="num">120 / 900 ms</td><td>2 s deadline, propagated</td><td>None (the user retries from the error page)</td><td>Per host via outlier detection</td><td>Error page with retry button</td></tr>
+<tr><th>Checkout → payments</th><td class="num">180 / 650 ms</td><td>min(800 ms, remaining - 100 ms)</td><td>1, with idempotency key, jittered, 10% budget</td><td>Yes</td><td class="meh">Queue the order, confirm by email</td></tr>
+<tr><th>Checkout → inventory</th><td class="num">15 / 90 ms</td><td>150 ms</td><td>2, full jitter, 10% budget</td><td>Yes</td><td class="no">Fail fast with a clear message</td></tr>
+<tr><th>Checkout → recommendations</th><td class="num">40 / 300 ms</td><td>200 ms (deliberately tight)</td><td>None</td><td>Yes, own 10-thread bulkhead</td><td class="yes">Render without the widget</td></tr>
+</tbody></table></div>
+<p>Notice the deliberate asymmetries. Recommendations gets a timeout <em>below</em> its p99.9 because it is optional: a missing widget costs nothing. Payments gets one retry only because it is expensive and non-idempotent without the key. Retries happen only in the checkout service, never also at the gateway and the app, so the worst case is bounded. Every timeout is also capped by the remaining deadline, so a slow first payments attempt leaves less time for its retry instead of pushing the request past 2 seconds.</p>
+
+<h2 id="tradeoffs">Trade-offs at a glance</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Pattern</th><th>Protects against</th><th>Costs you</th><th>Failure mode if misused</th></tr></thead>
+<tbody>
+<tr><th>Timeout</th><td>Resource exhaustion behind slow calls</td><td>Some healthy slow requests are cancelled</td><td>Too short: false failures and retry storms. Missing: thread exhaustion</td></tr>
+<tr><th>Retry + backoff + jitter</th><td>Transient faults</td><td>Extra load and latency</td><td>Amplification across layers, duplicate side effects</td></tr>
+<tr><th>Retry budget</th><td>Retry storms</td><td>Some retryable failures are not retried under stress</td><td>Budget too large to matter</td></tr>
+<tr><th>Circuit breaker</th><td>Wasting effort on a dead dependency, slow recovery</td><td>Some requests rejected that might have succeeded</td><td>Too coarse: one bad host trips everything. No fallback: fast errors only</td></tr>
+<tr><th>Bulkhead</th><td>One dependency or tenant exhausting shared resources</td><td>Lower utilisation, more pools to size</td><td>Partitions too small for normal peaks</td></tr>
+<tr><th>Load shedding</th><td>Goodput collapse under overload</td><td>Rejected requests</td><td>Rejection path as expensive as real work</td></tr>
+<tr><th>Fallback</th><td>Feature failure becoming page failure</td><td>Code paths that rarely run</td><td>Untested fallback that fails or overloads something else</td></tr>
+</tbody></table></div>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+<li><strong>Netflix Hystrix</strong> (open-sourced 2012) packaged timeouts, circuit breakers, thread-pool bulkheads and fallbacks into one library and made the patterns mainstream. It has been in maintenance mode since 2018; Netflix points users to Resilience4j for new code, and much of this logic has moved into service meshes.</li>
+<li><strong>Netflix Chaos Monkey and the Simian Army</strong> made failure injection in production a normal engineering practice, and Netflix later formalised it into the Principles of Chaos Engineering.</li>
+<li><strong>AWS Builders' Library</strong> documents how Amazon services handle timeouts, retries, backoff with jitter, retry at a single layer, load shedding and the risks of fallback. Marc Brooker's 2015 blog post measured the jitter variants used in the AWS SDKs.</li>
+<li><strong>Envoy and Istio</strong> provide per-route timeouts, retries with retry budgets, outlier detection, and "circuit breakers" that are really bulkhead-style concurrency limits (max connections, pending requests, requests and concurrent retries per upstream cluster).</li>
+<li><strong>Google</strong> propagates deadlines through every RPC, uses client-side adaptive throttling, and describes per-request and per-client retry limits in the SRE book's chapters on overload and cascading failures.</li>
+<li><strong>Kubernetes</strong> liveness, readiness and startup probes are the most common health-check setup today, and also the most common source of self-inflicted restart storms.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>Whenever your design has a synchronous call to another service, which is nearly always. After the high-level diagram, spend a minute on "what happens when this dependency is slow?": timeouts from p99.9, retries with jittered backoff at one layer only, a circuit breaker with a fallback for optional features, and a bulkhead for anything non-critical. Interviewers notice when you separate critical and optional dependencies.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>How do you pick a timeout? From the caller-measured latency distribution, around p99.9 with headroom, and capped by the remaining deadline.</li>
+<li>Why jitter? Backoff alone keeps clients synchronized; jitter spreads retries so most succeed on the next attempt.</li>
+<li>What happens if every layer retries three times? 4<sup>n</sup> amplification; retry at one layer or use budgets.</li>
+<li>Walk through the circuit breaker states. What counts as a failure? How many probes in half-open?</li>
+<li>What is the difference between liveness and readiness, and why not check the database in liveness?</li>
+<li>The service is overloaded. What do you do in the next five minutes? Shed load, disable retries, scale out, then find the trigger.</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>"We'll just retry" with no backoff, no jitter, no limit and no thought about idempotency.</li>
+<li>Calls with no timeout, or a 30-second timeout on a call whose p99 is 50 ms.</li>
+<li>Treating a circuit breaker as a fix in itself, with no answer for what users see when it is open.</li>
+<li>Unbounded queues described as "absorbing spikes".</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/" target="_blank" rel="noopener">Timeouts, retries, and backoff with jitter</a><span>Marc Brooker, Amazon Builders' Library. How Amazon picks timeouts from latency percentiles, where to retry, and why jitter matters.</span></li>
+<li><a href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/" target="_blank" rel="noopener">Exponential Backoff And Jitter</a><span>Marc Brooker, AWS Architecture Blog, 2015. Simulations comparing full, equal and decorrelated jitter.</span></li>
+<li><a href="https://sre.google/sre-book/handling-overload/" target="_blank" rel="noopener">Handling Overload</a><span>Google SRE book, chapter 21. Per-request (3 attempts) and per-client (10%) retry budgets, client-side throttling.</span></li>
+<li><a href="https://sre.google/sre-book/addressing-cascading-failures/" target="_blank" rel="noopener">Addressing Cascading Failures</a><span>Google SRE book, chapter 22. Overload, retry limits, deadlines and load shedding from Google's production experience.</span></li>
+<li><a href="https://martinfowler.com/bliki/CircuitBreaker.html" target="_blank" rel="noopener">CircuitBreaker</a><span>Martin Fowler, 2014. The pattern explained with code, building on Nygard's Release It!</span></li>
+<li><a href="https://github.com/Netflix/Hystrix/wiki/How-it-Works" target="_blank" rel="noopener">Hystrix: How it Works</a><span>Netflix. Detailed description of a production circuit breaker, thread-pool bulkheads and fallbacks.</span></li>
+</ul>
