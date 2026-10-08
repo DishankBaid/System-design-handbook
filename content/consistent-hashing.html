@@ -1,0 +1,401 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">Any system that spreads data or requests across machines has to answer one question millions of times per second: <em>which node owns this key?</em> The answer must be fast, computable by every client without coordination, and stable when nodes come and go.</p>
+<p>The obvious answer is <code>node = hash(key) % N</code>. It is fast and spreads keys evenly. Its flaw only shows up when <code>N</code> changes, and in production <code>N</code> changes all the time: a cache node dies, you add capacity before a sale, a host is replaced during a deploy.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 750 170" role="img" aria-label="Twenty keys mapped with hash mod 4 and hash mod 5; sixteen of twenty change node">
+<text class="t sm mute" x="0" y="30">hash</text>
+<text class="t b" x="0" y="59">% 4</text><text class="t xs mute" x="0" y="73">4 nodes</text>
+<text class="t b" x="0" y="115">% 5</text><text class="t xs mute" x="0" y="129">5 nodes</text>
+<text class="t mono mute mid" x="110.0" y="30">0</text>
+<rect x="96" y="40" width="28" height="28" rx="5" style="fill:var(--d-svc);stroke:var(--d-svc-s)"/><text class="t sm mid" x="110.0" y="58.5">A</text>
+<rect x="96" y="96" width="28" height="28" rx="5" style="fill:var(--d-svc);stroke:var(--d-svc-s)"/><text class="t sm mid" x="110.0" y="114.5">A</text>
+<text class="t mono mute mid" x="142.0" y="30">1</text>
+<rect x="128" y="40" width="28" height="28" rx="5" style="fill:var(--d-db);stroke:var(--d-db-s)"/><text class="t sm mid" x="142.0" y="58.5">B</text>
+<rect x="128" y="96" width="28" height="28" rx="5" style="fill:var(--d-db);stroke:var(--d-db-s)"/><text class="t sm mid" x="142.0" y="114.5">B</text>
+<text class="t mono mute mid" x="174.0" y="30">2</text>
+<rect x="160" y="40" width="28" height="28" rx="5" style="fill:var(--d-cache);stroke:var(--d-cache-s)"/><text class="t sm mid" x="174.0" y="58.5">C</text>
+<rect x="160" y="96" width="28" height="28" rx="5" style="fill:var(--d-cache);stroke:var(--d-cache-s)"/><text class="t sm mid" x="174.0" y="114.5">C</text>
+<text class="t mono mute mid" x="206.0" y="30">3</text>
+<rect x="192" y="40" width="28" height="28" rx="5" style="fill:var(--d-queue);stroke:var(--d-queue-s)"/><text class="t sm mid" x="206.0" y="58.5">D</text>
+<rect x="192" y="96" width="28" height="28" rx="5" style="fill:var(--d-queue);stroke:var(--d-queue-s)"/><text class="t sm mid" x="206.0" y="114.5">D</text>
+<text class="t mono mute mid" x="238.0" y="30">4</text>
+<rect x="224" y="40" width="28" height="28" rx="5" style="fill:var(--d-svc);stroke:var(--d-svc-s)"/><text class="t sm mid" x="238.0" y="58.5">A</text>
+<rect x="224" y="96" width="28" height="28" rx="5" style="fill:var(--d-ext);stroke:var(--d-red);stroke-width:2"/><text class="t sm mid" x="238.0" y="114.5">E</text>
+<text class="t mono mute mid" x="270.0" y="30">5</text>
+<rect x="256" y="40" width="28" height="28" rx="5" style="fill:var(--d-db);stroke:var(--d-db-s)"/><text class="t sm mid" x="270.0" y="58.5">B</text>
+<rect x="256" y="96" width="28" height="28" rx="5" style="fill:var(--d-svc);stroke:var(--d-red);stroke-width:2"/><text class="t sm mid" x="270.0" y="114.5">A</text>
+<text class="t mono mute mid" x="302.0" y="30">6</text>
+<rect x="288" y="40" width="28" height="28" rx="5" style="fill:var(--d-cache);stroke:var(--d-cache-s)"/><text class="t sm mid" x="302.0" y="58.5">C</text>
+<rect x="288" y="96" width="28" height="28" rx="5" style="fill:var(--d-db);stroke:var(--d-red);stroke-width:2"/><text class="t sm mid" x="302.0" y="114.5">B</text>
+<text class="t mono mute mid" x="334.0" y="30">7</text>
+<rect x="320" y="40" width="28" height="28" rx="5" style="fill:var(--d-queue);stroke:var(--d-queue-s)"/><text class="t sm mid" x="334.0" y="58.5">D</text>
+<rect x="320" y="96" width="28" height="28" rx="5" style="fill:var(--d-cache);stroke:var(--d-red);stroke-width:2"/><text class="t sm mid" x="334.0" y="114.5">C</text>
+<text class="t mono mute mid" x="366.0" y="30">8</text>
+<rect x="352" y="40" width="28" height="28" rx="5" style="fill:var(--d-svc);stroke:var(--d-svc-s)"/><text class="t sm mid" x="366.0" y="58.5">A</text>
+<rect x="352" y="96" width="28" height="28" rx="5" style="fill:var(--d-queue);stroke:var(--d-red);stroke-width:2"/><text class="t sm mid" x="366.0" y="114.5">D</text>
+<text class="t mono mute mid" x="398.0" y="30">9</text>
+<rect x="384" y="40" width="28" height="28" rx="5" style="fill:var(--d-db);stroke:var(--d-db-s)"/><text class="t sm mid" x="398.0" y="58.5">B</text>
+<rect x="384" y="96" width="28" height="28" rx="5" style="fill:var(--d-ext);stroke:var(--d-red);stroke-width:2"/><text class="t sm mid" x="398.0" y="114.5">E</text>
+<text class="t mono mute mid" x="430.0" y="30">10</text>
+<rect x="416" y="40" width="28" height="28" rx="5" style="fill:var(--d-cache);stroke:var(--d-cache-s)"/><text class="t sm mid" x="430.0" y="58.5">C</text>
+<rect x="416" y="96" width="28" height="28" rx="5" style="fill:var(--d-svc);stroke:var(--d-red);stroke-width:2"/><text class="t sm mid" x="430.0" y="114.5">A</text>
+<text class="t mono mute mid" x="462.0" y="30">11</text>
+<rect x="448" y="40" width="28" height="28" rx="5" style="fill:var(--d-queue);stroke:var(--d-queue-s)"/><text class="t sm mid" x="462.0" y="58.5">D</text>
+<rect x="448" y="96" width="28" height="28" rx="5" style="fill:var(--d-db);stroke:var(--d-red);stroke-width:2"/><text class="t sm mid" x="462.0" y="114.5">B</text>
+<text class="t mono mute mid" x="494.0" y="30">12</text>
+<rect x="480" y="40" width="28" height="28" rx="5" style="fill:var(--d-svc);stroke:var(--d-svc-s)"/><text class="t sm mid" x="494.0" y="58.5">A</text>
+<rect x="480" y="96" width="28" height="28" rx="5" style="fill:var(--d-cache);stroke:var(--d-red);stroke-width:2"/><text class="t sm mid" x="494.0" y="114.5">C</text>
+<text class="t mono mute mid" x="526.0" y="30">13</text>
+<rect x="512" y="40" width="28" height="28" rx="5" style="fill:var(--d-db);stroke:var(--d-db-s)"/><text class="t sm mid" x="526.0" y="58.5">B</text>
+<rect x="512" y="96" width="28" height="28" rx="5" style="fill:var(--d-queue);stroke:var(--d-red);stroke-width:2"/><text class="t sm mid" x="526.0" y="114.5">D</text>
+<text class="t mono mute mid" x="558.0" y="30">14</text>
+<rect x="544" y="40" width="28" height="28" rx="5" style="fill:var(--d-cache);stroke:var(--d-cache-s)"/><text class="t sm mid" x="558.0" y="58.5">C</text>
+<rect x="544" y="96" width="28" height="28" rx="5" style="fill:var(--d-ext);stroke:var(--d-red);stroke-width:2"/><text class="t sm mid" x="558.0" y="114.5">E</text>
+<text class="t mono mute mid" x="590.0" y="30">15</text>
+<rect x="576" y="40" width="28" height="28" rx="5" style="fill:var(--d-queue);stroke:var(--d-queue-s)"/><text class="t sm mid" x="590.0" y="58.5">D</text>
+<rect x="576" y="96" width="28" height="28" rx="5" style="fill:var(--d-svc);stroke:var(--d-red);stroke-width:2"/><text class="t sm mid" x="590.0" y="114.5">A</text>
+<text class="t mono mute mid" x="622.0" y="30">16</text>
+<rect x="608" y="40" width="28" height="28" rx="5" style="fill:var(--d-svc);stroke:var(--d-svc-s)"/><text class="t sm mid" x="622.0" y="58.5">A</text>
+<rect x="608" y="96" width="28" height="28" rx="5" style="fill:var(--d-db);stroke:var(--d-red);stroke-width:2"/><text class="t sm mid" x="622.0" y="114.5">B</text>
+<text class="t mono mute mid" x="654.0" y="30">17</text>
+<rect x="640" y="40" width="28" height="28" rx="5" style="fill:var(--d-db);stroke:var(--d-db-s)"/><text class="t sm mid" x="654.0" y="58.5">B</text>
+<rect x="640" y="96" width="28" height="28" rx="5" style="fill:var(--d-cache);stroke:var(--d-red);stroke-width:2"/><text class="t sm mid" x="654.0" y="114.5">C</text>
+<text class="t mono mute mid" x="686.0" y="30">18</text>
+<rect x="672" y="40" width="28" height="28" rx="5" style="fill:var(--d-cache);stroke:var(--d-cache-s)"/><text class="t sm mid" x="686.0" y="58.5">C</text>
+<rect x="672" y="96" width="28" height="28" rx="5" style="fill:var(--d-queue);stroke:var(--d-red);stroke-width:2"/><text class="t sm mid" x="686.0" y="114.5">D</text>
+<text class="t mono mute mid" x="718.0" y="30">19</text>
+<rect x="704" y="40" width="28" height="28" rx="5" style="fill:var(--d-queue);stroke:var(--d-queue-s)"/><text class="t sm mid" x="718.0" y="58.5">D</text>
+<rect x="704" y="96" width="28" height="28" rx="5" style="fill:var(--d-ext);stroke:var(--d-red);stroke-width:2"/><text class="t sm mid" x="718.0" y="114.5">E</text>
+<rect x="96" y="146" width="14" height="14" rx="3" style="fill:none;stroke:var(--d-red);stroke-width:2"/>
+<text class="t sm" x="118" y="157.5">key changed node: 16 of 20 (80%)</text>
+</svg>
+</div>
+<figcaption><b>Modulo hashing under change.</b> Twenty keys with hash values 0 to 19. Going from 4 to 5 nodes changes the owner of every key except 0 to 3. In general, going from N to N+1 nodes moves about N/(N+1) of all keys.</figcaption>
+</figure>
+
+<p>For a database, that means migrating almost every row. For a cache it is worse, because nothing gets migrated: almost every lookup suddenly goes to a node that has never seen that key, the hit rate collapses, and the full read load lands on the database behind it. Adding a node to relieve pressure is exactly what takes the system down.</p>
+<p><dfn>Consistent hashing</dfn> fixes this. When a node joins or leaves, only the keys that belong to that node move, about <code>1/N</code> of the total, and every other key stays put.</p>
+
+<h2 id="the-ring">The hash ring</h2>
+<p>Take the output range of a hash function, say 0 to 2<sup>32</sup> - 1, and bend it into a circle so the largest value wraps around to 0. Then place two kinds of things on it with the same hash function:</p>
+<ul>
+<li><strong>Nodes</strong>, at <code>hash(node_id)</code>, for example <code>hash("cache-07")</code>.</li>
+<li><strong>Keys</strong>, at <code>hash(key)</code>, for example <code>hash("user:42")</code>.</li>
+</ul>
+<p>A key belongs to the first node you meet walking <strong>clockwise</strong> from the key's position. Equivalently, each node owns the arc between its predecessor and itself. Use the buttons to change the cluster and watch which keys move.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 420" role="img" aria-label="Hash ring with nodes A to D and six keys, with steps for adding node E and removing node B">
+<circle class="line faint" cx="260" cy="215" r="150"/>
+<text class="t xs mute mid" x="260" y="52">0 = 2³²</text>
+<path class="line faint" d="M260,58 V70"/>
+<path class="e accent" d="M330,40 A190,190 0 0 1 392,72" style="stroke-width:1.5"/>
+<text class="t xs accent" x="398" y="66">clockwise</text>
+<path data-show="1 2 3" d="M119.0,163.7 A150,150 0 0 1 311.3,74.0" style="fill:none;stroke:var(--d-svc-s);stroke-width:6;opacity:.85"/>
+<path data-show="1 2" d="M311.3,74.0 A150,150 0 0 1 401.0,266.3" style="fill:none;stroke:var(--d-db-s);stroke-width:6;opacity:.85"/>
+<path data-show="1" d="M401.0,266.3 A150,150 0 0 1 185.0,344.9" style="fill:none;stroke:var(--d-cache-s);stroke-width:6;opacity:.85"/>
+<path data-show="2" d="M401.0,266.3 A150,150 0 0 1 298.8,359.9" style="fill:none;stroke:var(--d-ext-s);stroke-width:6;opacity:.85"/>
+<path data-show="2" d="M298.8,359.9 A150,150 0 0 1 185.0,344.9" style="fill:none;stroke:var(--d-cache-s);stroke-width:6;opacity:.85"/>
+<path data-show="3" d="M311.3,74.0 A150,150 0 1 1 185.0,344.9" style="fill:none;stroke:var(--d-cache-s);stroke-width:6;opacity:.85"/>
+<path data-show="1 2 3" d="M185.0,344.9 A150,150 0 0 1 119.0,163.7" style="fill:none;stroke:var(--d-queue-s);stroke-width:6;opacity:.85"/>
+<g><circle class="n svc" cx="311.3" cy="74.0" r="15"/><text class="t b mid" x="311.3" y="78.5">A</text></g>
+<g data-show="1 2"><circle class="n db" cx="401.0" cy="266.3" r="15"/><text class="t b mid" x="401.0" y="270.8">B</text></g>
+<g><circle class="n cache" cx="185.0" cy="344.9" r="15"/><text class="t b mid" x="185.0" y="349.4">C</text></g>
+<g><circle class="n queue" cx="119.0" cy="163.7" r="15"/><text class="t b mid" x="119.0" y="168.2">D</text></g>
+<g data-show="2"><circle class="n ext" cx="298.8" cy="359.9" r="15"/><text class="t b mid" x="298.8" y="364.4">E</text></g>
+<circle data-show="1 2" cx="389.9" cy="140.0" r="6" style="fill:var(--d-db-s);stroke:var(--surface);stroke-width:2"/>
+<circle data-show="3" cx="389.9" cy="140.0" r="6" style="fill:var(--d-cache-s);stroke:var(--surface);stroke-width:2"/>
+<circle data-show="3" cx="389.9" cy="140.0" r="11" style="fill:none;stroke:var(--d-red);stroke-width:1.5;stroke-dasharray:3 2"/>
+<text class="t mono mid" x="365.7" y="158.0">k1</text>
+<circle data-show="1 3" cx="382.9" cy="301.0" r="6" style="fill:var(--d-cache-s);stroke:var(--surface);stroke-width:2"/>
+<circle data-show="2" cx="382.9" cy="301.0" r="6" style="fill:var(--d-ext-s);stroke:var(--surface);stroke-width:2"/>
+<circle data-show="2" cx="382.9" cy="301.0" r="11" style="fill:none;stroke:var(--d-red);stroke-width:1.5;stroke-dasharray:3 2"/>
+<text class="t mono mid" x="359.9" y="289.0">k2</text>
+<circle data-show="1 3" cx="346.0" cy="337.9" r="6" style="fill:var(--d-cache-s);stroke:var(--surface);stroke-width:2"/>
+<circle data-show="2" cx="346.0" cy="337.9" r="6" style="fill:var(--d-ext-s);stroke:var(--surface);stroke-width:2"/>
+<circle data-show="2" cx="346.0" cy="337.9" r="11" style="fill:none;stroke:var(--d-red);stroke-width:1.5;stroke-dasharray:3 2"/>
+<text class="t mono mid" x="330.0" y="318.9">k3</text>
+<circle cx="246.9" cy="364.4" r="6" style="fill:var(--d-cache-s);stroke:var(--surface);stroke-width:2"/>
+<text class="t mono mid" x="249.4" y="340.5">k4</text>
+<circle cx="119.0" cy="266.3" r="6" style="fill:var(--d-queue-s);stroke:var(--surface);stroke-width:2"/>
+<text class="t mono mid" x="145.4" y="260.7">k5</text>
+<circle cx="185.0" cy="85.1" r="6" style="fill:var(--d-svc-s);stroke:var(--surface);stroke-width:2"/>
+<text class="t mono mid" x="199.0" y="113.3">k6</text>
+
+<rect class="n" x="470" y="70" width="230" height="290" rx="10"/>
+<text class="t b" x="490" y="100" data-show="1">4 nodes: A, B, C, D</text>
+<text class="t b" x="490" y="100" data-show="2">Node E joins at 165°</text>
+<text class="t b" x="490" y="100" data-show="3">Node B leaves</text>
+<path class="line faint" d="M490,114 H680"/>
+<text class="t mono" x="490" y="142">k1</text><text class="t mono mute" x="530" y="142">→</text>
+<text class="t mono" x="490" y="170">k2</text><text class="t mono mute" x="530" y="170">→</text>
+<text class="t mono" x="490" y="198">k3</text><text class="t mono mute" x="530" y="198">→</text>
+<text class="t mono" x="490" y="226">k4</text><text class="t mono mute" x="530" y="226">→</text>
+<text class="t mono" x="490" y="254">k5</text><text class="t mono mute" x="530" y="254">→</text>
+<text class="t mono" x="490" y="282">k6</text><text class="t mono mute" x="530" y="282">→</text>
+<text class="t mono" x="556" y="142" data-show="1 2">B</text><text class="t mono red" x="556" y="142" data-show="3">C  moved</text>
+<text class="t mono" x="556" y="170" data-show="1 3">C</text><text class="t mono red" x="556" y="170" data-show="2">E  moved</text>
+<text class="t mono" x="556" y="198" data-show="1 3">C</text><text class="t mono red" x="556" y="198" data-show="2">E  moved</text>
+<text class="t mono" x="556" y="226">C</text>
+<text class="t mono" x="556" y="254">D</text>
+<text class="t mono" x="556" y="282">A</text>
+<path class="line faint" d="M490,302 H680"/>
+<text class="t sm mute" x="490" y="328" data-show="1">Each node owns the arc that</text>
+<text class="t sm mute" x="490" y="346" data-show="1">ends at its position.</text>
+<text class="t sm" x="490" y="328" data-show="2">2 of 6 keys moved, and</text>
+<text class="t sm" x="490" y="346" data-show="2">all of them came from C.</text>
+<text class="t sm" x="490" y="328" data-show="3">1 of 6 keys moved: only the</text>
+<text class="t sm" x="490" y="346" data-show="3">keys B owned, all to C.</text>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Start: 4 nodes</button><button type="button" data-step="2" aria-pressed="false">Add node E</button><button type="button" data-step="3" aria-pressed="false">Remove node B</button></div>
+</div>
+<figcaption><b>The ring.</b> Coloured arcs show which node owns each stretch of the hash space. Adding E splits C's arc, so only keys in that slice move. Removing B hands B's whole arc to its clockwise successor, C.</figcaption>
+</figure>
+
+<p>Two properties fall out of this geometry:</p>
+<ul>
+<li><strong>Minimal movement.</strong> A joining node only takes keys from one neighbour, and a leaving node only gives keys to one neighbour. Everything else is untouched. On average that is <code>K/N</code> keys for <code>K</code> keys and <code>N</code> nodes.</li>
+<li><strong>No coordination per lookup.</strong> Any client holding the same node list computes the same owner. The only shared state is cluster membership, which changes rarely compared with lookups.</li>
+</ul>
+
+<h2 id="virtual-nodes">Virtual nodes fix the two flaws of the basic ring</h2>
+<p>With one position per node the ring has two problems. Both are visible in the figure above, where C owns more than a quarter of the ring and inherits all of B's keys when B leaves.</p>
+<ol>
+<li><strong>Uneven load.</strong> Node positions are random, so arc lengths are random too. With only a handful of nodes, one node routinely owns two or three times its fair share.</li>
+<li><strong>Uneven recovery.</strong> When a node fails, its single successor absorbs its entire load. A cluster at 60% utilisation can see that neighbour jump to 120% and fail too, and the failure walks around the ring.</li>
+</ol>
+<p>The fix is to give each physical node many positions, called <dfn>virtual nodes</dfn> or tokens. Node A is hashed as <code>A#0</code>, <code>A#1</code>, ... <code>A#99</code>, and so on for every node. Arcs from different physical nodes interleave, so the law of large numbers evens out the share each node owns, and when a node dies its many small arcs are inherited by many different successors.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 680 370" role="img" aria-label="Two rings: three nodes with one token each get 53, 11 and 36 percent; with four tokens each they get 34, 32 and 33 percent">
+<circle class="line faint" cx="165" cy="150" r="100"/>
+<path d="M130.8,244.0 A100,100 0 1 1 215.0,63.4" style="fill:none;stroke:var(--d-svc-s);stroke-width:6;opacity:.85"/>
+<path d="M215.0,63.4 A100,100 0 0 1 259.0,115.8" style="fill:none;stroke:var(--d-db-s);stroke-width:6;opacity:.85"/>
+<path d="M259.0,115.8 A100,100 0 0 1 130.8,244.0" style="fill:none;stroke:var(--d-cache-s);stroke-width:6;opacity:.85"/>
+<circle class="n svc" cx="215.0" cy="63.4" r="14"/><text class="t b mid" x="215.0" y="67.4">A</text>
+<circle class="n db" cx="259.0" cy="115.8" r="14"/><text class="t b mid" x="259.0" y="119.8">B</text>
+<circle class="n cache" cx="130.8" cy="244.0" r="14"/><text class="t b mid" x="130.8" y="248.0">C</text>
+<text class="t b mid" x="165" y="146">1 token each</text><text class="t sm mute mid" x="165" y="164">uneven arcs</text>
+<text class="t sm" x="55" y="301">A</text><rect x="71" y="290" width="84.4" height="14" rx="3" style="fill:var(--d-svc-s);opacity:.85"/><text class="t mono mute" x="161.4" y="301">53%</text>
+<text class="t sm" x="55" y="325">B</text><rect x="71" y="314" width="17.8" height="14" rx="3" style="fill:var(--d-db-s);opacity:.85"/><text class="t mono mute" x="94.8" y="325">11%</text>
+<text class="t sm" x="55" y="349">C</text><rect x="71" y="338" width="57.8" height="14" rx="3" style="fill:var(--d-cache-s);opacity:.85"/><text class="t mono mute" x="134.8" y="349">36%</text>
+<path class="line faint" d="M340,40 V350" style="stroke-dasharray:4 4"/>
+<circle class="line faint" cx="505" cy="150" r="100"/>
+<path d="M479.1,53.4 A100,100 0 0 1 530.9,53.4" style="fill:none;stroke:var(--d-svc-s);stroke-width:6;opacity:.85"/>
+<path d="M530.9,53.4 A100,100 0 0 1 571.9,75.7" style="fill:none;stroke:var(--d-db-s);stroke-width:6;opacity:.85"/>
+<path d="M571.9,75.7 A100,100 0 0 1 603.5,132.6" style="fill:none;stroke:var(--d-cache-s);stroke-width:6;opacity:.85"/>
+<path d="M603.5,132.6 A100,100 0 0 1 593.3,196.9" style="fill:none;stroke:var(--d-svc-s);stroke-width:6;opacity:.85"/>
+<path d="M593.3,196.9 A100,100 0 0 1 569.3,226.6" style="fill:none;stroke:var(--d-db-s);stroke-width:6;opacity:.85"/>
+<path d="M569.3,226.6 A100,100 0 0 1 513.7,249.6" style="fill:none;stroke:var(--d-cache-s);stroke-width:6;opacity:.85"/>
+<path d="M513.7,249.6 A100,100 0 0 1 462.7,240.6" style="fill:none;stroke:var(--d-db-s);stroke-width:6;opacity:.85"/>
+<path d="M462.7,240.6 A100,100 0 0 1 420.2,203.0" style="fill:none;stroke:var(--d-svc-s);stroke-width:6;opacity:.85"/>
+<path d="M420.2,203.0 A100,100 0 0 1 406.0,163.9" style="fill:none;stroke:var(--d-cache-s);stroke-width:6;opacity:.85"/>
+<path d="M406.0,163.9 A100,100 0 0 1 418.4,100.0" style="fill:none;stroke:var(--d-db-s);stroke-width:6;opacity:.85"/>
+<path d="M418.4,100.0 A100,100 0 0 1 443.4,71.2" style="fill:none;stroke:var(--d-cache-s);stroke-width:6;opacity:.85"/>
+<path d="M443.4,71.2 A100,100 0 0 1 479.1,53.4" style="fill:none;stroke:var(--d-svc-s);stroke-width:6;opacity:.85"/>
+<circle class="n svc" cx="530.9" cy="53.4" r="11"/><text class="t sm b mid" x="530.9" y="57.4">A</text>
+<circle class="n db" cx="571.9" cy="75.7" r="11"/><text class="t sm b mid" x="571.9" y="79.7">B</text>
+<circle class="n cache" cx="603.5" cy="132.6" r="11"/><text class="t sm b mid" x="603.5" y="136.6">C</text>
+<circle class="n svc" cx="593.3" cy="196.9" r="11"/><text class="t sm b mid" x="593.3" y="200.9">A</text>
+<circle class="n db" cx="569.3" cy="226.6" r="11"/><text class="t sm b mid" x="569.3" y="230.6">B</text>
+<circle class="n cache" cx="513.7" cy="249.6" r="11"/><text class="t sm b mid" x="513.7" y="253.6">C</text>
+<circle class="n db" cx="462.7" cy="240.6" r="11"/><text class="t sm b mid" x="462.7" y="244.6">B</text>
+<circle class="n svc" cx="420.2" cy="203.0" r="11"/><text class="t sm b mid" x="420.2" y="207.0">A</text>
+<circle class="n cache" cx="406.0" cy="163.9" r="11"/><text class="t sm b mid" x="406.0" y="167.9">C</text>
+<circle class="n db" cx="418.4" cy="100.0" r="11"/><text class="t sm b mid" x="418.4" y="104.0">B</text>
+<circle class="n cache" cx="443.4" cy="71.2" r="11"/><text class="t sm b mid" x="443.4" y="75.2">C</text>
+<circle class="n svc" cx="479.1" cy="53.4" r="11"/><text class="t sm b mid" x="479.1" y="57.4">A</text>
+<text class="t b mid" x="505" y="146">4 tokens each</text><text class="t sm mute mid" x="505" y="164">arcs interleave</text>
+<text class="t sm" x="395" y="301">A</text><rect x="411" y="290" width="55.1" height="14" rx="3" style="fill:var(--d-svc-s);opacity:.85"/><text class="t mono mute" x="472.1" y="301">34%</text>
+<text class="t sm" x="395" y="325">B</text><rect x="411" y="314" width="52.0" height="14" rx="3" style="fill:var(--d-db-s);opacity:.85"/><text class="t mono mute" x="469.0" y="325">32%</text>
+<text class="t sm" x="395" y="349">C</text><rect x="411" y="338" width="52.9" height="14" rx="3" style="fill:var(--d-cache-s);opacity:.85"/><text class="t mono mute" x="469.9" y="349">33%</text>
+</svg>
+</div>
+<figcaption><b>Virtual nodes.</b> Same three servers, same ring. With one token each, A owns over half the key space. With four interleaved tokens each, every server is within two points of a third. If B fails on the right-hand ring, its four arcs go to A and C instead of all landing on one neighbour.</figcaption>
+</figure>
+
+<h3 id="how-many-vnodes">How many virtual nodes?</h3>
+<p>The imbalance shrinks roughly with the square root of the token count, so going from 10 to 100 tokens per node helps a lot and going from 100 to 1,000 helps much less. These are measured numbers from the implementation below, for 10 nodes and 100,000 keys:</p>
+<div class="table-wrap"><table>
+<thead><tr><th class="num">Tokens per node</th><th class="num">Load std dev / mean</th><th class="num">Busiest node / mean</th><th>Ring size (10 nodes)</th></tr></thead>
+<tbody>
+<tr><td class="num">1</td><td class="num">92%</td><td class="num">2.78×</td><td>10 entries</td></tr>
+<tr><td class="num">10</td><td class="num">27%</td><td class="num">1.63×</td><td>100 entries</td></tr>
+<tr><td class="num">100</td><td class="num">5%</td><td class="num">1.08×</td><td>1,000 entries</td></tr>
+<tr><td class="num">1,000</td><td class="num">3%</td><td class="num">1.05×</td><td>10,000 entries</td></tr>
+</tbody></table></div>
+<p>The cost of more tokens is a bigger ring to store and gossip, and more, smaller ranges to stream when a node joins. That is why Cassandra lowered its default <code>num_tokens</code> from 256 to 16 in version 4.0 and paired it with a smarter token allocator: random placement needs many tokens to balance, deliberate placement needs few.</p>
+<p>Virtual nodes also give you <strong>weighting for free</strong>. A server with twice the RAM gets twice the tokens and therefore about twice the keys.</p>
+
+<h2 id="implementation">Implementation</h2>
+<p>The ring is just a sorted array of token positions plus a map from position to physical node. A lookup is a binary search for the first token greater than the key's hash, wrapping to index 0 past the end. That is <code>O(log(N·V))</code> for <code>N</code> nodes with <code>V</code> tokens each, which is a few dozen comparisons even for large clusters.</p>
+<pre><code class="language-python">import bisect
+import hashlib
+
+
+def h(value: str) -&gt; int:
+    """Map a string to a point on a 2^32 ring. md5 is used for spread, not security."""
+    return int.from_bytes(hashlib.md5(value.encode()).digest()[:4], "big")
+
+
+class HashRing:
+    def __init__(self, nodes=(), vnodes=100):
+        self.vnodes = vnodes
+        self.tokens = []   # sorted ring positions
+        self.owner = {}    # position -&gt; physical node
+        for node in nodes:
+            self.add(node)
+
+    def add(self, node):
+        for i in range(self.vnodes):
+            pos = h(f"{node}#{i}")
+            bisect.insort(self.tokens, pos)
+            self.owner[pos] = node
+
+    def remove(self, node):
+        for i in range(self.vnodes):
+            pos = h(f"{node}#{i}")
+            self.tokens.remove(pos)
+            del self.owner[pos]
+
+    def lookup(self, key):
+        # first token clockwise from the key; wrap to index 0 past the top of the ring
+        i = bisect.bisect_right(self.tokens, h(key)) % len(self.tokens)
+        return self.owner[self.tokens[i]]
+
+
+ring = HashRing([f"cache-{i}" for i in range(10)])
+before = {k: ring.lookup(k) for k in (f"user:{n}" for n in range(100_000))}
+ring.add("cache-10")
+moved = sum(ring.lookup(k) != node for k, node in before.items())
+print(f"{moved / len(before):.1%} of keys moved")   # ~10% (ideal is 1/11), all of them to cache-10</code></pre>
+<p>Details that matter in real implementations:</p>
+<ul>
+<li><strong>Hash choice.</strong> The hash needs good spread, not cryptographic strength. MD5 is the classic choice (the <em>ketama</em> Memcached client uses it); Cassandra uses Murmur3; xxHash is common in newer code. Every client must use the same function and the same token naming scheme, or they will disagree about ownership.</li>
+<li><strong>Collisions.</strong> Two tokens hashing to the same position is rare at 2<sup>32</sup> and vanishingly rare at 2<sup>64</sup>. Production code breaks ties deterministically, for example by node id.</li>
+<li><strong>Membership is the hard part.</strong> The lookup is trivial. Making every client agree on the node list is not. Systems either gossip it (Cassandra, Dynamo), store it in a coordination service such as ZooKeeper or etcd, or let a proxy own it so clients never see it.</li>
+</ul>
+
+<h2 id="replication">Replication on the ring</h2>
+<p>Storage systems need each key on several nodes. The ring gives a natural rule: store the key on the first <code>R</code> <em>distinct physical nodes</em> clockwise from its position. Dynamo calls this list the <dfn>preference list</dfn>. With virtual nodes, the walk must skip tokens that belong to a node already chosen, otherwise two replicas could land on the same machine.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 20 720 180" role="img" aria-label="Unrolled ring: from key k, walk clockwise and choose N2, skip a second N2 token, then N4 and N1">
+<path class="line" d="M30,110 H690"/>
+<path class="e dash" d="M690,110 C712,110 712,170 690,170 H30 C8,170 8,110 26,110" style="stroke-width:1.2"/>
+<text class="t xs mute mid" x="360" y="190">the line is the ring cut open: the right end wraps back to the left</text>
+<circle class="n queue" cx="70" cy="110" r="15"/><text class="t sm b mid" x="70" y="114">N3</text>
+<rect x="143" y="103" width="14" height="14" rx="2" transform="rotate(45 150 110)" class="fill-accent"/>
+<text class="t b mid accent" x="150" y="145">key k</text>
+<circle class="n db" cx="230" cy="110" r="15"/><text class="t sm b mid" x="230" y="114">N2</text>
+<circle class="n ghost" cx="310" cy="110" r="15"/><text class="t sm mute mid" x="310" y="114">N2</text>
+<circle class="n cache" cx="400" cy="110" r="15"/><text class="t sm b mid" x="400" y="114">N4</text>
+<circle class="n svc" cx="490" cy="110" r="15"/><text class="t sm b mid" x="490" y="114">N1</text>
+<circle class="n queue" cx="580" cy="110" r="15"/><text class="t sm b mid" x="580" y="114">N3</text>
+<circle class="n cache" cx="650" cy="110" r="15"/><text class="t sm b mid" x="650" y="114">N4</text>
+<path class="e accent" d="M156,96 Q193,52 222,92"/>
+<path class="e accent" d="M156,94 Q278,10 392,92"/>
+<path class="e accent" d="M156,92 Q323,-12 482,92"/>
+<text class="t sm b mid" x="230" y="145">replica 1</text>
+<text class="t xs mute mid" x="310" y="145">skipped:</text><text class="t xs mute mid" x="310" y="158">same machine</text>
+<text class="t sm b mid" x="400" y="145">replica 2</text>
+<text class="t sm b mid" x="490" y="145">replica 3</text>
+</svg>
+</div>
+<figcaption><b>Preference list with R = 3.</b> Walking clockwise from k, the second token belongs to N2 again, so it is skipped. Production systems also skip nodes in the same rack or availability zone, so one power failure cannot take out every copy.</figcaption>
+</figure>
+
+<p>This rule composes well with node changes. If N2 fails, the next distinct node clockwise (N3 here) temporarily takes its place. Dynamo-style stores mark these writes with a <em>hint</em> and hand them back when N2 returns, which is called <strong>hinted handoff</strong>. The <a href="replication.html">Replication</a> chapter covers quorums over these replicas.</p>
+
+<h2 id="worked-example">Worked example: losing a cache node</h2>
+<p>A product catalogue is served from 10 Memcached nodes holding 100 million keys. The service handles 200,000 reads per second with a 95% hit rate, so the database normally sees 10,000 reads per second and is provisioned for about 30,000. One cache node's host fails.</p>
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Modulo hashing (10 → 9)</th><th>Consistent hashing, 100 tokens/node</th></tr></thead>
+<tbody>
+<tr><th>Keys whose owner changes</th><td>~90% (90M keys)</td><td>~10% (the failed node's 10M keys)</td></tr>
+<tr><th>Hit rate right after</th><td>~10%</td><td>~85%</td></tr>
+<tr><th>Database reads/sec</th><td class="no">~180,000: six times capacity</td><td class="yes">~30,000: at the limit, then falling as keys refill</td></tr>
+<tr><th>Who absorbs the refill</th><td>Every node, for nearly every key</td><td>The 9 survivors, roughly 1/9 each</td></tr>
+<tr><th>Outcome</th><td>Database overload, cascading timeouts, outage</td><td>A latency bump for a few minutes</td></tr>
+</tbody></table></div>
+<p>The consistent-hashing column is still tight. Real deployments add protection on top: request coalescing so one miss fetches a hot key once, and warm standby nodes. The <a href="caching.html">Caching</a> chapter covers stampede protection in detail. The key point is that consistent hashing turns a full outage into an incident the rest of the system can absorb.</p>
+
+<h2 id="alternatives">Alternatives and when they win</h2>
+<p>The ring is the best-known scheme, but not the only one with the minimal-movement property, and in several settings it is not the best one.</p>
+<div class="defs">
+<div><h4>Rendezvous (HRW) hashing</h4><p>For each key, score every node with <code>hash(key, node)</code> and pick the highest. No ring, no tokens, perfectly even, and removal only moves that node's keys. Lookup is <code>O(N)</code>, so it suits tens of nodes, not thousands.</p></div>
+<div><h4>Jump consistent hash</h4><p>A five-line function from Google that maps a key to a bucket number in <code>O(log N)</code> with no memory and near-perfect balance. Buckets must be numbered 0 to N-1, so you can only add or remove at the end. A good fit for numbered shards, not for arbitrary node failure.</p></div>
+<div><h4>Maglev hashing</h4><p>Builds a fixed-size lookup table (e.g. 65,537 slots) filled from per-node permutations. Lookup is one array index. Used in Google's Maglev load balancer and in Envoy. Slightly more keys move on change than with a ring, in exchange for speed and balance.</p></div>
+<div><h4>Fixed hash slots</h4><p>Hash keys into a fixed number of slots and keep an explicit slot-to-node table. Redis Cluster uses 16,384 slots. Rebalancing moves whole slots, and the table is small enough to ship to every client. Simple, explicit and easy to reason about.</p></div>
+</div>
+<div class="table-wrap"><table>
+<thead><tr><th>Scheme</th><th>Lookup cost</th><th>Memory</th><th>Balance</th><th>Remove any node</th><th>Typical home</th></tr></thead>
+<tbody>
+<tr><th>Modulo</th><td><code>O(1)</code></td><td>None</td><td class="yes">Even</td><td class="no">Moves almost all keys</td><td>Fixed-size, never-resized pools</td></tr>
+<tr><th>Ring + vnodes</th><td><code>O(log NV)</code></td><td><code>N·V</code> tokens</td><td class="meh">Good with enough tokens</td><td class="yes">Yes</td><td>Cassandra, Dynamo, Riak, cache clients</td></tr>
+<tr><th>Rendezvous</th><td><code>O(N)</code></td><td>Node list</td><td class="yes">Even</td><td class="yes">Yes</td><td>Small clusters, CDN edge selection</td></tr>
+<tr><th>Jump hash</th><td><code>O(log N)</code></td><td>None</td><td class="yes">Even</td><td class="no">Only the last bucket</td><td>Numbered shards</td></tr>
+<tr><th>Maglev</th><td><code>O(1)</code></td><td>Lookup table</td><td class="yes">Even</td><td class="yes">Yes, slightly more churn</td><td>L4 load balancers</td></tr>
+<tr><th>Fixed slots</th><td><code>O(1)</code></td><td>Slot table</td><td class="yes">Even if slots are spread</td><td class="yes">Move its slots</td><td>Redis Cluster, Couchbase vBuckets</td></tr>
+</tbody></table></div>
+
+<h3 id="bounded-load">Hot keys and bounded loads</h3>
+<p>Consistent hashing balances the <em>key space</em>, not the <em>traffic</em>. If one celebrity's profile gets 50,000 reads per second, the node that owns it is overloaded no matter how evenly the ring is cut. Two tools help:</p>
+<ul>
+<li><strong>Consistent hashing with bounded loads</strong> caps every node at <code>(1 + ε)</code> times the average load. If a key's owner is full, the request spills to the next node clockwise. Vimeo added this to HAProxy and cut cache bandwidth substantially; Envoy and Google's load balancers use variants.</li>
+<li><strong>Hot-key replication</strong> detects very popular keys and serves them from several nodes or from a local in-process cache, which is a caching decision rather than a hashing one.</li>
+</ul>
+
+<h2 id="tradeoffs">Trade-offs at a glance</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>You gain</th><th>You pay</th></tr></thead>
+<tbody>
+<tr><td>Only about <code>1/N</code> of keys move when membership changes</td><td>Membership must be agreed on by every client, via gossip, a coordinator or a proxy</td></tr>
+<tr><td>Lookups need no central lookup service</td><td>A ring of <code>N·V</code> tokens to store, sort and distribute</td></tr>
+<tr><td>Weighted capacity through token counts</td><td>Balance is statistical: few tokens means real skew</td></tr>
+<tr><td>Natural replica placement by walking the ring</td><td>Range queries across keys are impossible, because neighbouring keys are scattered on purpose</td></tr>
+<tr><td>Failures spread evenly across survivors (with vnodes)</td><td>Does nothing for hot keys on its own</td></tr>
+</tbody></table></div>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+<li><strong>Akamai</strong>: the 1997 paper by Karger et al. introduced consistent hashing to spread web caching across a changing set of servers, and became the basis of Akamai's CDN.</li>
+<li><strong>Amazon Dynamo</strong> (2007): ring with virtual nodes, preference lists and hinted handoff. Cassandra, Riak and Voldemort copied the design. DynamoDB, the managed service, later moved to a partition map managed by a control plane.</li>
+<li><strong>Apache Cassandra</strong>: each node owns <code>num_tokens</code> ranges on a Murmur3 ring; the default dropped from 256 to 16 in 4.0 thanks to a balance-aware token allocator.</li>
+<li><strong>Memcached clients</strong>: the ketama algorithm (ring with MD5-derived tokens) is the standard way clients choose a server, so the cluster itself needs no coordination at all.</li>
+<li><strong>Load balancers</strong>: Envoy offers <code>RING_HASH</code> and <code>MAGLEV</code> policies for sticky routing; HAProxy supports consistent hashing with bounded loads.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>Whenever you shard a cache or a datastore and the cluster can grow or lose nodes. Say it in one sentence ("I'll partition by key with consistent hashing and virtual nodes so adding a node only moves about 1/N of the data") and move on unless the interviewer wants depth. In the <a href="key-value-store.html">key-value store</a> case it is the core of the design.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>Why not <code>hash % N</code>? Give the N/(N+1) movement number and the cache-stampede consequence.</li>
+<li>What are virtual nodes for? Balance, even redistribution on failure, and weighting by capacity.</li>
+<li>How do clients learn the ring? Gossip, a coordination service, or a routing proxy.</li>
+<li>How do you replicate? Next R distinct nodes clockwise, skipping same-rack nodes.</li>
+<li>What about a hot key? Consistent hashing does not help; use bounded loads, replication of hot keys, or local caching.</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>Claiming consistent hashing guarantees even load. It balances key space statistically, and does nothing for skewed traffic.</li>
+<li>Forgetting that replicas must be on distinct physical machines when vnodes are in play.</li>
+<li>Using it where range scans are needed. Range-partitioning is the right tool there; see <a href="sharding.html">Sharding</a>.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://www.cs.princeton.edu/courses/archive/fall09/cos518/papers/chash.pdf" target="_blank" rel="noopener">Consistent Hashing and Random Trees</a><span>Karger et al., STOC 1997. The original paper, motivated by web caching.</span></li>
+<li><a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf" target="_blank" rel="noopener">Dynamo: Amazon's Highly Available Key-value Store</a><span>DeCandia et al., SOSP 2007. Ring, virtual nodes, preference lists and hinted handoff in production.</span></li>
+<li><a href="https://arxiv.org/abs/1406.2294" target="_blank" rel="noopener">A Fast, Minimal Memory, Consistent Hash Algorithm</a><span>Lamping and Veach, 2014. Jump consistent hash.</span></li>
+<li><a href="https://www.usenix.org/conference/nsdi16/technical-sessions/presentation/eisenbud" target="_blank" rel="noopener">Maglev: A Fast and Reliable Software Network Load Balancer</a><span>Eisenbud et al., NSDI 2016. Includes Maglev hashing.</span></li>
+<li><a href="https://arxiv.org/abs/1608.01350" target="_blank" rel="noopener">Consistent Hashing with Bounded Loads</a><span>Mirrokni, Thorup and Zadimoghaddam, 2016. The algorithm behind HAProxy's bounded-load balancing.</span></li>
+</ul>

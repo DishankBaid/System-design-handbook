@@ -1,0 +1,318 @@
+<p class="lead">A URL shortener turns <code>https://shop.example.com/products/9481?utm_source=newsletter&amp;utm_campaign=fall</code> into <code>sho.rt/aB3x9Kq</code> and sends anyone who opens the short link to the original. The product is simple. The interesting parts are generating billions of unique short codes without a bottleneck, answering redirects in a few milliseconds at hundreds of thousands of requests per second, and counting clicks without slowing that path down.</p>
+
+<div class="callout note">
+<div class="callout-title">How to use this case study</div>
+<p>Sections follow the order of a real interview: requirements, estimation, API, data model, high-level design, then deep dives. Try each step yourself before reading it. Concepts used here have their own chapters: <a href="caching.html">Caching</a>, <a href="id-generation.html">Distributed ID Generation</a>, <a href="probabilistic.html">Bloom filters</a>, <a href="event-streaming.html">Event Streaming</a>.</p>
+</div>
+
+<h2 id="requirements">1. Requirements</h2>
+<p>Spend the first few minutes agreeing on scope. Each answer below changes the design, so ask rather than assume.</p>
+<div class="defs">
+<div><h4>Functional</h4><p>Create a short link for a long URL. Redirect a short link to its URL. Optional custom alias (<code>sho.rt/fall-sale</code>). Optional expiry. Click counts per link, by day, country and referrer.</p></div>
+<div><h4>Non-functional</h4><p>Redirects are fast (p99 under 20 ms server side) and highly available, because a broken link is visible to every reader of a tweet. Codes are short and not trivially enumerable. Creation can be slower and briefly unavailable.</p></div>
+<div><h4>Out of scope</h4><p>Editing a link's target, user accounts beyond an API key, link previews, QR codes. Mention them, then park them.</p></div>
+</div>
+<p>The single most important observation: <strong>this is a read-heavy system with a tiny, immutable record</strong>. A link is written once and read many times, and the mapping never changes. Almost every later decision follows from that.</p>
+
+<h2 id="estimation">2. Estimation</h2>
+<p>Assume 100 million new links per day and a 100:1 read-to-write ratio, kept for five years.</p>
+<div class="stats">
+<div><b>~1.2k/s</b><span>creates, ~3.5k/s at peak</span></div>
+<div><b>~116k/s</b><span>redirects, ~350k/s at peak</span></div>
+<div><b>~91 TB</b><span>stored over 5 years, before replication</span></div>
+<div><b>7 chars</b><span>base62 code length</span></div>
+</div>
+<div class="calc">Writes      100M / 86,400 s                     ≈ <span class="r">1,160/s</span>   (×3 for peak ≈ 3,500/s)
+Reads       100 × 1,160                          ≈ <span class="r">116,000/s</span> (×3 for peak ≈ 350,000/s)
+Record      code 7 B + URL ~200 B + metadata + index overhead ≈ 500 B
+Storage     100M × 500 B = 50 GB/day  →  × 365 × 5  ≈ <span class="r">91 TB</span>  (≈ 275 TB with 3 replicas)
+Links       100M × 365 × 5                       ≈ 183 billion
+Code space  62^6 ≈ 57 billion   (too small)
+            62^7 ≈ 3.5 trillion (fits 183B with 95% to spare)  →  <span class="r">7 characters</span>
+Cache       hottest 100M links × 500 B           ≈ <span class="r">50 GB</span> of RAM, a few Redis nodes
+Egress      116k/s × ~500 B response             ≈ 58 MB/s, small</div>
+<p>Two conclusions come out of these numbers. Storage is large but simple, a sharded key-value store handles it comfortably. And the read rate is high enough that the redirect path must be served from memory, not from disk.</p>
+
+<h2 id="api">3. API</h2>
+<pre><code class="language-http">POST /api/v1/links
+Authorization: Bearer &lt;api-key&gt;
+{ "url": "https://shop.example.com/products/9481?...",
+  "alias": "fall-sale",            // optional
+  "expires_at": "2027-01-01T00:00:00Z" }   // optional
+→ 201 Created
+{ "code": "aB3x9Kq", "short_url": "https://sho.rt/aB3x9Kq" }
+→ 409 Conflict  if the alias is taken
+
+GET /{code}
+→ 302 Found   Location: https://shop.example.com/products/9481?...
+→ 404 Not Found / 410 Gone (expired)
+
+GET /api/v1/links/{code}/stats?from=2026-10-01&amp;to=2026-10-08
+→ 200 { "clicks": 18422, "by_day": [...], "by_country": {...} }</code></pre>
+
+<h3 id="301-vs-302">301 or 302?</h3>
+<p>This choice decides whether analytics are possible, so state it explicitly.</p>
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>301 Moved Permanently</th><th>302 Found (or 307)</th></tr></thead>
+<tbody>
+<tr><th>Browser behaviour</th><td>Caches the redirect, often indefinitely</td><td>Asks the server on every click</td></tr>
+<tr><th>Load on us</th><td class="yes">Lower: repeat clicks never arrive</td><td class="meh">Every click arrives</td></tr>
+<tr><th>Analytics</th><td class="no">Repeat clicks are invisible</td><td class="yes">Every click is counted</td></tr>
+<tr><th>Expiry and takedowns</th><td class="no">Cached copies keep redirecting</td><td class="yes">Take effect immediately</td></tr>
+</tbody></table></div>
+<p>Because click analytics and abuse takedowns are requirements, use <strong>302</strong>. A 301 is right for a pure vanity shortener with no analytics.</p>
+
+<h2 id="data-model">4. Data model</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>links</th><th>Type</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><code>code</code></td><td>string(7..32)</td><td>Partition key. Custom aliases live in the same table.</td></tr>
+<tr><td><code>long_url</code></td><td>string(≤ 2048)</td><td>Validated and normalised on write.</td></tr>
+<tr><td><code>owner_id</code></td><td>string</td><td>For the stats API and rate limiting.</td></tr>
+<tr><td><code>created_at</code>, <code>expires_at</code></td><td>timestamp</td><td><code>expires_at</code> doubles as a store-level TTL.</td></tr>
+</tbody></table></div>
+<p>Every read is "get one row by its exact key", there are no joins, and the record never changes. That is the textbook case for a <strong>key-value or wide-column store</strong> such as DynamoDB or Cassandra, partitioned by <code>code</code>. A sharded relational database also works; nothing here needs it, and you would be paying for transactions and joins you never use. See <a href="sql-vs-nosql.html">SQL vs NoSQL</a> for the general argument.</p>
+<p>Click data is a different shape entirely (append-only, huge, queried by time range), so it does not go in this table. It flows to an analytics store, covered below.</p>
+
+<h2 id="high-level">5. High-level design</h2>
+<p>Split the system along the read/write asymmetry. Creating a link and following a link have different load, latency and availability needs, so they are separate services that scale independently and share only the store.</p>
+
+<figure class="fig wide">
+<div class="fig-frame">
+<svg viewBox="0 0 760 400" role="img" aria-label="Architecture: client to load balancer; write API uses an ID range allocator and the URL store; redirect service reads a Redis cache, falls back to the store, and publishes click events to Kafka for an aggregator">
+<rect class="n client" x="20" y="175" width="96" height="50" rx="8"/><text class="t b mid" x="68" y="198">Client</text><text class="t xs mute mid" x="68" y="214">browser / app</text>
+<rect class="n ext" x="150" y="175" width="96" height="50" rx="8"/><text class="t b mid" x="198" y="198">Load</text><text class="t b mid" x="198" y="214">balancer</text>
+<rect class="n svc" x="290" y="80" width="124" height="50" rx="8"/><text class="t b mid" x="352" y="102">Write API</text><text class="t xs mute mid" x="352" y="118">~3.5k req/s peak</text>
+<rect class="n svc" x="290" y="270" width="124" height="50" rx="8"/><text class="t b mid" x="352" y="292">Redirect service</text><text class="t xs mute mid" x="352" y="308">~350k req/s peak</text>
+<rect class="n ext" x="468" y="20" width="136" height="50" rx="8"/><text class="t b mid" x="536" y="42">ID range allocator</text><text class="t xs mute mid" x="536" y="58">etcd / ZooKeeper</text>
+<rect class="n cache" x="468" y="175" width="136" height="50" rx="8"/><text class="t b mid" x="536" y="197">Redis cache</text><text class="t xs mute mid" x="536" y="213">~50 GB hot links</text>
+<rect class="n db" x="636" y="105" width="112" height="64" rx="8"/><text class="t b mid" x="692" y="131">URL store</text><text class="t xs mute mid" x="692" y="147">KV, sharded</text><text class="t xs mute mid" x="692" y="160">by code</text>
+<rect class="n queue" x="468" y="330" width="136" height="50" rx="8"/><text class="t b mid" x="536" y="352">Click events</text><text class="t xs mute mid" x="536" y="368">Kafka</text>
+<rect class="n svc" x="636" y="330" width="112" height="50" rx="8"/><text class="t b mid" x="692" y="352">Aggregator</text><text class="t xs mute mid" x="692" y="368">→ OLAP store</text>
+
+<path class="e" d="M116,200 H146"/>
+<path class="e" d="M246,190 C268,190 268,105 286,105"/>
+<path class="e" d="M246,210 C268,210 268,295 286,295"/>
+<path class="e" d="M414,95 C440,95 440,45 464,45"/>
+<path class="e" d="M414,112 C520,112 570,137 632,137"/>
+<path class="e" d="M414,285 C440,285 440,200 464,200"/>
+<path class="e dash" d="M414,302 C560,302 640,250 680,173"/>
+<path class="e" d="M414,308 C440,308 440,355 464,355"/>
+<path class="e" d="M604,355 H632"/>
+
+<path class="flow" d="M116,200 H146"/>
+<path class="flow" d="M246,210 C268,210 268,295 286,295"/>
+<path class="flow" d="M414,285 C440,285 440,200 464,200"/>
+
+<text class="t xs mute end" x="260" y="140">create</text>
+<text class="t xs mute end" x="262" y="264">GET /aB3x9Kq</text>
+<text class="t xs mute" x="446" y="96">lease 1M ids</text>
+<text class="t xs mute" x="606" y="268">on miss</text>
+<text class="t xs mute end" x="432" y="348">async</text>
+</svg>
+</div>
+<figcaption><b>Architecture.</b> The animated path is the hot path: a redirect that hits the cache touches only the load balancer, one stateless service and Redis. Everything else (creating links, cache misses, analytics) is off that path or asynchronous.</figcaption>
+</figure>
+
+<ol class="steps">
+<li><strong>Create.</strong> The write API validates the URL (scheme, length, a malware/phishing blocklist check), takes the next ID from its locally leased block, turns it into a 7-character code, and writes the row. Custom aliases use a conditional write ("insert only if absent") so two users cannot claim the same alias.</li>
+<li><strong>Redirect.</strong> The redirect service looks the code up in Redis. On a hit it returns 302 immediately. On a miss it reads the store, fills the cache, then returns.</li>
+<li><strong>Count.</strong> After responding, the redirect service publishes a click event (code, timestamp, country from IP, referrer, user agent) to Kafka. Aggregators consume and roll up counts. The redirect never waits on analytics.</li>
+</ol>
+
+<h2 id="key-generation">6. Deep dive: generating short codes</h2>
+<p>This is the part interviewers push on. We need 183 billion unique 7-character codes, created by many servers in parallel, without a single bottleneck and ideally without codes that are easy to enumerate.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Approach</th><th>How</th><th>Strength</th><th>Weakness</th></tr></thead>
+<tbody>
+<tr><th>Hash the URL</th><td>First 7 base62 chars of <code>md5(long_url)</code></td><td>Same URL gives same code, so deduplication is free</td><td>Collisions: with billions of codes in 3.5T slots, they happen. Each write needs a check and a retry with a salt</td></tr>
+<tr><th>Random code</th><td>7 random base62 chars</td><td>Unguessable, no coordination</td><td>Same collision check on every write; gets worse as the space fills</td></tr>
+<tr><th>Single counter</th><td>DB auto-increment, base62-encoded</td><td>No collisions, simplest</td><td>One hot row for every write; codes are sequential and enumerable</td></tr>
+<tr><th>Counter ranges</th><td>Each server leases a block of 1M ids, uses them locally</td><td>No collisions, one coordinator call per million links</td><td>Unused ids lost when a server dies (harmless); codes enumerable unless scrambled</td></tr>
+<tr><th>Pre-generated keys</th><td>A key service fills a table of unused random codes ahead of time</td><td>No collisions at write time, random codes</td><td>Another service and table to run; must hand out each key exactly once</td></tr>
+</tbody></table></div>
+<p><strong>Recommendation: counter ranges plus a reversible scramble.</strong> A coordinator (an etcd key, or a single SQL row updated with <code>UPDATE ... SET next = next + 1 RETURNING next</code>) hands each write server a block of one million ids. At 3,500 writes per second across the fleet, the coordinator sees about one request every five minutes. Each id is then passed through a bijective scramble so consecutive ids do not produce consecutive codes, and encoded in base62.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 250" role="img" aria-label="Range allocation: the coordinator holds the next free block; three write servers each hold a leased block of one million ids; an id is scrambled and base62-encoded into a code">
+<rect class="n ext" x="40" y="20" width="230" height="58" rx="8"/><text class="t b mid" x="155" y="44">Coordinator</text><text class="t mono mute mid" x="155" y="64">next_block = 4</text>
+<rect class="n svc" x="20" y="150" width="84" height="58" rx="8"/><text class="t sm b mid" x="62" y="172">write-1</text><text class="t xs mono mute mid" x="62" y="190">block 1</text>
+<rect class="n svc" x="113" y="150" width="84" height="58" rx="8"/><text class="t sm b mid" x="155" y="172">write-2</text><text class="t xs mono mute mid" x="155" y="190">block 2</text>
+<rect class="n svc" x="206" y="150" width="84" height="58" rx="8"/><text class="t sm b mid" x="248" y="172">write-3</text><text class="t xs mono mute mid" x="248" y="190">block 3</text>
+<path class="e both" d="M90,82 L66,146"/>
+<path class="e both" d="M155,82 V146"/>
+<path class="e both" d="M220,82 L244,146"/>
+<text class="t xs mute mid" x="155" y="232">one call per 1,000,000 ids</text>
+<path class="line faint" d="M330,20 V230" style="stroke-dasharray:4 4"/>
+<text class="t sm b" x="360" y="44">Inside write-3, one link</text>
+<rect class="n" x="360" y="64" width="150" height="38" rx="6"/><text class="t mono mid" x="435" y="88">id 3,000,000</text>
+<path class="e" d="M435,102 V124"/>
+<text class="t xs mute" x="444" y="117">(id × A + B) mod 62⁷</text>
+<rect class="n" x="360" y="128" width="150" height="38" rx="6"/><text class="t mono mid" x="435" y="152">3,518,874,884,807</text>
+<path class="e" d="M435,166 V188"/>
+<text class="t xs mute" x="444" y="181">base62, 7 chars</text>
+<rect class="n good" x="360" y="192" width="150" height="38" rx="6"/><text class="t mono b mid" x="435" y="216">ZX0Apj9</text>
+<text class="t xs mute" x="530" y="83">unique: ids never repeat</text>
+<text class="t xs mute" x="530" y="147">bijective: still unique,</text>
+<text class="t xs mute" x="530" y="161">no longer sequential</text>
+<text class="t xs mute" x="530" y="211">sho.rt/ZX0Apj9</text>
+</svg>
+</div>
+<figcaption><b>Counter ranges.</b> Uniqueness comes from the counter, not from collision checks. The scramble is a permutation of the 62⁷ code space, so it cannot introduce collisions either.</figcaption>
+</figure>
+
+<pre><code class="language-python">import string
+import threading
+
+ALPHABET = string.digits + string.ascii_lowercase + string.ascii_uppercase  # 62 symbols
+CODE_LEN = 7
+SPACE = 62 ** CODE_LEN            # 3.5 trillion codes
+A, B = 1_580_030_173, 1_234_567  # A is odd and not a multiple of 31, so it is invertible mod SPACE
+
+
+def base62(n: int) -&gt; str:
+    out = []
+    for _ in range(CODE_LEN):     # fixed width: pad with leading '0'
+        n, r = divmod(n, 62)
+        out.append(ALPHABET[r])
+    return "".join(reversed(out))
+
+
+def scramble(n: int) -&gt; int:
+    """Bijective shuffle of [0, SPACE): consecutive ids no longer look consecutive.
+    Obfuscation only; anyone who knows A and B can reverse it."""
+    return (n * A + B) % SPACE
+
+
+class IdAllocator:
+    """Hands out ids from a block leased from a coordinator (one network call per block)."""
+
+    def __init__(self, lease_block, block_size=1_000_000):
+        self.lease_block = lease_block   # e.g. atomic INCR on a counter in etcd or a SQL row
+        self.block_size = block_size
+        self.next = self.end = 0
+        self.lock = threading.Lock()
+
+    def next_id(self) -&gt; int:
+        with self.lock:
+            if self.next == self.end:            # block used up: lease a new one
+                start = self.lease_block() * self.block_size
+                self.next, self.end = start, start + self.block_size
+            self.next += 1
+            return self.next - 1
+
+
+def new_code(alloc: IdAllocator) -&gt; str:
+    return base62(scramble(alloc.next_id()))   # block 3 → "ZX0Apj9", "ZYJw3kM", "00srHmp", ...</code></pre>
+<div class="callout warn">
+<div class="callout-title">Know the limits of the scramble</div>
+<p>An affine scramble hides the counter from casual eyes, but neighbouring ids still produce related codes (note the shared prefix of the first two above), and anyone who recovers <code>A</code> and <code>B</code> can enumerate every link. If links may point to private documents, use a keyed block cipher over the id (for example a small Feistel network with a secret key), or switch to random codes from a pre-generated key pool.</p>
+</div>
+
+<h2 id="redirect-path">7. Deep dive: the redirect path</h2>
+<p>At 350,000 requests per second, every millisecond and every disk read matters. The path has three cases worth walking through.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 360" role="img" aria-label="Sequence diagram for a redirect: cache hit, cache miss, and an unknown code rejected by a Bloom filter">
+<rect class="n client" x="25" y="16" width="90" height="36" rx="7"/><text class="t sm b mid" x="70" y="39">Browser</text>
+<rect class="n svc" x="195" y="16" width="110" height="36" rx="7"/><text class="t sm b mid" x="250" y="39">Redirect svc</text>
+<rect class="n cache" x="365" y="16" width="90" height="36" rx="7"/><text class="t sm b mid" x="410" y="39">Redis</text>
+<rect class="n db" x="505" y="16" width="90" height="36" rx="7"/><text class="t sm b mid" x="550" y="39">URL store</text>
+<rect class="n queue" x="625" y="16" width="90" height="36" rx="7"/><text class="t sm b mid" x="670" y="39">Kafka</text>
+<path class="line faint" d="M70,52 V320 M250,52 V320 M410,52 V320 M550,52 V320 M670,52 V320" style="stroke-dasharray:3 4"/>
+
+<path class="e" d="M70,90 H246"/><text class="t mono mid" x="160" y="83">GET /aB3x9Kq</text>
+
+<g data-show="1 2"><path class="e" d="M250,125 H406"/><text class="t mono mid" x="330" y="118">GET aB3x9Kq</text></g>
+<g data-show="1"><path class="e dash" d="M410,155 H254"/><text class="t sm mid" x="330" y="148">long URL · ~0.5 ms</text>
+<path class="e dash accent" d="M250,190 H666"/><text class="t sm accent mid" x="460" y="183">click event, fire-and-forget</text>
+<path class="e green" d="M250,225 H74"/><text class="t mono mid" x="160" y="218">302 Location: …</text>
+<text class="t sm mid" x="360" y="345">Hit: one memory lookup. About 1 to 2 ms of server time.</text></g>
+
+<g data-show="2"><path class="e dash" d="M410,155 H254"/><text class="t mono mid" x="330" y="148">nil (miss)</text>
+<path class="e" d="M250,185 H546"/><text class="t mono mid" x="400" y="178">get(aB3x9Kq) · ~5 ms</text>
+<path class="e dash" d="M550,215 H254"/><text class="t sm mid" x="400" y="208">row</text>
+<path class="e" d="M250,245 H406"/><text class="t mono mid" x="330" y="238">SET … EX 86400</text>
+<path class="e dash accent" d="M250,275 H666"/><text class="t sm accent mid" x="460" y="268">click event</text>
+<path class="e green" d="M250,305 H74"/><text class="t mono mid" x="160" y="298">302 Location: …</text>
+<text class="t sm mid" x="360" y="345">Miss: one store read, then the cache is warm for the next click.</text></g>
+
+<g data-show="3"><path class="e" d="M254,118 H300 V140 H254"/><text class="t sm" x="310" y="128">Bloom filter: "definitely never issued"</text>
+<path class="e red" d="M250,175 H74"/><text class="t mono red mid" x="160" y="168">404 Not Found</text>
+<text class="t sm mid" x="360" y="345">Unknown code: rejected in memory. Bots scanning random codes never reach Redis or the store.</text></g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Cache hit</button><button type="button" data-step="2" aria-pressed="false">Cache miss</button><button type="button" data-step="3" aria-pressed="false">Unknown code</button></div>
+</div>
+<figcaption><b>Three redirect paths.</b> With a power-law click distribution, more than 90% of redirects take the hit path. The Bloom filter path protects the store from enumeration traffic.</figcaption>
+</figure>
+
+<ul>
+<li><strong>Cache-aside with a long TTL.</strong> Links are immutable, so stale data is not a concern and there is no invalidation problem, except for deletes and takedowns, which explicitly delete the cache key. Popularity is heavily skewed (a link in a viral post gets millions of clicks, most links get a handful), so a cache holding a small fraction of links serves the vast majority of requests.</li>
+<li><strong>Negative lookups.</strong> Bots probe random codes. Without protection each probe is a cache miss and a store read. A <a href="probabilistic.html">Bloom filter</a> of all issued codes answers "definitely not issued" from memory. 183 billion codes at a 1% false-positive rate needs about 220 GB, so in practice you keep one filter per shard or only cover recent years, or cache short-lived "not found" entries instead.</li>
+<li><strong>Edge caching.</strong> A CDN can cache 302 responses for a short time (say 60 seconds) with <code>Cache-Control</code>. That absorbs viral spikes at the edge, at the cost of counting those clicks at the CDN (from its logs) instead of in our service.</li>
+<li><strong>Hot keys.</strong> A single viral link can push one Redis shard past its limit. Keep a small in-process LRU in each redirect instance for the top few thousand codes; it removes the network hop entirely for the hottest links.</li>
+</ul>
+
+<h2 id="analytics">8. Deep dive: analytics without slowing redirects</h2>
+<p>Writing to a database on every click would put a write on the hot path and turn a 2 ms read into a 10 ms read-plus-write. Instead the redirect service <em>emits</em> an event and moves on.</p>
+<ul>
+<li><strong>Buffered publish.</strong> The Kafka producer batches events in memory and sends them every few milliseconds. If Kafka is slow, the buffer absorbs it; if the buffer fills, drop events rather than delay redirects. Losing a tiny fraction of click counts is acceptable, a slow redirect is not. That is a product decision worth saying out loud.</li>
+<li><strong>Partition by code.</strong> All events for one link land on one partition, so a single consumer can count it without coordination.</li>
+<li><strong>Roll up.</strong> A stream processor aggregates per code per minute and writes the rollups to a columnar store (ClickHouse, Druid, BigQuery). The stats API reads rollups, never raw events.</li>
+<li><strong>Unique visitors.</strong> Counting distinct visitors exactly needs memory proportional to visitors. A HyperLogLog per link per day gives about 1% error in 12 KB. See <a href="probabilistic.html">Probabilistic Data Structures</a>.</li>
+</ul>
+
+<h2 id="expiry">9. Expiry and cleanup</h2>
+<p>Use two mechanisms together. On read, the redirect service checks <code>expires_at</code> and returns 410 Gone, so an expired link stops working at exactly the right moment. In the background, a store-level TTL (DynamoDB TTL, Cassandra <code>USING TTL</code>) or a periodic sweep deletes the rows to reclaim space. Do not recycle expired codes: someone may still have the old link saved, and silently sending them somewhere new is a security problem.</p>
+
+<h2 id="scaling">10. Bottlenecks and how the design handles them</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Pressure</th><th>What breaks first</th><th>Response</th></tr></thead>
+<tbody>
+<tr><th>Viral link</th><td>One Redis shard, one store partition</td><td>In-process LRU for the hottest codes, short CDN caching, Redis read replicas</td></tr>
+<tr><th>Read growth</th><td>Redirect service CPU, cache memory</td><td>Stateless redirect pods scale horizontally; add Redis shards (consistent hashing keeps most keys in place)</td></tr>
+<tr><th>Storage growth</th><td>Store capacity</td><td>Add partitions; codes hash evenly so no rebalancing hotspots</td></tr>
+<tr><th>Coordinator outage</th><td>New blocks cannot be leased</td><td>Servers already hold up to a million ids each; creation keeps working for minutes to hours. Redirects are unaffected</td></tr>
+<tr><th>Abuse</th><td>Spam and phishing links, enumeration</td><td>Per-key <a href="rate-limiting.html">rate limits</a> on creation, URL reputation checks, Bloom filter for probes, takedown that deletes from store and cache</td></tr>
+<tr><th>Region failure</th><td>All traffic in that region</td><td>Replicate the store across regions (links are immutable, so asynchronous replication is safe); route reads to the nearest healthy region</td></tr>
+</tbody></table></div>
+
+<h2 id="tradeoffs">11. Key trade-offs to state</h2>
+<ul>
+<li><strong>302 over 301</strong>: more traffic to us, in exchange for analytics and working takedowns.</li>
+<li><strong>Counter ranges over hashing</strong>: no collision checks and a coordinator touched once per million writes, in exchange for codes that need scrambling to look random.</li>
+<li><strong>No deduplication of identical long URLs</strong>: two users shortening the same URL get different codes, so each gets their own stats. Deduplication would need an extra index on <code>long_url</code> for a small storage saving.</li>
+<li><strong>Lossy click counting</strong>: dropping events under pressure protects redirect latency.</li>
+<li><strong>Key-value store over relational</strong>: simpler horizontal scaling for a workload with no joins or transactions.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>What the interviewer is checking</h4>
+<p>Whether you notice the 100:1 read/write ratio and design the read path first, whether you can do the code-length arithmetic (62⁷ vs the number of links), and whether you can defend a key generation scheme against collision and coordination questions.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>How do two servers avoid issuing the same code? (Leased ranges, or conditional writes for random codes.)</li>
+<li>What happens if the ID coordinator is down? (Leased blocks keep writes going; redirects never touch it.)</li>
+<li>How do you stop people enumerating links? (Scrambling, random codes, rate limits, longer codes for private links.)</li>
+<li>A link goes viral at 1M clicks/sec. What fails and what do you do?</li>
+<li>How would you support editing the target URL? (Now the record is mutable: cache invalidation and a 302-only policy become mandatory.)</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>Writing to the database on every redirect to count clicks.</li>
+<li>Hashing the URL and truncating, without any plan for collisions.</li>
+<li>A single auto-increment column as the code generator for a multi-region system.</li>
+<li>Choosing 301 and then promising accurate analytics.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://www.rfc-editor.org/rfc/rfc9110#name-redirection-3xx" target="_blank" rel="noopener">RFC 9110: HTTP Semantics, Redirection 3xx</a><span>Precise semantics of 301, 302, 307 and 308, including caching rules.</span></li>
+<li><a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.ConditionExpressions.html" target="_blank" rel="noopener">DynamoDB condition expressions</a><span>The "insert only if absent" write used for custom aliases.</span></li>
+<li><a href="https://kafka.apache.org/documentation/" target="_blank" rel="noopener">Apache Kafka documentation</a><span>Producer batching, partitioning by key and consumer groups used in the analytics pipeline.</span></li>
+<li><a href="http://algo.inria.fr/flajolet/Publications/FlFuGaMe07.pdf" target="_blank" rel="noopener">HyperLogLog: the analysis of a near-optimal cardinality estimation algorithm</a><span>Flajolet et al., 2007. Unique-visitor counting in kilobytes.</span></li>
+</ul>
