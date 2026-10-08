@@ -1,0 +1,405 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">A web app that serves 1,000 users from one server will not serve 10 million users from one server. Somewhere along the way the database runs out of connections, the disk fills, a deploy takes the whole site down, or a single slow query locks a table every user needs. Scalability is about knowing which of those walls you will hit next and how to get past it without a rewrite.</p>
+<p><dfn>Scalability</dfn> is a system's ability to handle more load by adding resources, while keeping performance per request acceptable. "Load" must be named concretely: requests per second, concurrent connections, rows written per second, data stored, or the fan-out of one action. A system can scale well along one of these and badly along another. A chat service may handle twice the users easily and still fall over when one group grows to 100,000 members.</p>
+<p>This chapter covers the two basic directions of scaling, the single most important design property that enables one of them (statelessness), how reads and writes scale differently, the mathematical limits that stop adding machines from helping, and a staged worked example of growing a web app from 1,000 to 10 million users.</p>
+
+<h2 id="vertical-horizontal">Vertical vs horizontal scaling</h2>
+<p><dfn>Vertical scaling</dfn> (scaling up) means a bigger machine: more cores, more RAM, faster disks. <dfn>Horizontal scaling</dfn> (scaling out) means more machines, each doing part of the work.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 250" role="img" aria-label="Vertical scaling replaces a small server with a large one; horizontal scaling puts many small servers behind a load balancer">
+<text class="t b mid" x="170" y="24">Vertical: a bigger box</text>
+<rect class="n ghost" x="40" y="150" width="80" height="60" rx="8"/><text class="t sm mute mid" x="80" y="178">4 cores</text><text class="t xs mute mid" x="80" y="194">16 GB</text>
+<path class="e accent" d="M126,180 H166"/>
+<rect class="n svc" x="172" y="50" width="140" height="160" rx="10"/><text class="t b mid" x="242" y="120">64 cores</text><text class="t sm mid" x="242" y="140">1 TB RAM</text><text class="t xs mute mid" x="242" y="158">NVMe array</text>
+<text class="t xs mute mid" x="170" y="236">no code changes; one machine's limit and price</text>
+<path class="line faint" d="M360,20 V230" style="stroke-dasharray:4 4"/>
+<text class="t b mid" x="545" y="24">Horizontal: more boxes</text>
+<rect class="n ext" x="400" y="110" width="80" height="50" rx="8"/><text class="t b mid" x="440" y="132">Load</text><text class="t b mid" x="440" y="148">balancer</text>
+<rect class="n svc" x="540" y="44" width="110" height="34" rx="6"/><text class="t sm mid" x="595" y="65">4 cores, 16 GB</text>
+<rect class="n svc" x="540" y="92" width="110" height="34" rx="6"/><text class="t sm mid" x="595" y="113">4 cores, 16 GB</text>
+<rect class="n svc" x="540" y="140" width="110" height="34" rx="6"/><text class="t sm mid" x="595" y="161">4 cores, 16 GB</text>
+<rect class="n ghost" x="540" y="188" width="110" height="34" rx="6"/><text class="t sm mute mid" x="595" y="209">... N</text>
+<path class="e" d="M480,126 C510,126 510,61 536,61"/>
+<path class="e" d="M480,132 C510,132 510,109 536,109"/>
+<path class="e" d="M480,138 C510,138 510,157 536,157"/>
+<path class="e dash" d="M480,144 C510,144 510,205 536,205"/>
+<text class="t xs mute mid" x="545" y="240">needs statelessness or partitioning</text>
+</svg>
+</div>
+<figcaption><b>Two directions.</b> Scaling up is invisible to the code but has a ceiling and a steep price curve. Scaling out has no hard ceiling and survives the loss of one machine, but only works if the software can split its work across machines.</figcaption>
+</figure>
+
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Vertical</th><th>Horizontal</th></tr></thead>
+<tbody>
+<tr><th>Code changes</th><td class="yes">None</td><td class="meh">Requires stateless services, or partitioned data</td></tr>
+<tr><th>Ceiling</th><td class="no">The largest machine you can buy: hundreds of cores, terabytes of RAM</td><td class="yes">Practically none for stateless work</td></tr>
+<tr><th>Cost curve</th><td class="no">Superlinear near the top end</td><td class="yes">Roughly linear with commodity machines</td></tr>
+<tr><th>Failure</th><td class="no">One machine is one failure domain</td><td class="yes">Losing one of N costs 1/N of capacity</td></tr>
+<tr><th>Consistency</th><td class="yes">Easy: one memory, one disk, local transactions</td><td class="no">Hard: coordination across a network</td></tr>
+<tr><th>Operational load</th><td class="yes">One thing to run</td><td class="meh">Load balancing, discovery, deploys across a fleet</td></tr>
+</tbody></table></div>
+<p>Vertical scaling is underrated. A single modern server with a few dozen cores and a few hundred gigabytes of RAM handles far more than most startups ever need, and every distributed-systems problem you avoid is a class of bugs you never write. The well-known example is Stack Overflow, which for years served one of the busiest sites on the internet from a handful of web servers and a few large SQL Server machines. A good default is: <strong>scale the stateless tier horizontally from day one (it is cheap), and scale the database vertically until it stops being enough.</strong></p>
+
+<h2 id="statelessness">Stateless services: the precondition for scaling out</h2>
+<p>A service is <dfn>stateless</dfn> when any instance can serve any request, because nothing a request needs lives only in one instance's memory or disk. State still exists, but it lives in shared stores built for it: a database, a cache cluster, an object store. Stateless instances are interchangeable, so you can add them, remove them, restart them and route to any of them freely.</p>
+<p>The common hidden state that blocks this:</p>
+<div class="defs">
+<div><h4>Sessions in memory</h4><p>A login session stored in the server's memory forces <dfn>sticky sessions</dfn>: the load balancer must pin each user to one server. Move sessions to Redis, or use signed tokens (such as JWTs) that carry the session in the request itself.</p></div>
+<div><h4>Files on local disk</h4><p>Uploads written to <code>/var/uploads</code> exist on one server only. Write them to object storage (S3, GCS) and serve them through a CDN. See <a href="blob-storage.html">Blob &amp; Object Storage</a>.</p></div>
+<div><h4>In-process caches</h4><p>A local cache is fine as an optimisation if a miss is harmless. It becomes state when correctness depends on it, such as a rate-limit counter that only one instance sees.</p></div>
+<div><h4>Singletons and cron</h4><p>"This server also runs the nightly job" breaks when there are 20 of them (it runs 20 times) or when that server is replaced. Use a scheduler with leader election or a job queue.</p></div>
+</div>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 270" role="img" aria-label="Stateful servers with sticky sessions lose a user's session and files when a server fails; stateless servers keep sessions in Redis and files in object storage">
+<rect class="n client" x="20" y="105" width="80" height="50" rx="8"/><text class="t b mid" x="60" y="127">User 42</text><text class="t xs mute mid" x="60" y="143">logged in</text>
+<g data-show="1 2"><rect class="n ext" x="140" y="105" width="100" height="50" rx="8"/><text class="t b mid" x="190" y="127">LB</text><text class="t xs mute mid" x="190" y="143">sticky by cookie</text></g>
+<g data-show="3"><rect class="n ext" x="140" y="105" width="100" height="50" rx="8"/><text class="t b mid" x="190" y="127">LB</text><text class="t xs mute mid" x="190" y="143">any instance</text></g>
+<path class="e" d="M100,130 H136"/>
+<g data-show="1 3"><rect class="n svc" x="290" y="30" width="150" height="76" rx="8"/></g>
+<g data-show="2"><rect class="n bad" x="290" y="30" width="150" height="76" rx="8"/><text class="t sm red mid" x="365" y="122">down</text></g>
+<rect class="n svc" x="290" y="154" width="150" height="76" rx="8"/>
+<text class="t b mid" x="365" y="52">App A</text>
+<text class="t b mid" x="365" y="176">App B</text>
+<g data-show="1 2">
+<text class="t xs mono mid" x="365" y="72">session[42] in RAM</text>
+<text class="t xs mono mid" x="365" y="90">/uploads/42.jpg</text>
+<text class="t xs mono mute mid" x="365" y="196">session[17] in RAM</text>
+<text class="t xs mono mute mid" x="365" y="214">/uploads/17.jpg</text>
+</g>
+<g data-show="3">
+<text class="t xs mute mid" x="365" y="78">no local state</text>
+<text class="t xs mute mid" x="365" y="202">no local state</text>
+</g>
+<g data-show="1"><path class="e accent" d="M240,124 C265,124 265,68 286,68"/>
+<text class="t sm b" x="480" y="60">Stateful, sticky</text>
+<text class="t xs mute" x="480" y="80">The LB pins user 42 to App A,</text>
+<text class="t xs mute" x="480" y="95">because only A holds the session</text>
+<text class="t xs mute" x="480" y="110">and the uploaded file.</text>
+<text class="t xs mute" x="480" y="140">Adding App C helps new users only;</text>
+<text class="t xs mute" x="480" y="155">load stays uneven.</text></g>
+<g data-show="2"><path class="e red" d="M240,136 C265,136 265,192 286,192"/>
+<text class="t sm b red" x="480" y="60">App A fails</text>
+<text class="t xs mute" x="480" y="80">The LB sends user 42 to App B.</text>
+<text class="t xs mute" x="480" y="95">B has no session: logged out.</text>
+<text class="t xs mute" x="480" y="110">The photo on A's disk is gone</text>
+<text class="t xs mute" x="480" y="125">or unreachable until A returns.</text>
+<text class="t xs mono red" x="480" y="155">401 Unauthorized</text></g>
+<g data-show="3">
+<rect class="n cache" x="530" y="30" width="160" height="50" rx="8"/><text class="t b mid" x="610" y="52">Redis</text><text class="t xs mute mid" x="610" y="68">session:42 TTL 30 min</text>
+<rect class="n db" x="530" y="180" width="160" height="50" rx="8"/><text class="t b mid" x="610" y="202">Object store</text><text class="t xs mute mid" x="610" y="218">uploads/42.jpg</text>
+<path class="e" d="M440,55 H526"/>
+<path class="e" d="M440,90 C480,90 490,195 526,198"/>
+<path class="e" d="M440,170 C480,170 490,65 526,62"/>
+<path class="e" d="M440,205 H526"/>
+<path class="e accent" d="M240,124 C265,124 265,68 286,68"/>
+<path class="e accent" d="M240,136 C265,136 265,192 286,192"/>
+<text class="t xs mute mid" x="365" y="258">either instance can serve user 42; kill one and nothing is lost</text>
+</g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Stateful</button><button type="button" data-step="2" aria-pressed="false">A server fails</button><button type="button" data-step="3" aria-pressed="false">Stateless</button></div>
+</div>
+<figcaption><b>Moving state out.</b> The same two servers, before and after. Once sessions live in Redis and files in an object store, app instances become disposable: the load balancer can use any algorithm, autoscaling can remove instances safely, and a crash costs only in-flight requests.</figcaption>
+</figure>
+<p>The state did not disappear; it moved into components that are built to be shared, replicated and backed up. Those components now have their own scaling problem, which is the subject of most of the Data part of this handbook. That is the general pattern: <strong>push state down into a few specialised tiers, keep everything above them stateless</strong>.</p>
+
+<h2 id="reads-vs-writes">Scaling reads vs scaling writes</h2>
+<p>Once the stateless tier scales out, the bottleneck moves to the data tier, and there reads and writes scale by different means.</p>
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Scaling reads</th><th>Scaling writes</th></tr></thead>
+<tbody>
+<tr><th>Core idea</th><td>Make copies; serve each read from any copy</td><td>Split the data; each write goes to one owner</td></tr>
+<tr><th>Tools</th><td><a href="caching.html">Caches</a>, <a href="replication.html">read replicas</a>, <a href="cdn.html">CDNs</a>, precomputed views</td><td><a href="sharding.html">Sharding</a>, batching, append-only logs, async processing with <a href="message-queues.html">queues</a></td></tr>
+<tr><th>Cost</th><td>Staleness: copies lag the source</td><td>Cross-shard queries and transactions become hard</td></tr>
+<tr><th>Difficulty</th><td class="yes">Usually incremental</td><td class="no">Often a major migration</td></tr>
+</tbody></table></div>
+<p>Copies help reads because each read needs only one copy. They do not help writes, because every write must reach every copy: ten replicas means each write is applied ten times. Only partitioning divides write load, since each partition receives only its share of writes. That is why most systems put off sharding as long as possible and do everything else first: caching, replicas, moving heavy work off the request path, and buying a bigger primary.</p>
+
+<h2 id="limits">Where scaling stops: Amdahl and the USL</h2>
+<p>Doubling the machines rarely doubles throughput. Two models explain why, and the second one explains why adding machines can even make things worse.</p>
+
+<h3 id="amdahl">Amdahl's law: the serial fraction</h3>
+<p>If a fraction <code>σ</code> of the work is serial (it cannot be split: a single lock, a single leader, one hot row), then the speedup with <code>N</code> workers is</p>
+<div class="calc">S(N) = 1 / ( σ + (1 - σ) / N )        and as N → ∞,  S → 1 / σ</div>
+<p>With just 5% serial work, no number of machines gives more than a 20× speedup, and 64 machines give only 15.4×. Gene Amdahl stated this argument in 1967 for parallel processors; it applies equally to a fleet of servers sharing a database row.</p>
+
+<h3 id="usl">The Universal Scalability Law: the cost of coordination</h3>
+<p>Amdahl assumes the serial part has a fixed cost. In distributed systems the cost of coordinating grows with the number of participants: every node must keep its caches coherent with every other, every lock is contended by more parties, every consensus round includes more voters. Neil Gunther's <dfn>Universal Scalability Law</dfn> (USL) adds a term for this:</p>
+<div class="calc">C(N) = N / ( 1 + α(N - 1) + βN(N - 1) )
+
+α  contention: queueing for a shared resource (Amdahl's serial fraction)
+β  coherency: pairwise coordination, which grows with N²
+peak at N* = √( (1 - α) / β )</div>
+<p>The <code>β</code> term is quadratic, so for large enough <code>N</code> it dominates and throughput <em>falls</em> as you add nodes. Every node added past the peak spends more time agreeing with the others than doing work.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 700 340" role="img" aria-label="Throughput relative to one node versus node count: linear ideal, Amdahl with 5 percent serial work flattening toward 20 times, and the Universal Scalability Law peaking at about 9 times near 31 nodes then declining">
+<path class="line faint" d="M70,290.0 H630"/><text class="t xs mono mute end" x="62" y="294.0">0x</text>
+<path class="line faint" d="M70,227.5 H630"/><text class="t xs mono mute end" x="62" y="231.5">4x</text>
+<path class="line faint" d="M70,165.0 H630"/><text class="t xs mono mute end" x="62" y="169.0">8x</text>
+<path class="line faint" d="M70,102.5 H630"/><text class="t xs mono mute end" x="62" y="106.5">12x</text>
+<path class="line faint" d="M70,40.0 H630"/><text class="t xs mono mute end" x="62" y="44.0">16x</text>
+<text class="t xs mono mute mid" x="70.0" y="308">0</text>
+<text class="t xs mono mute mid" x="210.0" y="308">16</text>
+<text class="t xs mono mute mid" x="350.0" y="308">32</text>
+<text class="t xs mono mute mid" x="490.0" y="308">48</text>
+<text class="t xs mono mute mid" x="630.0" y="308">64</text>
+<path class="line" d="M70,290 H630 M70,290 V40.0"/>
+<text class="t xs mute mid" x="350.0" y="326">nodes (N)</text>
+<text class="t xs mute" x="20" y="28.0">throughput vs one node</text>
+<polyline points="78.8,274.4 210.0,40.0" style="fill:none;stroke:var(--d-muted);stroke-width:1.5;stroke-dasharray:5 4"/>
+<polyline points="78.8,274.4 83.1,267.1 87.5,260.2 91.9,253.7 96.2,247.4 100.6,241.4 105.0,235.7 109.4,230.2 113.8,224.9 118.1,219.8 122.5,215.0 126.9,210.3 131.2,205.9 135.6,201.6 140.0,197.4 144.4,193.4 148.8,189.6 153.1,185.8 157.5,182.2 161.9,178.8 166.2,175.4 170.6,172.2 175.0,169.0 179.4,166.0 183.8,163.0 188.1,160.2 192.5,157.4 196.9,154.7 201.2,152.1 205.6,149.6 210.0,147.1 214.4,144.8 218.8,142.4 223.1,140.2 227.5,138.0 231.9,135.8 236.2,133.8 240.6,131.7 245.0,129.7 249.4,127.8 253.8,125.9 258.1,124.1 262.5,122.3 266.9,120.6 271.2,118.9 275.6,117.2 280.0,115.6 284.4,114.0 288.8,112.4 293.1,110.9 297.5,109.4 301.9,108.0 306.2,106.6 310.6,105.2 315.0,103.8 319.4,102.5 323.8,101.2 328.1,99.9 332.5,98.7 336.9,97.4 341.2,96.2 345.6,95.1 350.0,93.9 354.4,92.8 358.8,91.7 363.1,90.6 367.5,89.5 371.9,88.5 376.2,87.5 380.6,86.4 385.0,85.5 389.4,84.5 393.8,83.5 398.1,82.6 402.5,81.7 406.9,80.8 411.2,79.9 415.6,79.0 420.0,78.1 424.4,77.3 428.8,76.5 433.1,75.6 437.5,74.8 441.9,74.0 446.2,73.3 450.6,72.5 455.0,71.7 459.4,71.0 463.8,70.3 468.1,69.6 472.5,68.8 476.9,68.1 481.2,67.5 485.6,66.8 490.0,66.1 494.4,65.5 498.8,64.8 503.1,64.2 507.5,63.6 511.9,62.9 516.2,62.3 520.6,61.7 525.0,61.1 529.4,60.5 533.8,60.0 538.1,59.4 542.5,58.8 546.9,58.3 551.2,57.7 555.6,57.2 560.0,56.7 564.4,56.1 568.8,55.6 573.1,55.1 577.5,54.6 581.9,54.1 586.2,53.6 590.6,53.1 595.0,52.7 599.4,52.2 603.8,51.7 608.1,51.3 612.5,50.8 616.9,50.4 621.2,49.9 625.6,49.5 630.0,49.0" style="fill:none;stroke:var(--d-db-s);stroke-width:2.5"/>
+<polyline points="78.8,274.4 83.1,267.2 87.5,260.3 91.9,253.8 96.2,247.6 100.6,241.8 105.0,236.2 109.4,231.0 113.8,226.0 118.1,221.2 122.5,216.8 126.9,212.5 131.2,208.5 135.6,204.7 140.0,201.1 144.4,197.7 148.8,194.5 153.1,191.4 157.5,188.5 161.9,185.8 166.2,183.2 170.6,180.8 175.0,178.5 179.4,176.4 183.8,174.3 188.1,172.4 192.5,170.6 196.9,168.9 201.2,167.3 205.6,165.8 210.0,164.4 214.4,163.0 218.8,161.8 223.1,160.6 227.5,159.6 231.9,158.5 236.2,157.6 240.6,156.7 245.0,155.9 249.4,155.1 253.8,154.4 258.1,153.8 262.5,153.2 266.9,152.6 271.2,152.1 275.6,151.6 280.0,151.2 284.4,150.8 288.8,150.5 293.1,150.2 297.5,149.9 301.9,149.7 306.2,149.5 310.6,149.3 315.0,149.1 319.4,149.0 323.8,148.9 328.1,148.9 332.5,148.8 336.9,148.8 341.2,148.8 345.6,148.8 350.0,148.8 354.4,148.9 358.8,149.0 363.1,149.1 367.5,149.2 371.9,149.3 376.2,149.4 380.6,149.6 385.0,149.7 389.4,149.9 393.8,150.1 398.1,150.3 402.5,150.5 406.9,150.7 411.2,150.9 415.6,151.2 420.0,151.4 424.4,151.7 428.8,151.9 433.1,152.2 437.5,152.5 441.9,152.8 446.2,153.1 450.6,153.3 455.0,153.6 459.4,154.0 463.8,154.3 468.1,154.6 472.5,154.9 476.9,155.2 481.2,155.5 485.6,155.9 490.0,156.2 494.4,156.6 498.8,156.9 503.1,157.2 507.5,157.6 511.9,157.9 516.2,158.3 520.6,158.6 525.0,159.0 529.4,159.4 533.8,159.7 538.1,160.1 542.5,160.4 546.9,160.8 551.2,161.2 555.6,161.5 560.0,161.9 564.4,162.3 568.8,162.6 573.1,163.0 577.5,163.4 581.9,163.7 586.2,164.1 590.6,164.5 595.0,164.8 599.4,165.2 603.8,165.6 608.1,165.9 612.5,166.3 616.9,166.7 621.2,167.0 625.6,167.4 630.0,167.8" style="fill:none;stroke:var(--accent);stroke-width:2.5"/>
+<circle class="dot accent" cx="339.7" cy="148.8" r="4"/>
+<text class="t xs mute" x="218" y="54">linear (ideal)</text>
+<text class="t xs green end" x="626" y="34">Amdahl, α = 0.05: 15.4x at 64</text>
+<text class="t xs accent end" x="630" y="190">USL, α = 0.05, β = 0.001: 7.8x at 64</text>
+<text class="t xs accent mid" x="340" y="137">peak 9.0x at N ≈ 31</text>
+</svg>
+</div>
+<figcaption><b>Diminishing, then negative, returns.</b> Drawn to scale from the formulas. With 5% contention alone (Amdahl), 64 nodes deliver 15.4 times one node. Adding a small coherency cost of 0.001 caps throughput at about 9 times one node at 31 nodes; at 64 nodes it has fallen to 7.8 times.</figcaption>
+</figure>
+
+<p>Here are the same curves as code. The output in the comments is from a real run.</p>
+<pre><code class="language-python">import math
+
+
+def amdahl(n, serial):
+    """Speedup with n workers when a fraction `serial` of the work cannot be parallelised."""
+    return 1 / (serial + (1 - serial) / n)
+
+
+def usl(n, alpha, beta):
+    """Universal Scalability Law: relative capacity with n nodes.
+    alpha = contention (queueing on a shared resource), beta = coherency (pairwise coordination)."""
+    return n / (1 + alpha * (n - 1) + beta * n * (n - 1))
+
+
+alpha, beta = 0.05, 0.001
+peak_n = math.sqrt((1 - alpha) / beta)
+print(f"USL peak at N = {peak_n:.1f}, capacity {usl(peak_n, alpha, beta):.1f}x one node")
+for n in (1, 8, 16, 32, 64):
+    print(f"N={n:3d}  linear {n:3d}x   Amdahl {amdahl(n, alpha):5.1f}x   USL {usl(n, alpha, beta):5.1f}x")
+
+# USL peak at N = 30.8, capacity 9.0x one node
+# N=  1  linear   1x   Amdahl   1.0x   USL   1.0x
+# N=  8  linear   8x   Amdahl   5.9x   USL   5.7x
+# N= 16  linear  16x   Amdahl   9.1x   USL   8.0x
+# N= 32  linear  32x   Amdahl  12.5x   USL   9.0x
+# N= 64  linear  64x   Amdahl  15.4x   USL   7.8x</code></pre>
+<p>In practice you fit <code>α</code> and <code>β</code> to load-test measurements at a few cluster sizes (throughput at 1, 2, 4, 8 nodes), then use the fitted curve to predict where adding hardware stops paying. It is one of the few capacity models that captures retrograde scaling.</p>
+
+<h3 id="coordination">Coordination is the real limit</h3>
+<p>The USL makes a practical point precise: <strong>systems scale to the degree that their parts do not need to talk to each other</strong>. Every design technique that scales well removes coordination:</p>
+<ul>
+<li><strong>Stateless services</strong> need no coordination between instances at all, so <code>β ≈ 0</code> for that tier.</li>
+<li><strong>Sharding</strong> keeps each request on one partition, so partitions do not coordinate, until a query or transaction spans shards.</li>
+<li><strong>Asynchronous processing</strong> replaces "wait until everyone agrees" with "record it now, reconcile later".</li>
+<li><strong>Weaker consistency</strong> lets replicas answer without consulting each other; see <a href="cap-pacelc.html">CAP &amp; PACELC</a> and <a href="consistency-models.html">Consistency Models</a>.</li>
+</ul>
+<p>And the components that scale badly are the ones that coordinate by design: a single global lock, a counter row every request increments, a consensus group (which is why <a href="consensus.html">consensus</a> clusters stay at 3 or 5 members), a distributed transaction across many shards, or a gossip protocol where every node talks to every other.</p>
+
+<h2 id="scale-cube">The scale cube</h2>
+<p>The <dfn>AKF scale cube</dfn>, from Martin Abbott and Michael Fisher's <em>The Art of Scalability</em>, names three independent ways to split a system. Real systems use all three.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 740 300" role="img" aria-label="Scale cube with X axis for cloning, Y axis for splitting by function and Z axis for splitting by data">
+<path class="line faint" d="M200,250 H400 V90 H200 Z"/>
+<path class="line faint" d="M290,190 H490 V30 H290 Z"/>
+<path class="line faint" d="M400,250 L490,190 M400,90 L490,30 M200,90 L290,30 M200,250 L290,190"/>
+<path class="e accent" d="M200,250 H420" style="stroke-width:2.5"/>
+<path class="e accent" d="M200,250 V72" style="stroke-width:2.5"/>
+<path class="e accent" d="M200,250 L302,182" style="stroke-width:2.5"/>
+<text class="t b accent" x="428" y="255">X</text>
+<text class="t b accent mid" x="200" y="64">Y</text>
+<text class="t b accent" x="308" y="180">Z</text>
+<circle class="dot" cx="200" cy="250" r="5"/>
+<text class="t xs mute end" x="190" y="272">one monolith, one database</text>
+<text class="t xs mute" x="496" y="24">near infinite scale</text>
+<rect class="n svc" x="530" y="50" width="196" height="64" rx="8"/>
+<text class="t sm b" x="544" y="70">X: clone</text>
+<text class="t xs mute" x="544" y="87">identical copies behind an LB</text>
+<text class="t xs mute" x="544" y="102">e.g. 20 stateless web servers</text>
+<rect class="n cache" x="530" y="128" width="196" height="64" rx="8"/>
+<text class="t sm b" x="544" y="148">Y: split by function</text>
+<text class="t xs mute" x="544" y="165">different services, different jobs</text>
+<text class="t xs mute" x="544" y="180">e.g. feed, post, user services</text>
+<rect class="n db" x="530" y="206" width="196" height="64" rx="8"/>
+<text class="t sm b" x="544" y="226">Z: split by data</text>
+<text class="t xs mute" x="544" y="243">same code, a subset of the data</text>
+<text class="t xs mute" x="544" y="258">e.g. shards or cells by user_id</text>
+</svg>
+</div>
+<figcaption><b>The AKF scale cube.</b> Each axis attacks a different limit. X multiplies capacity for work that needs no shared state. Y splits a large codebase and its data by responsibility, so each part scales and deploys independently. Z splits by customer or key, so each partition handles a fraction of the data and writes.</figcaption>
+</figure>
+<div class="table-wrap"><table>
+<thead><tr><th>Axis</th><th>Solves</th><th>Costs</th><th>Handbook chapter</th></tr></thead>
+<tbody>
+<tr><th>X: horizontal duplication</th><td>Request volume on stateless tiers</td><td>Needs statelessness; does nothing for data size or write volume</td><td><a href="load-balancing.html">Load Balancing</a></td></tr>
+<tr><th>Y: functional decomposition</th><td>Team and codebase size; different scaling needs per function</td><td>Network calls replace function calls; distributed failure modes</td><td><a href="microservices.html">Monolith vs Microservices</a></td></tr>
+<tr><th>Z: data partitioning</th><td>Data size and write volume; blast radius (a cell failure hits only its users)</td><td>Cross-partition queries; rebalancing; hot partitions</td><td><a href="sharding.html">Sharding</a></td></tr>
+</tbody></table></div>
+
+<h2 id="autoscaling">Autoscaling and elasticity</h2>
+<p><dfn>Elasticity</dfn> is the ability to add and remove capacity automatically as load changes, so you pay for what you use. It is related to scalability but different: scalability says the architecture <em>can</em> use more machines effectively; elasticity says it can do so <em>quickly and automatically</em>, in both directions. A sharded database may scale to 100 shards yet take days to rebalance, so it is scalable but not elastic. A stateless service on Kubernetes can be both.</p>
+<p>Autoscalers come in three common forms:</p>
+<ol class="steps">
+<li><strong>Target tracking.</strong> Keep a metric near a target, for example average CPU at 60%. Simple, and the default for most services. The headroom (here 40%) absorbs spikes while new instances boot.</li>
+<li><strong>Scheduled.</strong> Add capacity before known peaks: weekday mornings, a product launch, a televised event. Cheap insurance, because reactive scaling always lags.</li>
+<li><strong>Predictive.</strong> Forecast load from history and scale ahead of it. Useful for strong daily cycles.</li>
+</ol>
+<p>Things that go wrong with autoscaling, and are worth saying in an interview:</p>
+<ul>
+<li><strong>Lag.</strong> A new VM can take minutes to boot, pull an image and warm up caches. A spike shorter than that is absorbed only by existing headroom. Containers start faster than VMs, and keeping a warm pool helps.</li>
+<li><strong>The wrong metric.</strong> CPU is a poor signal for I/O-bound services. Scale queue consumers on queue depth or consumer lag, and request-serving tiers on concurrency or latency.</li>
+<li><strong>Moving the bottleneck.</strong> Scaling the app tier from 10 to 100 instances multiplies database connections by ten. Without a connection pooler (such as PgBouncer), autoscaling the stateless tier can take down the stateful one.</li>
+<li><strong>Flapping.</strong> Scaling in too eagerly causes oscillation. Use cooldowns, and scale in more slowly than you scale out.</li>
+</ul>
+
+<h2 id="worked-example">Worked example: from 1,000 to 10 million users</h2>
+<p>A typical consumer web app (accounts, a feed of user content, photo uploads) grows through five stages. Assume each daily active user makes about 50 requests a day, with peak traffic three times the average. Use the buttons to walk through the architecture at each stage.</p>
+
+<figure class="fig wide" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 730 372" role="img" aria-label="Five stages of a growing web app: single server; separate database; load balancer with stateless app servers, Redis and object storage with CDN; cache, read replicas and a queue; sharded database and split services">
+<rect class="n client" x="20" y="160" width="80" height="46" rx="8"/><text class="t b mid" x="60" y="181">Users</text><text class="t xs mute mid" x="60" y="196">web, mobile</text>
+<g data-show="1">
+<text class="t sm b" x="20" y="34">Stage 1: 1k users, ~2 req/s peak</text>
+<text class="t xs mute" x="20" y="52">One VM runs app and database.</text>
+<text class="t xs mute" x="20" y="67">Simple, cheap, one failure domain.</text>
+<rect class="n svc" x="255" y="130" width="160" height="106" rx="10"/><text class="t b mid" x="335" y="170">One server</text><text class="t xs mute mid" x="335" y="188">app + PostgreSQL</text><text class="t xs mute mid" x="335" y="204">+ uploads on disk</text>
+<path class="e" d="M100,183 H251"/>
+</g>
+<g data-show="2">
+<text class="t sm b" x="20" y="34">Stage 2: 10k users, ~17 req/s</text>
+<text class="t xs mute" x="20" y="52">Database on its own machine,</text>
+<text class="t xs mute" x="20" y="67">with backups and a standby.</text>
+<rect class="n svc" x="255" y="160" width="120" height="46" rx="8"/><text class="t b mid" x="315" y="181">App server</text><text class="t xs mute mid" x="315" y="196">one, bigger</text>
+<rect class="n db" x="580" y="160" width="130" height="46" rx="8"/><text class="t b mid" x="645" y="181">PostgreSQL</text><text class="t xs mute mid" x="645" y="196">+ hot standby</text>
+<path class="e" d="M100,183 H251"/>
+<path class="e" d="M375,183 H576"/>
+</g>
+<g data-show="3 4 5">
+<rect class="n ext" x="130" y="160" width="90" height="46" rx="8"/><text class="t b mid" x="175" y="188">LB</text>
+<rect class="n ext" x="130" y="300" width="90" height="46" rx="8"/><text class="t b mid" x="175" y="328">CDN</text>
+<rect class="n db" x="580" y="300" width="130" height="46" rx="8"/><text class="t b mid" x="645" y="321">Object store</text><text class="t xs mute mid" x="645" y="336">photos</text>
+<rect class="n cache" x="420" y="20" width="110" height="46" rx="8"/><text class="t b mid" x="475" y="41">Redis</text>
+<path class="e" d="M100,183 H126"/>
+<path class="e" d="M220,175 C238,175 238,113 251,113"/>
+<path class="e" d="M220,183 H251"/>
+<path class="e" d="M220,191 C238,191 238,253 251,253"/>
+<path class="e" d="M60,206 C60,280 90,323 126,323"/>
+<path class="e" d="M220,323 H576"/>
+<text class="t xs mute mid" x="400" y="316">cache miss</text>
+<path class="e" d="M375,100 C398,100 398,43 416,43"/>
+</g>
+<g data-show="3 4">
+<rect class="n svc" x="255" y="90" width="120" height="46" rx="8"/><text class="t b mid" x="315" y="118">App 1</text>
+<rect class="n svc" x="255" y="160" width="120" height="46" rx="8"/><text class="t b mid" x="315" y="188">App 2</text>
+<rect class="n svc" x="255" y="230" width="120" height="46" rx="8"/><text class="t b mid" x="315" y="258">App N</text>
+</g>
+<g data-show="3">
+<text class="t sm b" x="20" y="34">Stage 3: 100k users, ~170 req/s</text>
+<text class="t xs mute" x="20" y="52">Stateless app servers behind an LB.</text>
+<text class="t xs mute" x="20" y="67">Sessions in Redis, photos in an</text>
+<text class="t xs mute" x="20" y="82">object store behind a CDN.</text>
+<text class="t xs mute mid" x="475" y="57">sessions</text>
+<rect class="n db" x="580" y="160" width="130" height="46" rx="8"/><text class="t b mid" x="645" y="181">PostgreSQL</text><text class="t xs mute mid" x="645" y="196">primary + standby</text>
+<path class="e" d="M375,120 C480,120 520,176 576,176"/>
+<path class="e" d="M375,183 H576"/>
+<path class="e" d="M375,246 C480,246 520,190 576,190"/>
+</g>
+<g data-show="4">
+<text class="t sm b" x="20" y="34">Stage 4: 1M users, ~1.7k req/s</text>
+<text class="t xs mute" x="20" y="52">Cache and read replicas take reads.</text>
+<text class="t xs mute" x="20" y="67">Slow work (thumbnails, email,</text>
+<text class="t xs mute" x="20" y="82">fan-out) moves to a queue.</text>
+<text class="t xs mute mid" x="475" y="57">sessions + cache</text>
+<rect class="n db" x="580" y="90" width="130" height="46" rx="8"/><text class="t b mid" x="645" y="111">Read replicas</text><text class="t xs mute mid" x="645" y="126">x3, async</text>
+<rect class="n db" x="580" y="160" width="130" height="46" rx="8"/><text class="t b mid" x="645" y="181">Primary</text><text class="t xs mute mid" x="645" y="196">all writes</text>
+<path class="e dash" d="M645,158 V140"/>
+<path class="e" d="M375,113 H576"/>
+<path class="e" d="M375,183 H576"/>
+</g>
+<g data-show="4 5">
+<rect class="n queue" x="420" y="230" width="110" height="46" rx="8"/><text class="t b mid" x="475" y="251">Queue</text><text class="t xs mute mid" x="475" y="266">+ workers</text>
+<path class="e" d="M375,253 H416"/>
+</g>
+<g data-show="4"><path class="e" d="M530,253 C555,253 555,195 576,195"/></g>
+<g data-show="5">
+<text class="t sm b" x="20" y="34">Stage 5: 10M users, ~17k req/s</text>
+<text class="t xs mute" x="20" y="52">Shard the database by user_id.</text>
+<text class="t xs mute" x="20" y="67">Split services by domain. Add a</text>
+<text class="t xs mute" x="20" y="82">second region for failover.</text>
+<text class="t xs mute mid" x="475" y="57">sessions + cache</text>
+<rect class="n svc" x="255" y="90" width="120" height="46" rx="8"/><text class="t b mid" x="315" y="111">Feed svc</text><text class="t xs mute mid" x="315" y="126">x N</text>
+<rect class="n svc" x="255" y="160" width="120" height="46" rx="8"/><text class="t b mid" x="315" y="181">Post svc</text><text class="t xs mute mid" x="315" y="196">x N</text>
+<rect class="n svc" x="255" y="230" width="120" height="46" rx="8"/><text class="t b mid" x="315" y="251">User svc</text><text class="t xs mute mid" x="315" y="266">x N</text>
+<rect class="n db" x="580" y="90" width="130" height="46" rx="8"/><text class="t b mid" x="645" y="111">Shard 1</text><text class="t xs mute mid" x="645" y="126">primary + replicas</text>
+<rect class="n db" x="580" y="160" width="130" height="46" rx="8"/><text class="t b mid" x="645" y="181">Shard 2</text><text class="t xs mute mid" x="645" y="196">primary + replicas</text>
+<rect class="n db" x="580" y="230" width="130" height="46" rx="8"/><text class="t b mid" x="645" y="251">Shard N</text><text class="t xs mute mid" x="645" y="266">primary + replicas</text>
+<path class="line" d="M375,113 H548 M375,183 H548 M530,253 H548 M548,113 V253"/>
+<path class="e" d="M548,113 H576"/><path class="e" d="M548,183 H576"/><path class="e" d="M548,253 H576"/>
+<text class="t xs mute" x="540" y="82">by user_id</text>
+</g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">1k</button><button type="button" data-step="2" aria-pressed="false">10k</button><button type="button" data-step="3" aria-pressed="false">100k</button><button type="button" data-step="4" aria-pressed="false">1M</button><button type="button" data-step="5" aria-pressed="false">10M</button></div>
+</div>
+<figcaption><b>Growing in stages.</b> Each stage fixes the bottleneck that the previous one hit, and nothing more. Note how late sharding arrives: caching, replicas and a queue push the single-primary design to about a million users.</figcaption>
+</figure>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Stage</th><th class="num">Peak req/s</th><th>What breaks or worries you</th><th>Change</th></tr></thead>
+<tbody>
+<tr><th>1k users</th><td class="num">~2</td><td>Nothing on capacity. One disk failure loses everything</td><td>Backups. Stay simple</td></tr>
+<tr><th>10k users</th><td class="num">~17</td><td>App and database compete for RAM; deploys restart the database host</td><td>Separate database server with a standby; scale both vertically</td></tr>
+<tr><th>100k users</th><td class="num">~170</td><td>Still within one server's capacity, but one app server is a single point of failure and deploys cause downtime</td><td>Load balancer, 2+ stateless app servers across zones; sessions to Redis; uploads to object storage and CDN</td></tr>
+<tr><th>1M users</th><td class="num">~1,700</td><td>Database reads: at ~10 queries per request, ~17k queries/s on one primary; slow requests that resize images or send email</td><td>Cache-aside for hot reads, read replicas, a queue with workers for slow jobs, connection pooling</td></tr>
+<tr><th>10M users</th><td class="num">~17,000</td><td>Write volume and data size outgrow the largest primary; one codebase and one deploy for many teams</td><td>Shard by user_id, split services by domain, second region, autoscaling per service</td></tr>
+</tbody></table></div>
+<p>Two observations make this sequence credible in an interview. First, <strong>the early changes are driven by availability, not capacity</strong>: 170 requests per second fits on one server, but one server means every deploy and every hardware fault is an outage. Second, <strong>each change is the cheapest one that removes the current bottleneck</strong>. Sharding at 10,000 users would cost months of engineering for a problem you do not have; sharding at 10 million users is unavoidable. Say which numbers would move you to the next stage, so the interviewer sees you would measure rather than guess.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+<li><strong>Stack Overflow</strong> is the standard example of vertical scaling done well: for years it ran on about nine web servers and a few large SQL Server machines, with heavy use of caching, and published its architecture in detail.</li>
+<li><strong>Instagram</strong> scaled its early growth on Django and PostgreSQL, then sharded PostgreSQL into thousands of logical shards mapped onto fewer physical servers, so shards could be moved between machines without re-splitting data.</li>
+<li><strong>Shopify</strong> partitions merchants into "pods", each a full slice of the stack with its own databases. That is Z-axis scaling with a blast-radius benefit: a pod failure affects only its merchants.</li>
+<li><strong>Amazon</strong> and many large platforms use <dfn>cell-based architecture</dfn>: many identical, independent copies of a service, each serving a subset of customers, with a thin routing layer in front.</li>
+<li><strong>Kubernetes</strong> provides the Horizontal Pod Autoscaler, which scales a deployment's replica count to hold a metric (CPU, memory or a custom metric such as queue depth) at a target.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>In every design, when you draw the service tier: "these are stateless, so they scale horizontally behind the load balancer". Then again when the data tier becomes the bottleneck: say whether the pressure is on reads (cache, replicas) or writes (sharding), and justify the step with numbers.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>"What happens at 10 times the traffic?" Name the first component to saturate and the change that relieves it.</li>
+<li>"Why not just buy a bigger database server?" Often a good answer up to a point; know where that point is (write volume, data size, failover time).</li>
+<li>"How do you make this service stateless?" Sessions, uploads, local caches, scheduled jobs.</li>
+<li>"Why doesn't doubling the nodes double throughput?" Contention and coordination; Amdahl and the USL.</li>
+<li>"How would you autoscale this?" Which metric, what headroom, what about boot time and database connections.</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>Sharding or microservices at the first mention of scale, with no numbers to justify them.</li>
+<li>Saying "add more servers" for a stateful component without a partitioning plan.</li>
+<li>Read replicas proposed as the fix for a write bottleneck.</li>
+<li>Treating scalability and availability as the same thing, or autoscaling as a substitute for capacity planning.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://www.oreilly.com/library/view/designing-data-intensive-applications/9781491903063/" target="_blank" rel="noopener">Designing Data-Intensive Applications</a><span>Martin Kleppmann, O'Reilly, 2017. Chapter 1 defines load parameters and scalability precisely; Part II covers replication and partitioning.</span></li>
+<li><a href="http://www.perfdynamics.com/Manifesto/USLscalability.html" target="_blank" rel="noopener">How to Quantify Scalability</a><span>Neil Gunther. The Universal Scalability Law, its derivation and how to fit it to measurements.</span></li>
+<li><a href="https://akfpartners.com/growth-blog/scale-cube" target="_blank" rel="noopener">The Scale Cube</a><span>AKF Partners. The X, Y and Z axes from <em>The Art of Scalability</em> by Abbott and Fisher.</span></li>
+<li><a href="https://nickcraver.com/blog/2016/02/17/stack-overflow-the-architecture-2016-edition/" target="_blank" rel="noopener">Stack Overflow: The Architecture, 2016 Edition</a><span>Nick Craver. A detailed account of a very large site that scaled mostly vertically.</span></li>
+<li><a href="https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/" target="_blank" rel="noopener">Kubernetes: Horizontal Pod Autoscaling</a><span>Official documentation for metric-driven horizontal autoscaling.</span></li>
+</ul>

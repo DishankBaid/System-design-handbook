@@ -1,0 +1,334 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">A user changes their profile photo, the app says "saved", they refresh, and the old photo is back. Nothing was lost: the write went to the primary, and the refresh read from a replica that had not caught up. Whether that is a bug depends on which <dfn>consistency model</dfn> the system promises, meaning the rules about which values a read is allowed to return.</p>
+<p>Replication, caching and multi-region deployment all create several copies of the same data, and copies drift. A consistency model is the contract between the storage system and its clients about how much drift clients can observe. Stronger models hide more of it and cost more latency and availability; weaker models are cheaper and push the complexity into the application. Knowing the ladder of models, and the mechanism behind each rung, lets you choose the cheapest model that still makes the product behave correctly.</p>
+<p>This chapter covers single-object consistency models: what reads of replicated data can see. <a href="cap-pacelc.html">CAP &amp; PACELC</a> explains why the strongest model costs availability during partitions; <a href="replication.html">Replication</a> covers the machinery that creates the copies.</p>
+
+<h2 id="vs-isolation">Consistency vs isolation</h2>
+<p>Two different questions are often both called "consistency":</p>
+<div class="defs">
+<div><h4>Consistency models</h4><p>About <strong>replicas and recency</strong>: when one client writes a value, which values can other clients read, and in what order do they see updates? Usually defined for single operations on single objects.</p></div>
+<div><h4>Isolation levels</h4><p>About <strong>transactions and interleaving</strong>: when several multi-object transactions run concurrently, which anomalies (lost updates, write skew) can occur? Serializability is the strongest. See <a href="transactions.html">ACID &amp; Isolation Levels</a>.</p></div>
+<div><h4>Strict serializability</h4><p>Both at once: transactions behave as if executed one at a time, <em>and</em> that order respects real time, so a transaction that commits before another starts is ordered first. Spanner calls this external consistency.</p></div>
+</div>
+<p>The axes are independent. A serializable database can return stale results if a read-only transaction is served from a lagging replica (serializability allows ordering it "in the past"). A linearizable key-value store says nothing about transactions spanning two keys. Strict serializability is the combination of serializability and linearizability.</p>
+
+<h2 id="hierarchy">The hierarchy</h2>
+<p>Models form a partial order: a stronger model allows fewer histories, so every history it allows is also allowed by the weaker models below it.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 740 410" role="img" aria-label="Hierarchy of consistency models: strict serializability implies serializability and linearizability; linearizability implies sequential, which implies causal, which implies read-your-writes, monotonic reads, monotonic writes and writes-follow-reads; eventual consistency sits apart as a convergence guarantee">
+<rect class="n svc" x="270" y="16" width="200" height="46" rx="8"/><text class="t b mid" x="370" y="36">Strict serializability</text><text class="t xs mute mid" x="370" y="52">transactions + real time</text>
+<rect class="n ghost" x="60" y="100" width="200" height="46" rx="8"/><text class="t b mid" x="160" y="120">Serializability</text><text class="t xs mute mid" x="160" y="136">isolation axis: transactions</text>
+<rect class="n ghost" x="60" y="180" width="200" height="46" rx="8"/><text class="t sm mid" x="160" y="200">Repeatable read,</text><text class="t sm mid" x="160" y="216">read committed, ...</text>
+<rect class="n svc" x="420" y="100" width="200" height="46" rx="8"/><text class="t b mid" x="520" y="120">Linearizability</text><text class="t xs mute mid" x="520" y="136">one copy, real-time order</text>
+<rect class="n svc" x="420" y="180" width="200" height="46" rx="8"/><text class="t b mid" x="520" y="200">Sequential</text><text class="t xs mute mid" x="520" y="216">one order, per-client order kept</text>
+<rect class="n db" x="420" y="260" width="200" height="46" rx="8"/><text class="t b mid" x="520" y="280">Causal</text><text class="t xs mute mid" x="520" y="296">causes seen before effects</text>
+<rect class="n cache" x="140" y="346" width="135" height="40" rx="8"/><text class="t sm b mid" x="207.5" y="371">Read-your-writes</text>
+<rect class="n cache" x="285" y="346" width="135" height="40" rx="8"/><text class="t sm b mid" x="352.5" y="371">Monotonic reads</text>
+<rect class="n cache" x="430" y="346" width="135" height="40" rx="8"/><text class="t sm b mid" x="497.5" y="371">Monotonic writes</text>
+<rect class="n cache" x="575" y="346" width="150" height="40" rx="8"/><text class="t sm b mid" x="650" y="371">Writes-follow-reads</text>
+<rect class="n ext" x="60" y="260" width="200" height="46" rx="8"/><text class="t b mid" x="160" y="280">Eventual</text><text class="t xs mute mid" x="160" y="296">replicas converge if writes stop</text>
+<path class="e" d="M330,62 C300,85 200,80 165,96"/>
+<path class="e" d="M410,62 C440,85 520,80 520,96"/>
+<path class="e" d="M160,146 V176"/>
+<path class="e" d="M520,146 V176"/>
+<path class="e" d="M520,226 V256"/>
+<path class="e" d="M470,306 C440,330 240,326 212,342"/>
+<path class="e" d="M495,306 C480,326 370,326 355,342"/>
+<path class="e" d="M520,306 C515,322 500,330 498,342"/>
+<path class="e" d="M560,306 C590,326 640,326 648,342"/>
+<text class="t xs mute" x="632" y="120">etcd, Spanner</text>
+<text class="t xs mute" x="632" y="200">rare in databases</text>
+<text class="t xs mute" x="632" y="280">MongoDB causal</text>
+<text class="t xs mute" x="632" y="294">sessions, COPS</text>
+<text class="t xs mute mid" x="432" y="404">session guarantees: per client, cheap to provide</text>
+</svg>
+</div>
+<figcaption><b>Stronger above, weaker below.</b> An arrow means "implies": every linearizable system is also sequentially and causally consistent. Eventual consistency is different in kind: it promises convergence, not any ordering, so it sits apart. The dashed left branch is the transaction isolation axis.</figcaption>
+</figure>
+
+<h2 id="models">The models</h2>
+
+<h3 id="linearizability">Linearizability</h3>
+<p><dfn>Linearizability</dfn>, defined by Herlihy and Wing in 1990, is the strongest single-object model. Every operation appears to take effect atomically at some instant between its invocation and its response, and the order of these instants respects real time. Practically: once a write is acknowledged, every read that starts afterwards, from any client, sees it or a later value. The system behaves as if there were one copy of the data.</p>
+<p>It is what you need for anything that relies on uniqueness or a single source of truth at a point in time: leader election, distributed locks, "username must be unique", and compare-and-set on an account balance. It is the C in CAP.</p>
+
+<h3 id="sequential">Sequential consistency</h3>
+<p><dfn>Sequential consistency</dfn> (Lamport, 1979) requires that all operations appear in <em>some</em> single total order, and that each client's operations appear in that order in the sequence that client issued them. Unlike linearizability, the order need not match real time: a read may return an old value as long as everyone agrees on one global sequence. It is common in discussions of CPU memory models and rare as a database guarantee, but it is a useful step to understand what "real time" adds.</p>
+
+<h3 id="causal">Causal consistency</h3>
+<p>Two operations are <dfn>causally related</dfn> if one could have influenced the other: the same client did one after the other, or one read a value the other wrote, or a chain of such links connects them. Lamport's 1978 "happened-before" relation formalises this. <dfn>Causal consistency</dfn> requires that every client sees causally related writes in causal order. Concurrent writes, with no causal link, may be seen in different orders by different clients.</p>
+<p>The classic example: Alice posts "I lost my job", then, after reading supportive replies, posts "Never mind, got a new one!". Bob replies "Congratulations" to the second post. Under causal consistency nobody can see Bob's congratulations without the post it answers. Mahajan, Alvisi and Dahlin showed in 2011 that a variant of causal consistency is the strongest model a system can provide while staying available during partitions, which makes it attractive for geo-replicated systems.</p>
+
+<h3 id="session-guarantees">Session guarantees</h3>
+<p>Terry and colleagues defined four guarantees in 1994 for a single client session. They are much cheaper than global models, because they only constrain what one client sees, and they fix the most visible anomalies:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Guarantee</th><th>Promise</th><th>Anomaly it prevents</th></tr></thead>
+<tbody>
+<tr><th>Read-your-writes</th><td>A client's reads reflect all its own earlier writes</td><td>"I saved my profile photo, refreshed, and the old one came back"</td></tr>
+<tr><th>Monotonic reads</th><td>Once a client has seen a value, later reads never return an older one</td><td>A comment appears, then disappears on refresh, then reappears</td></tr>
+<tr><th>Monotonic writes</th><td>A client's writes are applied everywhere in the order it issued them</td><td>"Set price to $10" then "set price to $12" ends as $10 on some replica</td></tr>
+<tr><th>Writes-follow-reads</th><td>A write that follows a read is ordered after the write that was read</td><td>A reply stored on a replica that has not yet received the post it replies to</td></tr>
+</tbody></table></div>
+<p>Causal consistency implies all four. Many products need little more than read-your-writes and monotonic reads; delivering just those two is often the right engineering answer.</p>
+
+<h3 id="eventual">Eventual consistency</h3>
+<p><dfn>Eventual consistency</dfn> promises only that if writes stop, all replicas eventually converge to the same value. It says nothing about what you read in the meantime: stale values, values going backwards, and effects before causes are all allowed. It is a <em>liveness</em> property (something good eventually happens) with no <em>safety</em> property (nothing bad happens). It is also how most caches, DNS, CDNs and asynchronously replicated databases behave by default. Systems often strengthen it to <dfn>strong eventual consistency</dfn>, where replicas that have received the same updates are in the same state, which CRDTs provide.</p>
+
+<h2 id="histories">Reading histories: allowed or forbidden?</h2>
+<p>A <dfn>history</dfn> is a record of operations, each with a start and end time, as clients observed them. Models are defined by which histories they allow. Each scenario below shows clients P1 to P4 on a real-time axis, with bars for the duration of each operation, and which models allow it.</p>
+
+<figure class="fig wide" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 740 350" role="img" aria-label="Five space-time histories with verdicts for six consistency models: a stale read by another client, a client missing its own write, reads going backwards, an effect seen before its cause, and concurrent writes observed in different orders">
+<text class="t sm b" x="560" y="40">Allowed under</text>
+<text class="t sm" x="560" y="72">Linearizable</text>
+<text class="t sm" x="560" y="102">Sequential</text>
+<text class="t sm" x="560" y="132">Causal</text>
+<text class="t sm" x="560" y="162">Read-your-writes</text>
+<text class="t sm" x="560" y="192">Monotonic reads</text>
+<text class="t sm" x="560" y="222">Eventual</text>
+<path class="e" d="M80,286 H520"/><text class="t xs mute end" x="520" y="302">real time</text>
+<g data-show="1">
+<text class="t sm b" x="20" y="34">A: stale read by another client</text>
+<text class="t b" x="20" y="74">P1</text><path class="line faint" d="M80,70 H520"/>
+<rect class="n svc" x="100" y="64" width="120" height="12" rx="3"/><text class="t xs mono mid" x="160.0" y="58">w(x=1)</text>
+<text class="t b" x="20" y="134">P2</text><path class="line faint" d="M80,130 H520"/>
+<rect class="n db" x="300" y="124" width="120" height="12" rx="3"/><text class="t xs mono mid" x="360.0" y="118">r(x) → 0</text>
+<path class="line" d="M220,80 V142" style="stroke:var(--accent);stroke-dasharray:3 3"/><text class="t xs accent" x="226" y="98">write acknowledged</text>
+<text class="t sm b end red" x="728" y="72">forbidden</text>
+<text class="t sm b end green" x="728" y="102">allowed</text>
+<text class="t sm b end green" x="728" y="132">allowed</text>
+<text class="t sm b end green" x="728" y="162">allowed</text>
+<text class="t sm b end green" x="728" y="192">allowed</text>
+<text class="t sm b end green" x="728" y="222">allowed</text>
+<text class="t xs" x="20" y="322">P2's read starts after P1's write was acknowledged, yet returns the old value.</text><text class="t xs mute" x="20" y="338">Fine under sequential order: put the read before the write.</text>
+</g>
+<g data-show="2">
+<text class="t sm b" x="20" y="34">B: client misses its own write</text>
+<text class="t b" x="20" y="74">P1</text><path class="line faint" d="M80,70 H520"/>
+<rect class="n svc" x="100" y="64" width="120" height="12" rx="3"/><text class="t xs mono mid" x="160.0" y="58">w(x=1)</text>
+<rect class="n db" x="300" y="64" width="120" height="12" rx="3"/><text class="t xs mono mid" x="360.0" y="58">r(x) → 0</text>
+<text class="t sm b end red" x="728" y="72">forbidden</text>
+<text class="t sm b end red" x="728" y="102">forbidden</text>
+<text class="t sm b end red" x="728" y="132">forbidden</text>
+<text class="t sm b end red" x="728" y="162">forbidden</text>
+<text class="t sm b end green" x="728" y="192">allowed</text>
+<text class="t sm b end green" x="728" y="222">allowed</text>
+<text class="t xs" x="20" y="322">P1 writes, then reads from a lagging replica and sees the old value.</text><text class="t xs mute" x="20" y="338">Monotonic reads alone and eventual consistency allow this.</text>
+</g>
+<g data-show="3">
+<text class="t sm b" x="20" y="34">C: time goes backwards</text>
+<text class="t b" x="20" y="74">P1</text><path class="line faint" d="M80,70 H520"/>
+<rect class="n svc" x="90" y="64" width="100" height="12" rx="3"/><text class="t xs mono mid" x="140.0" y="58">w(x=1)</text>
+<text class="t b" x="20" y="134">P2</text><path class="line faint" d="M80,130 H520"/>
+<rect class="n db" x="230" y="124" width="100" height="12" rx="3"/><text class="t xs mono mid" x="280.0" y="118">r(x) → 1</text>
+<rect class="n db" x="380" y="124" width="100" height="12" rx="3"/><text class="t xs mono mid" x="430.0" y="118">r(x) → 0</text>
+<text class="t sm b end red" x="728" y="72">forbidden</text>
+<text class="t sm b end red" x="728" y="102">forbidden</text>
+<text class="t sm b end red" x="728" y="132">forbidden</text>
+<text class="t sm b end green" x="728" y="162">allowed</text>
+<text class="t sm b end red" x="728" y="192">forbidden</text>
+<text class="t sm b end green" x="728" y="222">allowed</text>
+<text class="t xs" x="20" y="322">P2 reads the new value, then the old one (two replicas at different lag).</text><text class="t xs mute" x="20" y="338">Monotonic reads forbids this; read-your-writes does not cover P2.</text>
+</g>
+<g data-show="4">
+<text class="t sm b" x="20" y="34">D: effect seen before its cause</text>
+<text class="t b" x="20" y="74">P1</text><path class="line faint" d="M80,70 H520"/>
+<rect class="n svc" x="90" y="64" width="90" height="12" rx="3"/><text class="t xs mono mid" x="135.0" y="58">w(q="Lunch?")</text>
+<text class="t b" x="20" y="134">P2</text><path class="line faint" d="M80,130 H520"/>
+<rect class="n db" x="200" y="124" width="80" height="12" rx="3"/><text class="t xs mono mid" x="240.0" y="118">r(q) → Lunch?</text>
+<rect class="n svc" x="300" y="124" width="80" height="12" rx="3"/><text class="t xs mono mid" x="340.0" y="118">w(a="Yes")</text>
+<text class="t b" x="20" y="194">P3</text><path class="line faint" d="M80,190 H520"/>
+<rect class="n db" x="400" y="184" width="50" height="12" rx="3"/><text class="t xs mono mid" x="425.0" y="178">r(a) → Yes</text>
+<rect class="n db" x="470" y="184" width="50" height="12" rx="3"/><text class="t xs mono mid" x="495.0" y="178">r(q) → ∅</text>
+<text class="t sm b end red" x="728" y="72">forbidden</text>
+<text class="t sm b end red" x="728" y="102">forbidden</text>
+<text class="t sm b end red" x="728" y="132">forbidden</text>
+<text class="t sm b end green" x="728" y="162">allowed</text>
+<text class="t sm b end green" x="728" y="192">allowed</text>
+<text class="t sm b end green" x="728" y="222">allowed</text>
+<text class="t xs" x="20" y="322">P3 sees the answer but not the question that caused it.</text><text class="t xs mute" x="20" y="338">Causal forbids it. RYW or monotonic reads alone do not; writes-follow-reads does.</text>
+</g>
+<g data-show="5">
+<text class="t sm b" x="20" y="34">E: concurrent writes, different orders</text>
+<text class="t b" x="20" y="74">P1</text><path class="line faint" d="M80,70 H520"/>
+<rect class="n svc" x="90" y="64" width="100" height="12" rx="3"/><text class="t xs mono mid" x="140.0" y="58">w(x=1)</text>
+<text class="t b" x="20" y="134">P2</text><path class="line faint" d="M80,130 H520"/>
+<rect class="n svc" x="100" y="124" width="100" height="12" rx="3"/><text class="t xs mono mid" x="150.0" y="118">w(x=2)</text>
+<text class="t b" x="20" y="194">P3</text><path class="line faint" d="M80,190 H520"/>
+<rect class="n db" x="240" y="184" width="90" height="12" rx="3"/><text class="t xs mono mid" x="285.0" y="178">r(x) → 1</text>
+<rect class="n db" x="370" y="184" width="90" height="12" rx="3"/><text class="t xs mono mid" x="415.0" y="178">r(x) → 2</text>
+<text class="t b" x="20" y="254">P4</text><path class="line faint" d="M80,250 H520"/>
+<rect class="n db" x="240" y="244" width="90" height="12" rx="3"/><text class="t xs mono mid" x="285.0" y="238">r(x) → 2</text>
+<rect class="n db" x="370" y="244" width="90" height="12" rx="3"/><text class="t xs mono mid" x="415.0" y="238">r(x) → 1</text>
+<text class="t sm b end red" x="728" y="72">forbidden</text>
+<text class="t sm b end red" x="728" y="102">forbidden</text>
+<text class="t sm b end green" x="728" y="132">allowed</text>
+<text class="t sm b end green" x="728" y="162">allowed</text>
+<text class="t sm b end green" x="728" y="192">allowed</text>
+<text class="t sm b end green" x="728" y="222">allowed</text>
+<text class="t xs" x="20" y="322">P1 and P2 write concurrently. P3 and P4 observe them in opposite orders.</text><text class="t xs mute" x="20" y="338">Causal allows it (no causal link); sequential needs one order for all.</text>
+</g>
+
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">A</button><button type="button" data-step="2" aria-pressed="false">B</button><button type="button" data-step="3" aria-pressed="false">C</button><button type="button" data-step="4" aria-pressed="false">D</button><button type="button" data-step="5" aria-pressed="false">E</button></div>
+</div>
+<figcaption><b>Histories and verdicts.</b> Writes are indigo bars, reads green. Weaker models allow more of these histories; linearizability allows none of them. Eventual consistency allows all five, which is exactly why applications built on it need care.</figcaption>
+</figure>
+
+<p>Two things stand out. Among these five, history A is the only difference between linearizability and sequential consistency: real time. And history E is the only difference between sequential and causal: whether everyone must agree on the order of unrelated, concurrent writes. When choosing a model, ask which of these histories would break your product.</p>
+
+<h2 id="implementations">How systems implement each model</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Model</th><th>Typical mechanism</th><th>Cost</th></tr></thead>
+<tbody>
+<tr><th>Linearizable</th><td>A single leader per key range, replicated through consensus (Raft, Paxos). Reads go to the leader, which confirms it is still leader (read index or lease)</td><td>A quorum round trip per write; leader round trip for reads; minority side unavailable in a partition</td></tr>
+<tr><th>Sequential</th><td>Total order broadcast; reads may be served from a replica that has applied a prefix of the log, as long as each client only reads from replicas at least as far along as its own last operation</td><td>Ordering through a leader or sequencer</td></tr>
+<tr><th>Causal</th><td>Track dependencies with version vectors or hybrid logical clocks; apply a write at a replica only after its dependencies</td><td>Metadata per write; delayed visibility; no cross-region wait on the write path</td></tr>
+<tr><th>Read-your-writes</th><td>Read from the leader for a short window after a write, or remember the client's last write position (an LSN, GTID or timestamp) and read only from replicas past it</td><td>Some reads routed to the leader, or a short wait</td></tr>
+<tr><th>Monotonic reads</th><td>Sticky routing: each user always reads from the same replica, or pass the last-seen version and require replicas at least that new</td><td>Uneven load; failover breaks stickiness</td></tr>
+<tr><th>Eventual</th><td>Asynchronous replication with anti-entropy: read repair, hinted handoff, Merkle-tree comparison</td><td>Cheapest; anomalies handled by the application</td></tr>
+</tbody></table></div>
+
+<div class="callout warn">
+<div class="callout-title">Common mistake</div>
+<p>Assuming that quorums (<code>R + W &gt; N</code>) give linearizability. Overlapping quorums guarantee that a read <em>contacts</em> a replica with the latest acknowledged write, but with concurrent writes, sloppy quorums, or a write that failed partway, two successive reads can still return new then old values. Dynamo-style stores need extra steps, such as synchronous read repair, or a consensus protocol like Cassandra's lightweight transactions, to be linearizable.</p>
+</div>
+
+<h3 id="vector-clocks">Vector clocks: detecting concurrency</h3>
+<p>Causal consistency and conflict detection both need to answer one question about two versions: did one happen before the other, or are they concurrent? Physical timestamps cannot answer it, because clocks drift and because "earlier" in wall-clock time does not mean "seen by". A <dfn>vector clock</dfn> can. Each replica keeps a counter per replica. It increments its own entry on every write, and on receiving a version it takes the element-wise maximum. Version <code>a</code> happened before <code>b</code> if every entry of <code>a</code> is at most the matching entry of <code>b</code> and they differ; if neither precedes the other, they are concurrent and must be merged.</p>
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 230" role="img" aria-label="Vector clocks on two replicas: v1 on A is sent to B, which writes v2; A writes v3 without seeing v2; v2 and v3 are concurrent and are merged on B">
+<text class="t b" x="20" y="74">Replica A</text>
+<text class="t b" x="20" y="164">Replica B</text>
+<path class="line faint" d="M100,70 H690"/>
+<path class="line faint" d="M100,160 H690"/>
+<path class="e dash" d="M156,74 L294,154"/>
+<path class="e dash" d="M426,74 L554,154"/>
+<circle class="dot svc" cx="150" cy="70" r="6"/>
+<circle class="dot db" cx="300" cy="160" r="6"/>
+<circle class="dot svc" cx="420" cy="70" r="6"/>
+<circle class="dot accent" cx="560" cy="160" r="6"/>
+<text class="t sm b mid" x="150" y="36">v1 <tspan class="t xs mute">{book}</tspan></text><text class="t xs mono mid" x="150" y="54">{A:1}</text>
+<text class="t sm b mid" x="300" y="186">v2</text><text class="t xs mono mid" x="300" y="202">{A:1, B:1}</text>
+<text class="t xs mute mid" x="300" y="218">{book, lamp}</text>
+<text class="t sm b mid" x="420" y="36">v3 <tspan class="t xs mute">{book, pen}</tspan></text><text class="t xs mono mid" x="420" y="54">{A:2}</text>
+<text class="t sm b accent mid" x="560" y="186">merge</text><text class="t xs mono mid" x="560" y="202">{A:2, B:2}</text>
+<text class="t xs mute mid" x="560" y="218">{book, lamp, pen}</text>
+<text class="t xs mute" x="584" y="112">v2 and v3 are</text>
+<text class="t xs red" x="584" y="127">concurrent:</text>
+<text class="t xs mute" x="584" y="142">neither dominates</text>
+</svg>
+</div>
+<figcaption><b>Concurrency, detected.</b> v1 precedes both v2 and v3, because both clocks dominate {A:1}. But {A:1, B:1} and {A:2} are incomparable (B is ahead in one entry, A in the other), so the store keeps both and merges them instead of silently dropping one.</figcaption>
+</figure>
+<pre><code class="language-python">def happened_before(a, b):
+    """True if the event with clock a causally precedes the event with clock b."""
+    keys = a.keys() | b.keys()
+    return a != b and all(a.get(k, 0) &lt;= b.get(k, 0) for k in keys)
+
+
+def compare(a, b):
+    if happened_before(a, b):
+        return "before"
+    if happened_before(b, a):
+        return "after"
+    return "equal" if a == b else "concurrent"
+
+
+class Replica:
+    def __init__(self, name):
+        self.name, self.clock = name, {}
+
+    def local_write(self):
+        self.clock[self.name] = self.clock.get(self.name, 0) + 1
+        return dict(self.clock)          # the version stamped on this write
+
+    def receive(self, remote_clock):
+        for k, v in remote_clock.items():   # element-wise max, then count the receive
+            self.clock[k] = max(self.clock.get(k, 0), v)
+        return self.local_write()
+
+
+a, b = Replica("A"), Replica("B")
+v1 = a.local_write()       # cart = {book}           on A
+v2 = b.receive(v1)         # B sees v1, adds a lamp
+v3 = a.local_write()       # A adds a pen without having seen v2
+
+print("v1", v1, "v2", v2, "v3", v3)
+print("v1 vs v2:", compare(v1, v2))
+print("v1 vs v3:", compare(v1, v3))
+print("v2 vs v3:", compare(v2, v3))
+
+# v1 {'A': 1} v2 {'A': 1, 'B': 1} v3 {'A': 2}
+# v1 vs v2: before
+# v1 vs v3: before
+# v2 vs v3: concurrent</code></pre>
+<p>Both v2 and v3 descend from v1, so either may safely overwrite v1. But v2 and v3 are concurrent: a store using last-writer-wins would silently drop the lamp or the pen. A store using vector clocks keeps both as <em>siblings</em> and lets the application merge them (here, a set union gives <code>{book, lamp, pen}</code>). Dynamo and Riak use this approach. Vector clocks grow with the number of writers, so practical systems bound them: Dynamo truncated old entries, Riak moved to dotted version vectors keyed by replica rather than by client.</p>
+
+<h2 id="cost">The cost of strong consistency</h2>
+<p>Every model above causal requires coordination on the operation path (for sequential consistency, either reads or writes can be local, but not both), and the price is set by the distance to the replicas that must agree:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Replica placement</th><th class="num">Quorum round trip per write</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><th>One zone</th><td class="num">~0.5 ms</td><td>Negligible next to disk fsync</td></tr>
+<tr><th>Three zones in one region</th><td class="num">~1 to 2 ms</td><td>The normal choice for linearizable stores such as etcd</td></tr>
+<tr><th>Three regions on one continent</th><td class="num">~10 to 70 ms</td><td>Noticeable; fine for low-rate writes</td></tr>
+<tr><th>Three regions on different continents</th><td class="num">~70 to 150 ms</td><td>Every write waits for the nearest other region; cross-continent sequential writes become slow</td></tr>
+</tbody></table></div>
+<p>Linearizable reads usually cost too: the leader must confirm it is still the leader, either with a quorum round trip or with a time-based lease that assumes bounded clock drift. Weaker models avoid this entirely by answering from the local replica. That gap of tens of milliseconds per operation, multiplied by every operation on a request path, is why so many systems choose causal or session guarantees for most data and reserve linearizability for the few operations that need it. This per-request trade-off is PACELC's "else" branch.</p>
+
+<h2 id="choosing">Choosing a model: a worked example</h2>
+<p>A social app has profiles, posts, comments, like counts and usernames. Pick the cheapest model per data type that keeps the product correct:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Data</th><th>What must not happen</th><th>Model</th><th>Mechanism</th></tr></thead>
+<tbody>
+<tr><th>Username registration</th><td>Two users with the same name</td><td class="no">Linearizable</td><td>Conditional write on a consensus-backed store</td></tr>
+<tr><th>Own profile edits</th><td>Seeing your old photo after saving</td><td class="meh">Read-your-writes</td><td>Route the editor's reads to the leader for 10 seconds after a write</td></tr>
+<tr><th>Comment threads</th><td>A reply visible before the comment it answers</td><td class="meh">Causal</td><td>Dependency tracking per write</td></tr>
+<tr><th>Feed scrolling</th><td>Posts disappearing on refresh</td><td class="meh">Monotonic reads</td><td>Sticky replica per user session</td></tr>
+<tr><th>Like counts</th><td>Nothing serious: a count off by a few for seconds</td><td class="yes">Eventual</td><td>CRDT counter or async aggregation</td></tr>
+</tbody></table></div>
+<p>Only one row needs the expensive model. Saying this out loud, per data type, is the strongest answer to "what consistency does your design need?"</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+<li><strong>Google Spanner</strong> provides external consistency (strict serializability) across the globe, using TrueTime's bounded clock uncertainty to commit-wait out the ambiguity, typically a few milliseconds.</li>
+<li><strong>Amazon DynamoDB</strong> defaults to eventually consistent reads and offers strongly consistent reads per request within a region, at twice the read capacity cost.</li>
+<li><strong>Azure Cosmos DB</strong> exposes five named levels: strong, bounded staleness, session, consistent prefix and eventual. Session (read-your-writes and monotonic reads within a session token) is the default.</li>
+<li><strong>MongoDB</strong> offers causally consistent client sessions since version 3.6, and linearizable reads through a read concern on the primary.</li>
+<li><strong>Cassandra</strong> lets each request choose a consistency level (ONE, QUORUM, ALL and local variants) and uses Paxos-based lightweight transactions when linearizable compare-and-set is needed.</li>
+<li><strong>Jepsen</strong> analyses have found many databases violating their documented consistency claims under partitions and clock faults, a reminder to test the guarantee rather than trust the label.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>Whenever you add replicas, caches or regions. Name the model per data type, as in the worked example, and the mechanism that provides it. In particular, call out read-your-writes for any flow where a user edits something and then views it.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>"A user updates their profile and sees the old version. Why, and how do you fix it?" Replica lag; read-your-writes via leader reads or a last-write token.</li>
+<li>"What is the difference between linearizable and serializable?" Single object and real time versus transactions and any order; strict serializability is both.</li>
+<li>"Does a quorum give strong consistency?" Not by itself; explain why.</li>
+<li>"How do you detect concurrent writes?" Version vectors, and what to do with siblings.</li>
+<li>"What does linearizability cost across regions?" A cross-region round trip per write, with numbers.</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>Saying "strong consistency" without defining it, or using it for everything.</li>
+<li>Using wall-clock timestamps to decide which concurrent write wins without acknowledging lost writes and clock skew.</li>
+<li>Confusing consistency models with ACID consistency or isolation levels.</li>
+<li>Treating "eventually consistent" as "consistent after a short delay" without saying what users see in the meantime.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://doi.org/10.1145/78969.78972" target="_blank" rel="noopener">Linearizability: A Correctness Condition for Concurrent Objects</a><span>Maurice Herlihy and Jeannette Wing, ACM TOPLAS, 1990. The definition of linearizability.</span></li>
+<li><a href="https://lamport.azurewebsites.net/pubs/time-clocks.pdf" target="_blank" rel="noopener">Time, Clocks, and the Ordering of Events in a Distributed System</a><span>Leslie Lamport, CACM, 1978. Happened-before and logical clocks, the basis of causal consistency.</span></li>
+<li><a href="https://doi.org/10.1109/PDIS.1994.331722" target="_blank" rel="noopener">Session Guarantees for Weakly Consistent Replicated Data</a><span>Douglas Terry et al., PDIS 1994. Read-your-writes, monotonic reads, monotonic writes and writes-follow-reads.</span></li>
+<li><a href="https://jepsen.io/consistency" target="_blank" rel="noopener">Jepsen: Consistency Models</a><span>Kyle Kingsbury. A clickable map of consistency and isolation models with precise definitions and the anomalies each prevents.</span></li>
+</ul>

@@ -1,0 +1,401 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">"Is the system fast and up?" sounds like two yes-or-no questions. In practice both are distributions. A checkout API with an average latency of 50 ms can still make one customer in a hundred wait half a second, and a service that is "up" can fail 1% of requests for a whole afternoon. Interviewers want to hear you talk about these qualities in numbers: percentiles, utilisation, nines and error budgets.</p>
+<p>This chapter defines the vocabulary precisely, then covers the four mechanisms that matter most in design discussions: Little's law, tail latency and fan-out, queueing near full utilisation, and how availability composes across components. It ends with how teams turn all of this into targets they can operate against.</p>
+
+<h2 id="definitions">Latency, throughput and bandwidth</h2>
+<div class="defs">
+<div><h4>Latency</h4><p>The time one operation takes, from the moment it is issued until the result arrives. Usually measured in milliseconds at the client or the server. A distribution, never a single number.</p></div>
+<div><h4>Throughput</h4><p>How many operations complete per unit of time: requests per second, messages per second, MB per second. A rate.</p></div>
+<div><h4>Bandwidth</h4><p>The maximum throughput a channel can carry, such as a 10 Gbps link. Throughput is what you actually achieve.</p></div>
+<div><h4>Service time vs response time</h4><p>Service time is the work itself. Response time is service time plus time spent waiting in queues. Under load, waiting usually dominates.</p></div>
+</div>
+<p>Latency and throughput are related but not opposites. Batching raises throughput and also raises latency, because items wait for the batch to fill. Adding parallel servers raises throughput without changing the latency of one request. And a system near its throughput limit has terrible latency, which the queueing section explains. A useful image is a highway: latency is how long one trip takes, throughput is how many cars pass per hour, bandwidth is the number of lanes.</p>
+
+<h2 id="littles-law">Little's law</h2>
+<p><dfn>Little's law</dfn> says that in any stable system, the average number of items inside equals the arrival rate times the average time each item spends inside:</p>
+<div class="calc">L = λ × W
+
+L   average number in the system (in-flight requests, queue length, open connections)
+λ   average arrival rate (requests per second)
+W   average time in the system (seconds)</div>
+<p>It needs no assumptions about distributions, which makes it the most useful formula in capacity planning. Three typical uses:</p>
+<div class="calc">In flight     2,000 req/s × 0.050 s                  = <span class="r">100</span> concurrent requests
+DB pool       2,000 req/s × 0.010 s holding a connection = <span class="r">20</span> connections busy on average
+Max rate      pool of 50 connections ÷ 0.010 s each      = <span class="r">5,000</span> req/s before requests queue</div>
+<p>The third line runs the law backwards: a fixed concurrency limit divided by latency caps throughput. That is why a slow downstream dependency reduces throughput even when CPU is idle. If database calls slow from 10 ms to 100 ms, the same 50-connection pool now supports only 500 requests per second, and everything beyond that waits. Thread pools, connection pools and in-flight request limits all behave this way.</p>
+
+<h2 id="percentiles">Percentiles and tail latency</h2>
+<p>Latency distributions are skewed: most requests are fast, and a long tail is slow because of garbage-collection pauses, cache misses, lock waits, retries and noisy neighbours. The mean hides this. A <dfn>percentile</dfn> answers the question users care about: "how slow is it for the unlucky ones?" The p99 is the latency that 99% of requests beat and 1% exceed.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 300" role="img" aria-label="Histogram of 100,000 request latencies: median 41 ms, p95 102 ms, p99 423 ms, with a small slow tail between 250 and 600 ms magnified 50 times">
+<rect x="60.5" y="247.8" width="11.8" height="2.2" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="73.3" y="177.0" width="11.8" height="73.0" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="86.1" y="63.5" width="11.8" height="186.5" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="98.9" y="50.0" width="11.8" height="200.0" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="111.7" y="88.1" width="11.8" height="161.9" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="124.5" y="141.9" width="11.8" height="108.1" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="137.3" y="179.0" width="11.8" height="71.0" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="150.1" y="206.1" width="11.8" height="43.9" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="162.9" y="221.6" width="11.8" height="28.4" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="175.7" y="232.5" width="11.8" height="17.5" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="188.5" y="238.4" width="11.8" height="11.6" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="201.3" y="242.9" width="11.8" height="7.1" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="214.1" y="245.6" width="11.8" height="4.4" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="226.9" y="247.1" width="11.8" height="2.9" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="239.7" y="248.2" width="11.8" height="1.8" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="252.5" y="248.8" width="11.8" height="1.2" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="265.3" y="249.3" width="11.8" height="0.7" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="278.1" y="249.5" width="11.8" height="0.5" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="290.9" y="249.6" width="11.8" height="0.4" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="303.7" y="249.7" width="11.8" height="0.3" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="316.5" y="249.9" width="11.8" height="0.1" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="329.3" y="249.9" width="11.8" height="0.1" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="342.1" y="249.9" width="11.8" height="0.1" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="354.9" y="250.0" width="11.8" height="0.0" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="367.7" y="250.0" width="11.8" height="0.0" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="380.5" y="249.6" width="11.8" height="0.4" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="393.3" y="249.5" width="11.8" height="0.5" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="406.1" y="249.4" width="11.8" height="0.6" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="418.9" y="249.3" width="11.8" height="0.7" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="431.7" y="249.5" width="11.8" height="0.5" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="444.5" y="249.4" width="11.8" height="0.6" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="457.3" y="249.5" width="11.8" height="0.5" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="470.1" y="249.5" width="11.8" height="0.5" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="482.9" y="249.5" width="11.8" height="0.5" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="495.7" y="249.5" width="11.8" height="0.5" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="508.5" y="249.4" width="11.8" height="0.6" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="521.3" y="249.5" width="11.8" height="0.5" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="534.1" y="249.5" width="11.8" height="0.5" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="546.9" y="249.4" width="11.8" height="0.6" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="559.7" y="249.4" width="11.8" height="0.6" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="572.5" y="249.4" width="11.8" height="0.6" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="585.3" y="249.5" width="11.8" height="0.5" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="598.1" y="249.4" width="11.8" height="0.6" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="610.9" y="249.5" width="11.8" height="0.5" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="623.7" y="249.4" width="11.8" height="0.6" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="636.5" y="249.5" width="11.8" height="0.5" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="649.3" y="249.5" width="11.8" height="0.5" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="662.1" y="249.5" width="11.8" height="0.5" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="674.9" y="249.5" width="11.8" height="0.5" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="687.7" y="249.5" width="11.8" height="0.5" style="fill:var(--d-svc-s);opacity:.55"/>
+<rect x="252.5" y="192.0" width="11.8" height="58.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="265.3" y="215.1" width="11.8" height="34.9" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="278.1" y="223.1" width="11.8" height="26.9" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="290.9" y="229.3" width="11.8" height="20.7" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="303.7" y="236.3" width="11.8" height="13.7" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="316.5" y="244.3" width="11.8" height="5.7" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="329.3" y="244.3" width="11.8" height="5.7" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="342.1" y="247.2" width="11.8" height="2.8" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="354.9" y="247.6" width="11.8" height="2.4" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="367.7" y="249.1" width="11.8" height="0.9" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="380.5" y="228.8" width="11.8" height="21.2" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="393.3" y="223.6" width="11.8" height="26.4" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="406.1" y="220.3" width="11.8" height="29.7" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="418.9" y="216.5" width="11.8" height="33.5" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="431.7" y="225.0" width="11.8" height="25.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="444.5" y="220.8" width="11.8" height="29.2" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="457.3" y="224.1" width="11.8" height="25.9" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="470.1" y="226.4" width="11.8" height="23.6" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="482.9" y="224.5" width="11.8" height="25.5" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="495.7" y="225.0" width="11.8" height="25.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="508.5" y="219.4" width="11.8" height="30.6" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="521.3" y="223.6" width="11.8" height="26.4" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="534.1" y="224.5" width="11.8" height="25.5" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="546.9" y="219.4" width="11.8" height="30.6" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="559.7" y="219.8" width="11.8" height="30.2" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="572.5" y="221.7" width="11.8" height="28.3" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="585.3" y="222.7" width="11.8" height="27.3" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="598.1" y="218.4" width="11.8" height="31.6" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="610.9" y="223.1" width="11.8" height="26.9" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="623.7" y="220.3" width="11.8" height="29.7" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="636.5" y="226.9" width="11.8" height="23.1" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="649.3" y="225.5" width="11.8" height="24.5" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="662.1" y="226.0" width="11.8" height="24.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="674.9" y="226.0" width="11.8" height="24.0" style="fill:var(--d-queue-s);opacity:.55"/>
+<rect x="687.7" y="225.5" width="11.8" height="24.5" style="fill:var(--d-queue-s);opacity:.55"/>
+<path class="line" d="M60,250 H700"/>
+<path class="line" d="M60.0,250 V255"/><text class="t xs mono mute mid" x="60.0" y="268">0 ms</text>
+<path class="line" d="M188.0,250 V255"/><text class="t xs mono mute mid" x="188.0" y="268">100 ms</text>
+<path class="line" d="M316.0,250 V255"/><text class="t xs mono mute mid" x="316.0" y="268">200 ms</text>
+<path class="line" d="M444.0,250 V255"/><text class="t xs mono mute mid" x="444.0" y="268">300 ms</text>
+<path class="line" d="M572.0,250 V255"/><text class="t xs mono mute mid" x="572.0" y="268">400 ms</text>
+<path class="line" d="M700.0,250 V255"/><text class="t xs mono mute mid" x="700.0" y="268">500 ms</text>
+<path class="line" d="M111.9,250 V40" style="stroke:var(--accent);stroke-dasharray:4 3"/>
+<text class="t xs b accent mid" x="111.9" y="32">p50 41 ms</text>
+<path class="line" d="M190.8,250 V40" style="stroke:var(--accent);stroke-dasharray:4 3"/>
+<text class="t xs b accent mid" x="190.8" y="32">p95 102 ms</text>
+<path class="line" d="M601.3,250 V40" style="stroke:var(--d-red);stroke-dasharray:4 3"/>
+<text class="t xs b red mid" x="601.3" y="32">p99 423 ms</text>
+<text class="t xs mute" x="300" y="196">bins above 150 ms magnified ×50</text>
+<text class="t xs mute mid" x="380" y="290">latency per request</text>
+</svg>
+</div>
+<figcaption><b>One distribution, three very different numbers.</b> 100,000 simulated requests: 98% roughly log-normal around 40 ms, 2% hit a slow path (a GC pause or a retry) taking 250 to 600 ms. The mean is 53 ms and the p95 is 102 ms, yet the p99 is 423 ms. That tail is invisible on a linear axis, so it is magnified here.</figcaption>
+</figure>
+
+<ul>
+<li><strong>p50 (median)</strong> describes the typical request. Good for spotting regressions in the common path.</li>
+<li><strong>p95 and p99</strong> describe the experience of the unlucky. For a user making 100 requests during a session, hitting the p99 at least once is more likely than not.</li>
+<li><strong>p99.9 and max</strong> matter for high-volume or high-value paths, and for systems where one slow call blocks a whole batch.</li>
+</ul>
+<div class="callout warn">
+<div class="callout-title">Common mistake</div>
+<p>Averaging percentiles. The p99 of a fleet is not the average of each server's p99, and you cannot compute a daily p99 from 1,440 per-minute p99 values. Percentiles must be computed from the underlying data or from mergeable histograms (HdrHistogram, t-digest, Prometheus histograms). Also measure latency at the client when you can: a server-side timer misses time spent waiting in its own accept queue.</p>
+</div>
+
+<h3 id="tail-at-scale">The tail at scale: why p99 dominates fan-out</h3>
+<p>Many requests fan out: a search query hits 100 index shards, a page renders from 30 microservice calls, a timeline is hydrated from 20 cache lookups. The request is only as fast as its slowest call. If each call independently has probability <code>p</code> of being slow, the chance that at least one of <code>N</code> calls is slow is</p>
+<div class="calc">P(at least one slow) = 1 - (1 - p)^N
+
+p = 1%   N = 1    →  1.0%
+p = 1%   N = 10   →  9.6%
+p = 1%   N = 100  →  <span class="r">63.4%</span></div>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 700 310" role="img" aria-label="Probability that a request sees at least one slow call versus fan-out: with a 1 percent slow rate it reaches 63 percent at 100 calls; with 0.1 percent it reaches 9.5 percent">
+<path class="line faint" d="M70,260.0 H630"/><text class="t xs mono mute end" x="62" y="264.0">0%</text>
+<path class="line faint" d="M70,207.5 H630"/><text class="t xs mono mute end" x="62" y="211.5">25%</text>
+<path class="line faint" d="M70,155.0 H630"/><text class="t xs mono mute end" x="62" y="159.0">50%</text>
+<path class="line faint" d="M70,102.5 H630"/><text class="t xs mono mute end" x="62" y="106.5">75%</text>
+<path class="line faint" d="M70,50.0 H630"/><text class="t xs mono mute end" x="62" y="54.0">100%</text>
+<text class="t xs mono mute mid" x="70.0" y="278">0</text>
+<text class="t xs mono mute mid" x="182.0" y="278">20</text>
+<text class="t xs mono mute mid" x="294.0" y="278">40</text>
+<text class="t xs mono mute mid" x="406.0" y="278">60</text>
+<text class="t xs mono mute mid" x="518.0" y="278">80</text>
+<text class="t xs mono mute mid" x="630.0" y="278">100</text>
+<path class="line" d="M70,260 H630 M70,260 V50.0"/>
+<polyline points="75.6,257.9 81.2,255.8 86.8,253.8 92.4,251.7 98.0,249.7 103.6,247.7 109.2,245.7 114.8,243.8 120.4,241.8 126.0,239.9 131.6,238.0 137.2,236.1 142.8,234.3 148.4,232.4 154.0,230.6 159.6,228.8 165.2,227.0 170.8,225.2 176.4,223.5 182.0,221.8 187.6,220.0 193.2,218.3 198.8,216.7 204.4,215.0 210.0,213.3 215.6,211.7 221.2,210.1 226.8,208.5 232.4,206.9 238.0,205.3 243.6,203.8 249.2,202.2 254.8,200.7 260.4,199.2 266.0,197.7 271.6,196.2 277.2,194.8 282.8,193.3 288.4,191.9 294.0,190.5 299.6,189.1 305.2,187.7 310.8,186.3 316.4,184.9 322.0,183.6 327.6,182.3 333.2,180.9 338.8,179.6 344.4,178.3 350.0,177.1 355.6,175.8 361.2,174.5 366.8,173.3 372.4,172.0 378.0,170.8 383.6,169.6 389.2,168.4 394.8,167.2 400.4,166.1 406.0,164.9 411.6,163.8 417.2,162.6 422.8,161.5 428.4,160.4 434.0,159.3 439.6,158.2 445.2,157.1 450.8,156.0 456.4,155.0 462.0,153.9 467.6,152.9 473.2,151.8 478.8,150.8 484.4,149.8 490.0,148.8 495.6,147.8 501.2,146.9 506.8,145.9 512.4,144.9 518.0,144.0 523.6,143.0 529.2,142.1 534.8,141.2 540.4,140.3 546.0,139.4 551.6,138.5 557.2,137.6 562.8,136.7 568.4,135.9 574.0,135.0 579.6,134.1 585.2,133.3 590.8,132.5 596.4,131.6 602.0,130.8 607.6,130.0 613.2,129.2 618.8,128.4 624.4,127.6 630.0,126.9" style="fill:none;stroke:var(--d-red);stroke-width:2.5"/>
+<polyline points="75.6,259.8 81.2,259.6 86.8,259.4 92.4,259.2 98.0,259.0 103.6,258.7 109.2,258.5 114.8,258.3 120.4,258.1 126.0,257.9 131.6,257.7 137.2,257.5 142.8,257.3 148.4,257.1 154.0,256.9 159.6,256.7 165.2,256.5 170.8,256.3 176.4,256.0 182.0,255.8 187.6,255.6 193.2,255.4 198.8,255.2 204.4,255.0 210.0,254.8 215.6,254.6 221.2,254.4 226.8,254.2 232.4,254.0 238.0,253.8 243.6,253.6 249.2,253.4 254.8,253.2 260.4,253.0 266.0,252.8 271.6,252.6 277.2,252.4 282.8,252.2 288.4,252.0 294.0,251.8 299.6,251.6 305.2,251.4 310.8,251.2 316.4,251.0 322.0,250.8 327.6,250.6 333.2,250.4 338.8,250.2 344.4,250.0 350.0,249.8 355.6,249.6 361.2,249.4 366.8,249.2 372.4,249.0 378.0,248.8 383.6,248.6 389.2,248.4 394.8,248.2 400.4,248.0 406.0,247.8 411.6,247.6 417.2,247.4 422.8,247.2 428.4,247.0 434.0,246.8 439.6,246.6 445.2,246.4 450.8,246.2 456.4,246.0 462.0,245.8 467.6,245.6 473.2,245.4 478.8,245.2 484.4,245.0 490.0,244.8 495.6,244.6 501.2,244.4 506.8,244.2 512.4,244.0 518.0,243.8 523.6,243.7 529.2,243.5 534.8,243.3 540.4,243.1 546.0,242.9 551.6,242.7 557.2,242.5 562.8,242.3 568.4,242.1 574.0,241.9 579.6,241.7 585.2,241.5 590.8,241.3 596.4,241.2 602.0,241.0 607.6,240.8 613.2,240.6 618.8,240.4 624.4,240.2 630.0,240.0" style="fill:none;stroke:var(--accent);stroke-width:2.5"/>
+
+<text class="t xs b red end" x="626" y="115">each call 1% slow: 63.4% at N = 100</text>
+<text class="t xs b accent end" x="626" y="230">each call 0.1% slow: 9.5% at N = 100</text>
+<text class="t xs mute mid" x="350" y="296">calls per request (fan-out N)</text>
+<text class="t xs mute" x="20" y="38">requests that hit a slow call</text>
+</svg>
+</div>
+<figcaption><b>Fan-out turns a backend's p99 into the user's median.</b> With 100 parallel calls, a 1-in-100 slow event in each backend makes almost two thirds of user requests slow. Cutting each backend's slow rate to 1 in 1,000 brings it down to under 10%.</figcaption>
+</figure>
+
+<p>This is the central point of Dean and Barroso's "The Tail at Scale": in large fan-out systems, rare per-server hiccups become the common case for users, and you cannot fix them by making servers faster on average. Techniques that work:</p>
+<ul>
+<li><strong>Hedged requests.</strong> Send the request to one replica; if no answer arrives within, say, the p95, send it to a second replica and use whichever answers first. Costs a few percent extra load and cuts the tail dramatically.</li>
+<li><strong>Tied requests.</strong> Enqueue on two servers at once, and let the first to start processing cancel the other.</li>
+<li><strong>Reduce fan-out.</strong> Fewer, larger shards; batch lookups; precompute.</li>
+<li><strong>Return partial results</strong> when some shards miss the deadline, if the product allows it (search results usually can).</li>
+<li><strong>Set deadlines and propagate them,</strong> so work for an already-abandoned request stops. See <a href="fault-tolerance.html">Timeouts, Retries &amp; Circuit Breakers</a>.</li>
+</ul>
+
+<h2 id="queueing">Queueing: why latency explodes near 100% utilisation</h2>
+<p>A server busy 50% of the time often finds a request waiting when it finishes another; at 90% it almost always does, and the queue keeps growing during every burst. The simplest model, the <dfn>M/M/1 queue</dfn> (random arrivals, random service times, one server), gives a closed form for the mean response time:</p>
+<div class="calc">W = S / (1 - ρ)
+
+S   mean service time (the work itself)
+ρ   utilisation = arrival rate / service rate   (must be below 1)
+
+ρ = 50%  →  W = 2 S        ρ = 90%  →  W = 10 S
+ρ = 80%  →  W = 5 S        ρ = 95%  →  W = 20 S</div>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 700 318" role="img" aria-label="Mean response time as a multiple of service time versus utilisation for an M/M/1 queue: 2 times at 50 percent, 5 times at 80, 10 times at 90 and 20 times at 95">
+<path class="line faint" d="M70,270.0 H630"/><text class="t xs mono mute end" x="62" y="274.0">0x</text>
+<path class="line faint" d="M70,212.5 H630"/><text class="t xs mono mute end" x="62" y="216.5">5x</text>
+<path class="line faint" d="M70,155.0 H630"/><text class="t xs mono mute end" x="62" y="159.0">10x</text>
+<path class="line faint" d="M70,97.5 H630"/><text class="t xs mono mute end" x="62" y="101.5">15x</text>
+<path class="line faint" d="M70,40.0 H630"/><text class="t xs mono mute end" x="62" y="44.0">20x</text>
+<text class="t xs mono mute mid" x="70.0" y="288">0%</text>
+<text class="t xs mono mute mid" x="182.0" y="288">20%</text>
+<text class="t xs mono mute mid" x="294.0" y="288">40%</text>
+<text class="t xs mono mute mid" x="406.0" y="288">60%</text>
+<text class="t xs mono mute mid" x="518.0" y="288">80%</text>
+<text class="t xs mono mute mid" x="630.0" y="288">100%</text>
+<path class="line" d="M70,270 H630 M70,270 V40.0"/>
+<polyline points="70.0,258.5 72.8,258.4 75.6,258.4 78.4,258.3 81.2,258.3 84.0,258.2 86.8,258.1 89.6,258.1 92.4,258.0 95.2,258.0 98.0,257.9 100.8,257.8 103.6,257.8 106.4,257.7 109.2,257.6 112.0,257.6 114.8,257.5 117.6,257.4 120.4,257.4 123.2,257.3 126.0,257.2 128.8,257.2 131.6,257.1 134.4,257.0 137.2,256.9 140.0,256.9 142.8,256.8 145.6,256.7 148.4,256.6 151.2,256.5 154.0,256.5 156.8,256.4 159.6,256.3 162.4,256.2 165.2,256.1 168.0,256.1 170.8,256.0 173.6,255.9 176.4,255.8 179.2,255.7 182.0,255.6 184.8,255.5 187.6,255.4 190.4,255.4 193.2,255.3 196.0,255.2 198.8,255.1 201.6,255.0 204.4,254.9 207.2,254.8 210.0,254.7 212.8,254.6 215.6,254.5 218.4,254.4 221.2,254.2 224.0,254.1 226.8,254.0 229.6,253.9 232.4,253.8 235.2,253.7 238.0,253.6 240.8,253.5 243.6,253.3 246.4,253.2 249.2,253.1 252.0,253.0 254.8,252.8 257.6,252.7 260.4,252.6 263.2,252.4 266.0,252.3 268.8,252.2 271.6,252.0 274.4,251.9 277.2,251.7 280.0,251.6 282.8,251.5 285.6,251.3 288.4,251.1 291.2,251.0 294.0,250.8 296.8,250.7 299.6,250.5 302.4,250.3 305.2,250.2 308.0,250.0 310.8,249.8 313.6,249.6 316.4,249.5 319.2,249.3 322.0,249.1 324.8,248.9 327.6,248.7 330.4,248.5 333.2,248.3 336.0,248.1 338.8,247.9 341.6,247.7 344.4,247.5 347.2,247.2 350.0,247.0 352.8,246.8 355.6,246.5 358.4,246.3 361.2,246.0 364.0,245.8 366.8,245.5 369.6,245.3 372.4,245.0 375.2,244.7 378.0,244.4 380.8,244.2 383.6,243.9 386.4,243.6 389.2,243.3 392.0,242.9 394.8,242.6 397.6,242.3 400.4,242.0 403.2,241.6 406.0,241.2 408.8,240.9 411.6,240.5 414.4,240.1 417.2,239.7 420.0,239.3 422.8,238.9 425.6,238.5 428.4,238.1 431.2,237.6 434.0,237.1 436.8,236.7 439.6,236.2 442.4,235.7 445.2,235.2 448.0,234.6 450.8,234.1 453.6,233.5 456.4,232.9 459.2,232.3 462.0,231.7 464.8,231.0 467.6,230.3 470.4,229.6 473.2,228.9 476.0,228.2 478.8,227.4 481.6,226.6 484.4,225.8 487.2,224.9 490.0,224.0 492.8,223.1 495.6,222.1 498.4,221.1 501.2,220.0 504.0,218.9 506.8,217.7 509.6,216.5 512.4,215.2 515.2,213.9 518.0,212.5 520.8,211.0 523.6,209.5 526.4,207.8 529.2,206.1 532.0,204.3 534.8,202.4 537.6,200.3 540.4,198.1 543.2,195.8 546.0,193.3 548.8,190.7 551.6,187.9 554.4,184.8 557.2,181.5 560.0,178.0 562.8,174.2 565.6,170.0 568.4,165.5 571.2,160.5 574.0,155.0 576.8,148.9 579.6,142.2 582.4,134.7 585.2,126.2 588.0,116.7 590.8,105.7 593.6,93.1 596.4,78.3 599.2,60.9 602.0,40.0" style="fill:none;stroke:var(--accent);stroke-width:2.5"/>
+<circle class="dot accent" cx="350.0" cy="247.0" r="4"/>
+<circle class="dot accent" cx="518.0" cy="212.5" r="4"/>
+<circle class="dot accent" cx="574.0" cy="155.0" r="4"/>
+<circle class="dot accent" cx="602.0" cy="40.0" r="4"/>
+
+<text class="t xs b end" x="342" y="235">50%: 2x</text>
+<text class="t xs b end" x="510" y="205">80%: 5x</text>
+<text class="t xs b end" x="566" y="150">90%: 10x</text>
+<text class="t xs b end" x="594" y="56">95%: 20x</text>
+<text class="t xs mute mid" x="350" y="308">utilisation ρ</text>
+<text class="t xs mute" x="20" y="28">response time / service time</text>
+</svg>
+</div>
+<figcaption><b>The hockey stick.</b> Drawn to scale from W = S / (1 - ρ). Going from 50% to 80% utilisation multiplies response time by 2.5; going from 90% to 95% doubles it again. Real servers differ in detail, but every queueing system has this shape.</figcaption>
+</figure>
+
+<p>Three practical consequences:</p>
+<ul>
+<li><strong>Do not plan for 100%.</strong> Target 50% to 70% steady-state utilisation on latency-sensitive tiers. The "wasted" capacity is what keeps the queue short during bursts.</li>
+<li><strong>The tail is worse than the mean.</strong> In M/M/1, response time is exponentially distributed, so the p99 is about 4.6 times the mean: at 90% utilisation the p99 is about 46 times the bare service time.</li>
+<li><strong>Small load changes cause large latency changes near the knee.</strong> A 5% traffic increase at 90% utilisation adds far more latency than the same increase at 50%, which is why latency alerts often fire long before CPU alerts. Queues that grow without bound are why systems need load shedding and backpressure.</li>
+</ul>
+
+<h2 id="availability">Availability and the nines</h2>
+<p><dfn>Availability</dfn> is the fraction of time, or of requests, for which the system works correctly. Modern teams usually measure it per request (<code>good requests / total requests</code>) rather than per minute of uptime, because a partial outage that fails 10% of requests is invisible to a ping check but very visible to users. It is quoted in "nines":</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Availability</th><th class="num">Downtime per year</th><th class="num">Per 30-day month</th><th class="num">Per day</th><th>Typical of</th></tr></thead>
+<tbody>
+<tr><th>99% (two nines)</th><td class="num">3.65 days</td><td class="num">7.2 hours</td><td class="num">14.4 min</td><td>Internal tools, batch systems</td></tr>
+<tr><th>99.9% (three nines)</th><td class="num">8.76 hours</td><td class="num">43.2 min</td><td class="num">1.44 min</td><td>Many SaaS products and single-region cloud services</td></tr>
+<tr><th>99.95%</th><td class="num">4.38 hours</td><td class="num">21.6 min</td><td class="num">43.2 s</td><td>Common cloud SLA tier</td></tr>
+<tr><th>99.99% (four nines)</th><td class="num">52.6 min</td><td class="num">4.32 min</td><td class="num">8.64 s</td><td>Payment and core platform services; usually needs multi-zone redundancy</td></tr>
+<tr><th>99.999% (five nines)</th><td class="num">5.26 min</td><td class="num">25.9 s</td><td class="num">0.86 s</td><td>Telecom, critical infrastructure; needs automated failover everywhere</td></tr>
+</tbody></table></div>
+<p>Each extra nine is ten times harder and usually much more than ten times as expensive. At four nines you have 4.3 minutes a month: no human can be paged, log in and fix anything in that time, so recovery must be automatic. A design claiming five nines should explain how every failure, including deploys and configuration changes, is handled without an operator.</p>
+
+<h3 id="composing">Composing availability: series and parallel</h3>
+<p>When a request needs every component in a chain, the components are in <dfn>series</dfn> and their availabilities multiply. When any one of several redundant components can serve the request, they are in <dfn>parallel</dfn> and their <em>unavailabilities</em> multiply.</p>
+<div class="calc">Series     A = A₁ × A₂ × ... × Aₙ                 (never above the weakest part)
+Parallel   A = 1 - (1 - A₁)(1 - A₂)...(1 - Aₙ)    (never below the strongest part)</div>
+
+<figure class="fig wide">
+<div class="fig-frame">
+<svg viewBox="0 0 760 330" role="img" aria-label="Series chain of load balancer 99.99, app 99.9 and database 99.95 percent gives 99.84 percent; with three app instances at 99.5 percent and a database pair at 99.9 percent the total is 99.99 percent">
+<text class="t sm b" x="20" y="24">Series: every component must be up</text>
+<rect class="n client" x="20" y="44" width="80" height="46" rx="8"/><text class="t b mid" x="60" y="72">Client</text>
+<rect class="n ext" x="140" y="44" width="110" height="46" rx="8"/><text class="t b mid" x="195" y="64">LB</text><text class="t xs mono mute mid" x="195" y="80">99.99%</text>
+<rect class="n svc" x="290" y="44" width="110" height="46" rx="8"/><text class="t b mid" x="345" y="64">App</text><text class="t xs mono mute mid" x="345" y="80">99.9%</text>
+<rect class="n db" x="440" y="44" width="110" height="46" rx="8"/><text class="t b mid" x="495" y="64">Database</text><text class="t xs mono mute mid" x="495" y="80">99.95%</text>
+<path class="e" d="M100,67 H136"/><path class="e" d="M250,67 H286"/><path class="e" d="M400,67 H436"/>
+<path class="flow" d="M100,67 H136"/><path class="flow" d="M250,67 H286"/><path class="flow" d="M400,67 H436"/>
+<rect class="n bad" x="590" y="44" width="150" height="46" rx="8"/><text class="t b mid" x="665" y="64">= 99.84%</text><text class="t xs mute mid" x="665" y="80">~14 hours down/year</text>
+<path class="line faint" d="M20,118 H740" style="stroke-dasharray:4 4"/>
+<text class="t sm b" x="20" y="146">Redundant: parallel groups inside the chain</text>
+<rect class="n client" x="20" y="220" width="80" height="46" rx="8"/><text class="t b mid" x="60" y="248">Client</text>
+<rect class="n ext" x="140" y="220" width="110" height="46" rx="8"/><text class="t b mid" x="195" y="240">LB</text><text class="t xs mono mute mid" x="195" y="256">99.99%</text>
+<rect class="zone" x="280" y="160" width="130" height="166" rx="10"/>
+<rect class="n svc" x="290" y="170" width="110" height="34" rx="6"/><text class="t sm mid" x="345" y="191">App 99.5%</text>
+<rect class="n svc" x="290" y="226" width="110" height="34" rx="6"/><text class="t sm mid" x="345" y="247">App 99.5%</text>
+<rect class="n svc" x="290" y="282" width="110" height="34" rx="6"/><text class="t sm mid" x="345" y="303">App 99.5%</text>
+<rect class="zone" x="430" y="188" width="130" height="110" rx="10"/>
+<rect class="n db" x="440" y="198" width="110" height="34" rx="6"/><text class="t sm mid" x="495" y="219">DB 99.9%</text>
+<rect class="n db" x="440" y="254" width="110" height="34" rx="6"/><text class="t sm mid" x="495" y="275">DB 99.9%</text>
+<path class="e" d="M100,243 H136"/><path class="e" d="M250,243 H276"/><path class="e" d="M410,243 H426"/><path class="e" d="M560,243 H586"/>
+<rect class="n good" x="590" y="220" width="150" height="46" rx="8"/><text class="t b mid" x="665" y="240">= 99.99%</text><text class="t xs mute mid" x="665" y="256">~53 min down/year</text>
+<text class="t xs mono mute mid" x="345" y="155">1 - 0.005³</text>
+<text class="t xs mono mute mid" x="495" y="180">1 - 0.001²</text>
+</svg>
+</div>
+<figcaption><b>Series multiplies availability; parallel multiplies unavailability.</b> The animated request in the top chain needs all three components at once. Three app instances that are each only 99.5% available form a tier that is 99.99999% available. Once the app and database tiers are redundant, the single load balancer dominates: the system can never beat its weakest series component.</figcaption>
+</figure>
+
+<p>The parallel formula assumes two things that real systems often violate, and an interviewer may probe both:</p>
+<ul>
+<li><strong>Independent failures.</strong> Three replicas in one rack, behind one switch, running one bad config push, fail together. Redundancy only counts across independent failure domains: zones, regions, deploy waves.</li>
+<li><strong>Instant, correct failover.</strong> Promoting a database standby takes seconds to minutes, and failover logic is itself a component that can fail. Many large outages are failover systems misbehaving.</li>
+</ul>
+<p>The same arithmetic gives a design rule for dependencies: a service that calls 10 others in series, each 99.9% available, cannot exceed 99.0% unless it tolerates some of them failing (with caching, defaults or graceful degradation).</p>
+
+<h3 id="availability-python">Computing it</h3>
+<p>Both formulas and the fan-out probability in a few lines. The output in the comments is from a real run.</p>
+<pre><code class="language-python">from math import prod
+
+MIN_PER_YEAR = 365 * 24 * 60
+
+
+def series(*parts):
+    """All parts must be up: availabilities multiply."""
+    return prod(parts)
+
+
+def parallel(*replicas):
+    """Up if at least one replica is up (independent failures, instant failover)."""
+    return 1 - prod(1 - a for a in replicas)
+
+
+def p_any_slow(p_slow, fanout):
+    """Probability that at least one of `fanout` independent calls is slow."""
+    return 1 - (1 - p_slow) ** fanout
+
+
+def show(name, a):
+    print(f"{name:28s} {a:.6%}  ~{(1 - a) * MIN_PER_YEAR:,.0f} min down/year")
+
+
+show("LB -&gt; app -&gt; db", series(0.9999, 0.999, 0.9995))
+show("LB -&gt; 3 apps -&gt; db pair", series(0.9999, parallel(0.995, 0.995, 0.995), parallel(0.999, 0.999)))
+for n in (1, 10, 100):
+    print(f"fan-out {n:3d}: P(request sees a p99 tail) = {p_any_slow(0.01, n):.1%}")
+
+# LB -&gt; app -&gt; db              99.840065%  ~841 min down/year
+# LB -&gt; 3 apps -&gt; db pair      99.989888%  ~53 min down/year
+# fan-out   1: P(request sees a p99 tail) = 1.0%
+# fan-out  10: P(request sees a p99 tail) = 9.6%
+# fan-out 100: P(request sees a p99 tail) = 63.4%</code></pre>
+
+<h2 id="sli-slo-sla">SLIs, SLOs, SLAs and error budgets</h2>
+<p>Google's SRE practice gave the industry a precise vocabulary for targets:</p>
+<div class="defs">
+<div><h4>SLI (indicator)</h4><p>A measured ratio of good events to total events. "Fraction of <code>GET /feed</code> requests that return 2xx in under 300 ms, measured at the load balancer."</p></div>
+<div><h4>SLO (objective)</h4><p>An internal target for an SLI over a window. "99.9% of feed requests are good, over a rolling 28 days." Owned by engineering.</p></div>
+<div><h4>SLA (agreement)</h4><p>A contract with customers, with consequences (usually service credits) when missed. Should always be looser than the SLO, so you breach your own target before you owe anyone money.</p></div>
+<div><h4>Error budget</h4><p>One minus the SLO: the amount of failure you are allowed. A 99.9% SLO over 30 days at 100 million requests is a budget of 100,000 failed requests, or 43.2 minutes of full outage.</p></div>
+</div>
+<p>The <dfn>error budget</dfn> turns reliability into a resource to spend. While budget remains, teams ship features and take risks. When it runs out, the agreed policy kicks in: freeze risky launches, prioritise reliability work. This ends the usual argument between "ship faster" and "stay stable" with a number both sides accepted in advance. It also implies that 100% is the wrong target: users cannot tell 99.999% from 100% through their own Wi-Fi and phone networks, and the last nines cost the most.</p>
+<ul>
+<li><strong>Choose SLIs users would recognise:</strong> success rate and latency of user-facing operations, not CPU or disk usage.</li>
+<li><strong>Use latency percentiles in SLOs:</strong> "99% of requests under 300 ms" is meaningful; "mean under 100 ms" is not.</li>
+<li><strong>Alert on burn rate,</strong> meaning how fast the budget is being consumed, rather than on each error spike. Burning a month's budget in an hour pages someone; slow burns become tickets. See <a href="observability.html">Observability</a>.</li>
+</ul>
+
+<h2 id="worked-example">Worked example: setting targets for a checkout API</h2>
+<p>A checkout service handles 300 requests per second at peak. Each request calls inventory, pricing and payment in series and writes an order to the database. The product requirement is "checkout must feel instant and almost never fail".</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Question</th><th>Reasoning</th><th>Answer</th></tr></thead>
+<tbody>
+<tr><th>Latency SLO</th><td>Users notice delays past a few hundred ms; payment providers take 100 to 300 ms themselves</td><td>p99 under 800 ms, p50 under 250 ms, measured at the edge</td></tr>
+<tr><th>Availability SLO</th><td>Each failed checkout is lost revenue, but four nines would need fully automated multi-zone failover for every dependency, and often multi-region; 99.95% is achievable in one region with zone redundancy</td><td>99.95% of checkouts succeed over 28 days</td></tr>
+<tr><th>Error budget</th><td>300 req/s peak, about 100 req/s on average: roughly 240 million requests per 28 days</td><td>~120,000 failed checkouts per window</td></tr>
+<tr><th>Dependency budget</th><td>Inventory, pricing and payment in series: each needs well above 99.95%</td><td>Require 99.99% from internal deps; retry payment with an idempotency key</td></tr>
+<tr><th>Concurrency</th><td>Little's law: 300 req/s × 0.4 s average in flight</td><td>~120 in flight; size pools for 3x that</td></tr>
+<tr><th>Utilisation</th><td>Keep latency stable through bursts</td><td>Scale to stay under ~60% CPU at peak</td></tr>
+</tbody></table></div>
+<p>The weakest link is the external payment provider, whose SLA might be only 99.9%. Since checkout cannot exceed the availability of a dependency it calls synchronously, the design must handle provider failures: retry with an <a href="idempotency.html">idempotency key</a>, fail over to a second provider, or accept the order and charge asynchronously. Each option trades complexity for nines, which is exactly the discussion an interviewer wants.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Technique</th><th>Improves</th><th>Costs</th></tr></thead>
+<tbody>
+<tr><th>Caching and precomputation</th><td>Latency, and availability when the source is down</td><td>Staleness, memory</td></tr>
+<tr><th>Redundancy across zones</th><td>Availability</td><td>Cost, replication lag, failover complexity</td></tr>
+<tr><th>Hedged requests</th><td>Tail latency</td><td>A few percent more backend load</td></tr>
+<tr><th>Lower target utilisation</th><td>Latency under bursts</td><td>More machines</td></tr>
+<tr><th>Load shedding and backpressure</th><td>Availability for the requests you keep</td><td>Explicitly failing some requests</td></tr>
+<tr><th>Graceful degradation</th><td>Availability of the core path</td><td>Reduced features during incidents</td></tr>
+</tbody></table></div>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>During requirements, turn "fast and reliable" into numbers: "p99 under 200 ms for reads, 99.99% availability for the redirect path". In the design, use Little's law to size pools, the fan-out formula when a request touches many shards, and the series/parallel formulas when you add redundancy.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>"Why not track average latency?" It hides the tail, and the tail is what fan-out amplifies.</li>
+<li>"Your request touches 50 shards. What is your p99?" Use <code>1 - (1 - p)^N</code>, then propose hedging or less fan-out.</li>
+<li>"Can we run the servers at 90% CPU to save money?" Explain the queueing curve and what happens to p99.</li>
+<li>"What availability can this design achieve?" Multiply the series chain; show the weakest component.</li>
+<li>"What is an error budget and how would you use it?"</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>Promising five nines with a single-region, single-database design.</li>
+<li>Adding redundancy and assuming failures are independent when replicas share a rack, a config or a deploy.</li>
+<li>Confusing throughput with latency, or bits with bytes when talking about bandwidth.</li>
+<li>Averaging percentiles across servers or time windows.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://dl.acm.org/doi/10.1145/2408776.2408794" target="_blank" rel="noopener">The Tail at Scale</a><span>Jeffrey Dean and Luiz André Barroso, Communications of the ACM, 2013. Fan-out amplification of tail latency, hedged and tied requests.</span></li>
+<li><a href="https://doi.org/10.1287/opre.9.3.383" target="_blank" rel="noopener">A Proof for the Queuing Formula: L = λW</a><span>John D. C. Little, Operations Research, 1961. The original proof of Little's law.</span></li>
+<li><a href="https://sre.google/sre-book/service-level-objectives/" target="_blank" rel="noopener">Site Reliability Engineering: Service Level Objectives</a><span>Google, 2016. SLIs, SLOs and SLAs, and why to use percentiles.</span></li>
+<li><a href="https://sre.google/workbook/implementing-slos/" target="_blank" rel="noopener">The Site Reliability Workbook: Implementing SLOs</a><span>Google, 2018. Error budgets and error budget policies in practice.</span></li>
+</ul>

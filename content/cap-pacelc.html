@@ -1,0 +1,287 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">A database replicated across two regions loses the link between them. A user in Frankfurt tries to update a record. The Frankfurt replica cannot reach Virginia. It has two options: accept the write and risk disagreeing with Virginia, or refuse it and tell the user to try later. There is no third option, and whichever one the system picks is a product decision someone should have made on purpose.</p>
+<p>That forced choice is the <dfn>CAP theorem</dfn>. It is the most quoted and most misquoted result in distributed systems. Interviewers use it to check whether you can reason precisely about failure, rather than recite "pick two of three". This chapter states CAP exactly, shows what CP and AP systems actually do during a partition, extends it with PACELC to cover the much more common case when nothing is broken, and classifies real systems with the caveats that classification needs.</p>
+
+<h2 id="statement">The precise statement</h2>
+<p>Eric Brewer stated the conjecture in a keynote at PODC in 2000. Seth Gilbert and Nancy Lynch proved it in 2002, and their proof pins down what each letter means. The definitions are narrower than everyday usage, and most confusion comes from ignoring them.</p>
+<div class="defs">
+<div><h4>C: consistency</h4><p><dfn>Linearizability</dfn>: every operation appears to take effect at a single instant between its start and end, so all clients see one up-to-date copy. A read never returns a value older than a write that completed before the read began. See <a href="consistency-models.html">Consistency Models</a>.</p></div>
+<div><h4>A: availability</h4><p>Every request received by a <em>non-failing</em> node eventually gets a non-error response. Not "the service is up" or "99.99%": every working node must answer, with no time bound.</p></div>
+<div><h4>P: partition tolerance</h4><p>The system keeps its guarantees even when the network loses arbitrarily many messages between nodes. A <dfn>network partition</dfn> splits nodes into groups that cannot talk to each other.</p></div>
+</div>
+<p>The theorem: <strong>in a network that can lose messages, no system can guarantee both linearizability and availability.</strong> The proof is short. Put two replicas on opposite sides of a partition. A client writes to one; another client then reads from the other. To be available, the second replica must answer. It cannot know about the write, so it must return the old value, which breaks linearizability. To stay linearizable, it must refuse to answer, which breaks availability.</p>
+
+<h3 id="partitions">What a partition looks like in practice</h3>
+<p>Partitions are not only cut cables. Any of these produces one from the system's point of view:</p>
+<ul>
+<li>A failed switch or a misconfigured firewall rule isolating a rack or a zone.</li>
+<li>A congested or flapping link between regions, dropping or delaying packets for minutes.</li>
+<li>A long garbage-collection pause or a VM freeze: the node is alive but silent, and when it wakes it may still believe it is the leader.</li>
+<li>Asymmetric failures, where A can reach B but B cannot reach A.</li>
+</ul>
+<p>The crucial property is that <strong>a node cannot tell a partition from a crash or from a slow network</strong>. All it sees is a missing reply. A timeout is therefore a decision point: give up and answer with what you have (choose A), or keep waiting or return an error (choose C). Large studies of production incidents, such as Bailis and Kingsbury's survey of network partitions, found them to be a regular occurrence in real datacenters, not a theoretical edge case.</p>
+
+<h2 id="pick-two">Why "pick two of three" is misleading</h2>
+<p>The popular triangle with C, A and P at the corners suggests three equal options: CA, CP and AP. That framing is wrong in several ways.</p>
+<ol class="steps">
+<li><strong>P is not optional.</strong> You cannot choose to have no partitions in a system that uses a network. "CA" only describes a single-node system, or a cluster that silently breaks its guarantees when a partition happens. The real choice is what to give up <em>when</em> a partition occurs: C or A.</li>
+<li><strong>The choice only applies during a partition.</strong> When the network is healthy, a system can be both linearizable and available. CAP says nothing about normal operation, which is where systems spend nearly all their time. PACELC, below, fills that gap.</li>
+<li><strong>The choice can be made per operation.</strong> A shop can keep browsing and cart updates available while making checkout consistent. Cassandra lets each request pick its consistency level; DynamoDB lets each read choose eventual or strong.</li>
+<li><strong>C and A in CAP are extreme definitions.</strong> Most databases offer neither linearizability nor CAP-availability. A single-leader database with asynchronous replicas is not linearizable (replica reads can be stale) and not CAP-available (a partitioned-off replica cannot accept writes). Calling it "CP" or "AP" says little. Martin Kleppmann's essay "Please stop calling databases CP or AP" makes this argument in detail.</li>
+<li><strong>Latency is the hidden variable.</strong> A system that answers after 30 seconds is technically available. In practice, users treat a very slow answer as no answer, so the real trade-off is between consistency and response time.</li>
+</ol>
+
+<h2 id="cp-vs-ap">CP and AP behaviour during a partition</h2>
+<p>Both systems below have three replicas: N1 and N2 in us-east, N3 in eu-west. Clients write a key <code>x</code>. Step through the same failure for each design.</p>
+
+<figure class="fig wide" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 740 378" role="img" aria-label="Two lanes, CP and AP, each with replicas N1 and N2 in us-east and N3 in eu-west. During a partition the CP system rejects the minority side's write while the AP system accepts both writes and must resolve a conflict when the partition heals">
+<text class="t sm b" x="20" y="42">CP: majority quorum (3 replicas)</text>
+<rect class="zone" x="130" y="54" width="220" height="92" rx="10"/><text class="t xs mute" x="140" y="68">region us-east</text>
+<rect class="zone" x="430" y="54" width="120" height="92" rx="10"/><text class="t xs mute" x="440" y="68">region eu-west</text>
+<rect class="n db" x="145" y="74" width="90" height="60" rx="8"/><text class="t b mid" x="190" y="96">N1</text>
+<rect class="n db" x="245" y="74" width="90" height="60" rx="8"/><text class="t b mid" x="290" y="96">N2</text>
+<rect class="n db" x="445" y="74" width="90" height="60" rx="8"/><text class="t b mid" x="490" y="96">N3</text>
+<text class="t mono mid " x="190" y="120" data-show="1">x = 1</text>
+<text class="t mono mid " x="290" y="120" data-show="1">x = 1</text>
+<text class="t mono mid " x="490" y="120" data-show="1">x = 1</text>
+<text class="t xs mid mute" x="370" y="180" data-show="1">Writes are acknowledged after a majority (2 of 3) has them.</text>
+<text class="t mono mid " x="190" y="120" data-show="2">x = 1</text>
+<text class="t mono mid " x="290" y="120" data-show="2">x = 1</text>
+<text class="t mono mid " x="490" y="120" data-show="2">x = 1</text>
+<text class="t xs mid mute" x="370" y="180" data-show="2">Link cut. N3 is alone in the minority.</text>
+<text class="t mono mid " x="190" y="120" data-show="3">x = 2</text>
+<text class="t mono mid " x="290" y="120" data-show="3">x = 2</text>
+<text class="t mono mid mute" x="490" y="120" data-show="3">x = 1</text>
+<text class="t xs mid red" x="370" y="180" data-show="3">Majority side accepts x=2. N3 refuses requests: unavailable.</text>
+<text class="t mono mid " x="190" y="120" data-show="4">x = 2</text>
+<text class="t mono mid " x="290" y="120" data-show="4">x = 2</text>
+<text class="t mono mid " x="490" y="120" data-show="4">x = 2</text>
+<text class="t xs mid mute" x="370" y="180" data-show="4">N3 catches up to x=2. No conflict, but B's write was rejected.</text>
+<rect class="n client" x="20" y="82" width="80" height="44" rx="8"/><text class="t b mid" x="60" y="109">Client A</text>
+<rect class="n client" x="640" y="82" width="80" height="44" rx="8"/><text class="t b mid" x="680" y="109">Client B</text>
+<path class="e" d="M100,104 H141"/><path class="e" d="M640,104 H539"/>
+<g data-show="1 4"><path class="line" d="M339,104 H441" style="stroke:var(--d-green);stroke-width:2"/><text class="t xs green mid" x="390" y="96">replication</text></g>
+<g data-show="2 3"><path class="line" d="M339,104 H372 M408,104 H441" style="stroke:var(--d-red)"/><path d="M384,90 L392,100 L382,108 L392,118" style="fill:none;stroke:var(--d-red);stroke-width:2.5"/><text class="t xs red mid" x="388" y="134">partition</text></g>
+<text class="t xs mono accent mid" x="60" y="76" data-show="3">write x=2</text>
+<text class="t xs mono accent mid" x="680" y="76" data-show="3">write x=3</text>
+<text class="t xs green mid" x="60" y="142" data-show="3">ok</text>
+<text class="t xs red mid" x="680" y="142" data-show="3">error: no quorum</text>
+<text class="t sm b" x="20" y="222">AP: accept everywhere, replicate asynchronously</text>
+<rect class="zone" x="130" y="234" width="220" height="92" rx="10"/><text class="t xs mute" x="140" y="248">region us-east</text>
+<rect class="zone" x="430" y="234" width="120" height="92" rx="10"/><text class="t xs mute" x="440" y="248">region eu-west</text>
+<rect class="n db" x="145" y="254" width="90" height="60" rx="8"/><text class="t b mid" x="190" y="276">N1</text>
+<rect class="n db" x="245" y="254" width="90" height="60" rx="8"/><text class="t b mid" x="290" y="276">N2</text>
+<rect class="n db" x="445" y="254" width="90" height="60" rx="8"/><text class="t b mid" x="490" y="276">N3</text>
+<text class="t mono mid " x="190" y="300" data-show="1">x = 1</text>
+<text class="t mono mid " x="290" y="300" data-show="1">x = 1</text>
+<text class="t mono mid " x="490" y="300" data-show="1">x = 1</text>
+<text class="t xs mid mute" x="370" y="360" data-show="1">Every replica accepts reads and writes on its own.</text>
+<text class="t mono mid " x="190" y="300" data-show="2">x = 1</text>
+<text class="t mono mid " x="290" y="300" data-show="2">x = 1</text>
+<text class="t mono mid " x="490" y="300" data-show="2">x = 1</text>
+<text class="t xs mid mute" x="370" y="360" data-show="2">Link cut. Both sides keep serving.</text>
+<text class="t mono mid " x="190" y="300" data-show="3">x = 2</text>
+<text class="t mono mid " x="290" y="300" data-show="3">x = 2</text>
+<text class="t mono mid " x="490" y="300" data-show="3">x = 3</text>
+<text class="t xs mid mute" x="370" y="360" data-show="3">Both writes succeed. The replicas now disagree.</text>
+<text class="t mono mid red" x="190" y="300" data-show="4">x = 2 | 3</text>
+<text class="t mono mid red" x="290" y="300" data-show="4">x = 2 | 3</text>
+<text class="t mono mid red" x="490" y="300" data-show="4">x = 2 | 3</text>
+<text class="t xs mid red" x="370" y="360" data-show="4">On heal: last-writer-wins silently drops one write, or keep both and merge.</text>
+<rect class="n client" x="20" y="262" width="80" height="44" rx="8"/><text class="t b mid" x="60" y="289">Client A</text>
+<rect class="n client" x="640" y="262" width="80" height="44" rx="8"/><text class="t b mid" x="680" y="289">Client B</text>
+<path class="e" d="M100,284 H141"/><path class="e" d="M640,284 H539"/>
+<g data-show="1 4"><path class="line" d="M339,284 H441" style="stroke:var(--d-green);stroke-width:2"/><text class="t xs green mid" x="390" y="276">replication</text></g>
+<g data-show="2 3"><path class="line" d="M339,284 H372 M408,284 H441" style="stroke:var(--d-red)"/><path d="M384,270 L392,280 L382,288 L392,298" style="fill:none;stroke:var(--d-red);stroke-width:2.5"/><text class="t xs red mid" x="388" y="314">partition</text></g>
+<text class="t xs mono accent mid" x="60" y="256" data-show="3">write x=2</text>
+<text class="t xs mono accent mid" x="680" y="256" data-show="3">write x=3</text>
+<text class="t xs green mid" x="60" y="322" data-show="3">ok</text>
+<text class="t xs green mid" x="680" y="322" data-show="3">ok</text>
+
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">1. Normal</button><button type="button" data-step="2" aria-pressed="false">2. Partition</button><button type="button" data-step="3" aria-pressed="false">3. Writes on both sides</button><button type="button" data-step="4" aria-pressed="false">4. Heal</button></div>
+</div>
+<figcaption><b>Same failure, two designs.</b> The CP system stays correct by refusing service on the minority side: client B gets an error. The AP system serves everyone, and pays later with a conflict that it must resolve automatically, often by losing a write.</figcaption>
+</figure>
+
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>CP (consistent under partition)</th><th>AP (available under partition)</th></tr></thead>
+<tbody>
+<tr><th>Minority side</th><td class="no">Rejects writes and linearizable reads, or times out</td><td class="yes">Keeps serving reads and writes</td></tr>
+<tr><th>Majority side</th><td class="yes">Keeps serving</td><td class="yes">Keeps serving</td></tr>
+<tr><th>Reads</th><td class="yes">Never stale if served by the leader or a quorum; local follower reads (e.g. ZooKeeper) can be</td><td class="no">May be stale, or reflect writes later discarded</td></tr>
+<tr><th>On heal</th><td class="yes">Minority catches up; no conflicts</td><td class="meh">Divergent writes must be reconciled</td></tr>
+<tr><th>Typical mechanism</th><td>Leader plus majority quorum (Raft, Paxos)</td><td>Leaderless or multi-leader replication, async</td></tr>
+<tr><th>Conflict handling</th><td>Not needed</td><td>Last-writer-wins, version vectors with siblings, or CRDTs</td></tr>
+</tbody></table></div>
+<p>Note that a CP system is not "down" during a partition. The majority side keeps working; only clients that can reach only the minority are refused. With three or five replicas spread across zones, that is usually a small slice of traffic. Coordination services such as etcd and ZooKeeper work exactly this way, and so do the leader-election mechanisms described in <a href="consensus.html">Consensus &amp; Leader Election</a>.</p>
+<p>AP systems need a reconciliation strategy, and this is where the real design work lies:</p>
+<ul>
+<li><strong>Last-writer-wins</strong> (LWW) keeps the write with the highest timestamp. Simple, and silently discards the other write. Also vulnerable to clock skew between nodes.</li>
+<li><strong>Siblings</strong>: detect concurrent writes with version vectors and return all versions to the application to merge, as Amazon's Dynamo did for shopping carts.</li>
+<li><strong>CRDTs</strong> (conflict-free replicated data types): counters, sets and maps whose merge is mathematically guaranteed to converge, such as a set where concurrent adds are all kept.</li>
+</ul>
+<p>The <a href="replication.html">Replication</a> chapter covers quorums and conflict resolution in depth; the <a href="key-value-store.html">key-value store</a> case study builds an AP store end to end.</p>
+
+<h2 id="pacelc">PACELC: the trade-off when nothing is broken</h2>
+<p>Daniel Abadi pointed out in 2010, and formalised in a 2012 paper, that CAP ignores the trade-off that shapes systems every day. Partitions are rare; replication latency is constant. His <dfn>PACELC</dfn> formulation reads: <strong>if</strong> there is a <strong>P</strong>artition, choose between <strong>A</strong>vailability and <strong>C</strong>onsistency; <strong>E</strong>lse, choose between <strong>L</strong>atency and <strong>C</strong>onsistency.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 740 280" role="img" aria-label="PACELC decision tree: if partitioned choose availability or consistency; else choose latency or consistency">
+<rect class="n svc" x="270" y="16" width="200" height="46" rx="8"/><text class="t b mid" x="370" y="44">Is the network partitioned?</text>
+<path class="e" d="M320,62 C300,82 230,86 200,104"/>
+<path class="e" d="M420,62 C440,82 510,86 540,104"/>
+<text class="t sm b mid" x="236" y="80">yes: P</text>
+<text class="t sm b mid" x="506" y="80">no: E (else)</text>
+<rect class="n ext" x="90" y="108" width="220" height="46" rx="8"/><text class="t b mid" x="200" y="136">Availability or Consistency?</text>
+<rect class="n ext" x="430" y="108" width="220" height="46" rx="8"/><text class="t b mid" x="540" y="136">Latency or Consistency?</text>
+<path class="e" d="M160,154 C150,170 120,176 105,190"/>
+<path class="e" d="M240,154 C250,170 280,176 295,190"/>
+<path class="e" d="M500,154 C490,170 460,176 445,190"/>
+<path class="e" d="M580,154 C590,170 620,176 635,190"/>
+<rect class="n cache" x="20" y="194" width="170" height="70" rx="8"/><text class="t b mid" x="105" y="216">PA</text><text class="t xs mute mid" x="105" y="234">answer from local data,</text><text class="t xs mute mid" x="105" y="249">reconcile later</text>
+<rect class="n db" x="210" y="194" width="170" height="70" rx="8"/><text class="t b mid" x="295" y="216">PC</text><text class="t xs mute mid" x="295" y="234">refuse or wait if a</text><text class="t xs mute mid" x="295" y="249">quorum is unreachable</text>
+<rect class="n cache" x="400" y="194" width="150" height="70" rx="8"/><text class="t b mid" x="475" y="216">EL</text><text class="t xs mute mid" x="475" y="234">reply from nearest</text><text class="t xs mute mid" x="475" y="249">replica, async copy</text>
+<rect class="n db" x="570" y="194" width="150" height="70" rx="8"/><text class="t b mid" x="645" y="216">EC</text><text class="t xs mute mid" x="645" y="234">wait for sync replicas</text><text class="t xs mute mid" x="645" y="249">or a quorum</text>
+</svg>
+</div>
+<figcaption><b>PACELC.</b> The left branch is CAP. The right branch is the trade-off a system makes on every single request: answering from the nearest replica is fast but may be stale; waiting for other replicas to confirm is consistent but costs at least one round trip to them.</figcaption>
+</figure>
+
+<p>The else-branch cost is concrete. Consistency across replicas requires coordinating with them before answering, and coordination costs round trips:</p>
+<div class="calc">Same zone            round trip  ~0.5 ms     consistency is nearly free
+Across zones         round trip  ~1-2 ms     usually worth paying
+us-east ↔ eu-west    round trip  ~70-90 ms   paid by every consistent write
+us-east ↔ ap-south   round trip  ~180+ ms
+Majority of 3 regions: each write waits for the nearest other region</div>
+<p>This is why globally distributed systems so often choose EL: a social app that made every like wait 80 ms for another continent would feel sluggish, while a like that takes a second to appear elsewhere bothers nobody. And it is why systems that do choose EC across regions, such as Spanner, invest heavily in reducing the cost (placing leaders near writers, using TrueTime to serve consistent reads locally).</p>
+
+<h2 id="classification">Classifying real systems</h2>
+<p>With caveats, here is how common systems fall in PACELC terms. The caveats matter more than the labels: most of these systems are configurable, and the label describes the default or the typical deployment.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 740 330" role="img" aria-label="Two by two grid of PACELC classes: PA/EL contains Cassandra, Riak and DynamoDB default reads; PC/EC contains Spanner, CockroachDB, etcd, ZooKeeper, HBase and Bigtable; PA/EC contains MongoDB as classified in 2012; PC/EL contains Yahoo PNUTS">
+<text class="t sm b mid" x="320" y="24">During a partition: A</text>
+<text class="t sm b mid" x="600" y="24">During a partition: C</text>
+<text class="t sm b end" x="168" y="102">Else: L</text>
+<text class="t xs mute end" x="168" y="118">fast, maybe stale</text>
+<text class="t sm b end" x="168" y="232">Else: C</text>
+<text class="t xs mute end" x="168" y="248">coordinate first</text>
+<rect class="n cache" x="180" y="40" width="280" height="130" rx="10"/>
+<text class="t b" x="196" y="64">PA/EL</text>
+<text class="t sm" x="196" y="88">Cassandra, Riak (default levels)</text>
+<text class="t sm" x="196" y="108">DynamoDB eventually consistent reads</text>
+<text class="t sm" x="196" y="128">Amazon Dynamo</text>
+<text class="t xs accent" x="196" y="154">QUORUM or strong reads move toward PC/EC</text>
+<rect class="n ext" x="460" y="40" width="270" height="130" rx="10"/>
+<text class="t b" x="476" y="64">PC/EL</text>
+<text class="t sm" x="476" y="88">Yahoo PNUTS</text>
+<text class="t xs mute" x="476" y="110">async replicas for speed; a record's</text>
+<text class="t xs mute" x="476" y="125">writes stop if its master region</text>
+<text class="t xs mute" x="476" y="140">is unreachable</text>
+<rect class="n ext" x="180" y="170" width="280" height="130" rx="10"/>
+<text class="t b" x="196" y="194">PA/EC</text>
+<text class="t sm" x="196" y="218">MongoDB, in Abadi's 2012 paper</text>
+<text class="t xs mute" x="196" y="240">old defaults could roll back acknowledged</text>
+<text class="t xs mute" x="196" y="255">writes after failover; majority write</text>
+<text class="t xs mute" x="196" y="270">concern (default since 5.0) plus majority</text>
+<text class="t xs mute" x="196" y="285">reads → PC/EC</text>
+<rect class="n db" x="460" y="170" width="270" height="130" rx="10"/>
+<text class="t b" x="476" y="194">PC/EC</text>
+<text class="t sm" x="476" y="218">Spanner, CockroachDB</text>
+<text class="t sm" x="476" y="238">etcd, ZooKeeper, Consul</text>
+<text class="t sm" x="476" y="258">HBase, Bigtable</text>
+<text class="t xs mute" x="476" y="282">consensus or single owner per key range</text>
+</svg>
+</div>
+<figcaption><b>PACELC classes.</b> Most systems sit on the diagonal: PA/EL (stay fast and available, accept staleness) or PC/EC (always coordinate). The off-diagonal cells are rare. Labels follow Abadi's 2012 paper where it covers a system, and describe defaults, not every configuration.</figcaption>
+</figure>
+
+<div class="table-wrap"><table>
+<thead><tr><th>System</th><th>Default behaviour</th><th>Caveat</th></tr></thead>
+<tbody>
+<tr><th>Cassandra</th><td>PA/EL with consistency level ONE</td><td>QUORUM reads and writes give stronger guarantees and lose availability on the minority side; lightweight transactions use Paxos for linearizable compare-and-set</td></tr>
+<tr><th>DynamoDB</th><td>Eventually consistent reads by default</td><td>Strongly consistent reads are available per request within a region; global tables replicate asynchronously with last-writer-wins by default; multi-Region strong consistency (GA June 2025) is an opt-in mode</td></tr>
+<tr><th>MongoDB</th><td>Single primary per replica set</td><td>Majority write concern and linearizable read concern give CP behaviour; reads from secondaries are stale</td></tr>
+<tr><th>Spanner</th><td>PC/EC: externally consistent transactions</td><td>Technically CP; Google argues it is "effectively CA" because its private network makes partitions extremely rare</td></tr>
+<tr><th>ZooKeeper</th><td>CP writes through a leader and quorum</td><td>Reads are served locally and can be stale unless preceded by <code>sync</code></td></tr>
+<tr><th>Redis Cluster</th><td>Asynchronous replication</td><td>Neither CP nor AP in the CAP sense: it can lose acknowledged writes after a failover, and minority masters stop accepting writes</td></tr>
+<tr><th>PostgreSQL with async replicas</th><td>Primary handles writes</td><td>Replica reads are stale; failover can lose recent commits unless synchronous replication is configured</td></tr>
+</tbody></table></div>
+
+<h2 id="worked-example">Worked example: shopping cart vs bank balance</h2>
+<p>The same partition, two products, opposite answers. Assume two regions and a partition lasting ten minutes during peak.</p>
+<h3 id="cart">Shopping cart: choose AP</h3>
+<p>A customer adds a book in one session served by us-east and a lamp in another served by eu-west. Rejecting either add loses a sale; both are low-risk. The cart is AP, and concurrent versions are merged by union, which is exactly the design described in the Dynamo paper.</p>
+<div class="calc">us-east version   {book}            eu-west version   {lamp}
+merge on heal     {book} ∪ {lamp} = <span class="r">{book, lamp}</span>   nothing lost
+anomaly           an item removed on one side can reappear after merge
+cost of anomaly   the customer deletes it again, or notices at checkout</div>
+<p>The anomaly is real but cheap, and checkout can re-validate the cart against current stock and prices.</p>
+
+<h3 id="bank">Bank balance: choose CP, with a bounded escape hatch</h3>
+<p>An account holds $100. During the partition, the account holder withdraws $80 at an ATM routed to us-east and, at the same moment, someone with the joint card withdraws $80 routed to eu-west.</p>
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>AP</th><th>CP</th><th>CP with a partition limit</th></tr></thead>
+<tbody>
+<tr><th>us-east withdrawal</th><td>Approved</td><td>Approved (majority side)</td><td>Approved up to $40 per side</td></tr>
+<tr><th>eu-west withdrawal</th><td>Approved</td><td>Rejected: "try again later"</td><td>Approved up to $40</td></tr>
+<tr><th>Balance after heal</th><td class="no">-$60 overdraft</td><td class="yes">$20</td><td class="meh">$20; never below zero</td></tr>
+<tr><th>Customer experience</th><td>Good now, angry bank later</td><td>One failed withdrawal</td><td>Both get some cash</td></tr>
+</tbody></table></div>
+<p>The third column is the design Brewer describes for ATMs in "CAP Twelve Years Later": during a partition the system stays available for <em>bounded</em> operations and limits the damage, then reconciles and applies compensation (an overdraft fee, a reversal) afterwards. That is the mature answer in an interview: not "banks are CP", but "money movement is CP by default, with explicitly bounded availability during partitions where the business accepts the risk".</p>
+
+<h2 id="partition-mode">Designing for partition mode</h2>
+<p>Brewer's 2012 follow-up recasts CAP as a process rather than a one-time label. A well-designed system plans for three phases:</p>
+<ol class="steps">
+<li><strong>Detect the partition.</strong> In practice, a timeout on a call to another replica or region. Choosing the timeout is choosing how long you will sacrifice availability before you decide a partition exists. Too short and you flap into partition mode on every latency spike; too long and users wait.</li>
+<li><strong>Enter partition mode.</strong> Decide per operation what is allowed. Reads of the cart: allowed. Adding items: allowed. Charging a card: queued, or allowed only up to a limit. Changing a username, which must be globally unique: refused. Record every operation done in this mode so it can be reconciled.</li>
+<li><strong>Recover.</strong> When communication returns, merge the two histories: replay logged operations, merge CRDT state, detect invariant violations (two users with the same username, a negative balance) and fix them with compensating actions such as refunds, apologies or a manual review queue.</li>
+</ol>
+<p>Thinking in these phases changes the interview conversation from "which letter do we drop" to "which operations stay available, what invariant might break, and how do we repair it". That is how real systems such as airline booking (overbooking, then compensation) and payment networks (offline approvals under a limit) have always worked.</p>
+
+<h2 id="misconceptions">Common misconceptions</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Misconception</th><th>Reality</th></tr></thead>
+<tbody>
+<tr><th>"Our system is CA."</th><td>Only a single node is CA. A distributed system that claims CA has not decided what happens during a partition, which means it does something unplanned.</td></tr>
+<tr><th>"CP means the system goes down during a partition."</th><td>Only the minority side stops serving. The majority keeps working.</td></tr>
+<tr><th>"AP means no consistency at all."</th><td>AP systems usually provide eventual consistency and often session guarantees such as read-your-writes. They give up linearizability, not all ordering.</td></tr>
+<tr><th>"The C in CAP is the C in ACID."</th><td>ACID consistency means preserving application invariants within a transaction. CAP consistency means linearizability across replicas. See <a href="transactions.html">ACID &amp; Isolation Levels</a>.</td></tr>
+<tr><th>"Availability in CAP is the same as uptime nines."</th><td>CAP availability means every non-failing node answers. Real availability is measured as a fraction of successful requests; see <a href="latency-availability.html">Latency, Throughput &amp; Availability</a>.</td></tr>
+<tr><th>"We picked a CP database, so our application is consistent."</th><td>Caches, read replicas, async queues and client retries in front of it can each reintroduce stale reads and duplicates.</td></tr>
+<tr><th>"Partitions are rare, so CAP does not matter."</th><td>Partitions are rare; the latency trade-off (PACELC's else branch) applies to every request.</td></tr>
+</tbody></table></div>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>When you replicate data across zones or regions, state per data type what happens during a partition and what consistency normal reads get. "Cart and likes are AP with merge; payments and inventory decrements are CP; the feed reads from the nearest replica (EL)." Avoid a lecture on the theorem unless asked.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>"What exactly does the C mean?" Linearizability, with an example of a stale read it forbids.</li>
+<li>"Is this database CP or AP?" Answer with configuration: consistency levels, write concern, sync vs async replication.</li>
+<li>"How do you resolve conflicts in the AP path?" LWW, version vectors with siblings, or CRDTs, and what each loses.</li>
+<li>"What does consistency cost when there is no partition?" Round trips to replicas: give cross-region numbers.</li>
+<li>"How does a node know there is a partition?" It does not; it sees timeouts, and the timeout is the decision.</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>Choosing "CA" for a distributed design.</li>
+<li>Saying "pick two of three" without explaining that the choice only arises during a partition.</li>
+<li>Labelling a database CP or AP with no reference to how it is configured.</li>
+<li>Confusing CAP consistency with ACID consistency or with transaction isolation.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://groups.csail.mit.edu/tds/papers/Gilbert/Brewer2.pdf" target="_blank" rel="noopener">Brewer's Conjecture and the Feasibility of Consistent, Available, Partition-Tolerant Web Services</a><span>Seth Gilbert and Nancy Lynch, SIGACT News, 2002. The formal definitions and proof.</span></li>
+<li><a href="https://www.infoq.com/articles/cap-twelve-years-later-how-the-rules-have-changed/" target="_blank" rel="noopener">CAP Twelve Years Later: How the "Rules" Have Changed</a><span>Eric Brewer, IEEE Computer, 2012 (republished by InfoQ). Why "two of three" misleads, and partition-mode design such as the ATM example.</span></li>
+<li><a href="https://www.cs.umd.edu/~abadi/papers/abadi-pacelc.pdf" target="_blank" rel="noopener">Consistency Tradeoffs in Modern Distributed Database System Design</a><span>Daniel Abadi, IEEE Computer, 2012. Introduces PACELC and classifies Dynamo, Cassandra, PNUTS, MongoDB and others.</span></li>
+<li><a href="https://martin.kleppmann.com/2015/05/11/please-stop-calling-databases-cp-or-ap.html" target="_blank" rel="noopener">Please stop calling databases CP or AP</a><span>Martin Kleppmann, 2015. Why most real databases are neither, and what to say instead.</span></li>
+</ul>

@@ -1,0 +1,357 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">A system design interview gives you 45 to 60 minutes, a one-line prompt such as "design Instagram", and no right answer. Candidates rarely fail because they do not know what a cache is. They fail because they spend 25 minutes on requirements, or draw boxes before knowing what the boxes are for, or never get to the part where they show judgement.</p>
+<p>The interview is a simulation of a design review with a colleague. The interviewer wants to see how you turn ambiguity into a concrete plan, which risks you notice, and how you reason about trade-offs under time pressure. A repeatable structure frees your attention for that reasoning. This chapter gives you the structure, the time budget, what interviewers write down at each level, and the habits that sink otherwise strong candidates.</p>
+<p>Everything else in this handbook plugs into this framework. <a href="estimation.html">Estimation</a> fills the second phase. The Data and Async parts supply the components for the high-level design. The case studies, starting with the <a href="url-shortener.html">URL shortener</a>, are worked runs of the whole thing.</p>
+
+<h2 id="time-budget">The time budget</h2>
+<p>Most loops use a 45-minute slot (after introductions, closer to 40) or a 60-minute slot. The phases are the same either way. What changes is how long you can afford to go deep.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 750 235" role="img" aria-label="Interview timelines drawn to the same scale: 45 minutes split into scope 5, size 4, API 4, data 4, high-level 10, deep dives 14, wrap-up 4; 60 minutes split into 7, 5, 5, 5, 13, 20, 5">
+<text class="t xs mute" x="110" y="26">minutes from the start, both bars on the same scale</text>
+<text class="t b" x="20" y="64">45 min</text>
+<rect class="n client" x="110.0" y="40" width="51.7" height="36" rx="4"/><text class="t sm b mid" x="135.8" y="62">Scope</text>
+<rect class="n svc" x="161.7" y="40" width="41.3" height="36" rx="4"/><text class="t sm b mid" x="182.3" y="62">Size</text>
+<rect class="n ext" x="203.0" y="40" width="41.3" height="36" rx="4"/><text class="t sm b mid" x="223.7" y="62">API</text>
+<rect class="n db" x="244.3" y="40" width="41.3" height="36" rx="4"/><text class="t sm b mid" x="265.0" y="62">Data</text>
+<rect class="n svc" x="285.7" y="40" width="103.3" height="36" rx="4"/><text class="t sm b mid" x="337.3" y="62">High-level</text>
+<rect class="n cache" x="389.0" y="40" width="144.7" height="36" rx="4"/><text class="t sm b mid" x="461.3" y="62">Deep dives</text>
+<rect class="n queue" x="533.7" y="40" width="41.3" height="36" rx="4"/><text class="t sm b mid" x="554.3" y="62">Wrap</text>
+<text class="t xs mono mute mid" x="110.0" y="92">0</text>
+<text class="t xs mono mute mid" x="161.7" y="92">5</text>
+<text class="t xs mono mute mid" x="203.0" y="92">9</text>
+<text class="t xs mono mute mid" x="244.3" y="92">13</text>
+<text class="t xs mono mute mid" x="285.7" y="92">17</text>
+<text class="t xs mono mute mid" x="389.0" y="92">27</text>
+<text class="t xs mono mute mid" x="533.7" y="92">41</text>
+<text class="t xs mono mute mid" x="575.0" y="92">45</text>
+<text class="t b" x="20" y="144">60 min</text>
+<rect class="n client" x="110.0" y="120" width="72.3" height="36" rx="4"/><text class="t sm b mid" x="146.2" y="142">Scope</text>
+<rect class="n svc" x="182.3" y="120" width="51.7" height="36" rx="4"/><text class="t sm b mid" x="208.2" y="142">Size</text>
+<rect class="n ext" x="234.0" y="120" width="51.7" height="36" rx="4"/><text class="t sm b mid" x="259.8" y="142">API</text>
+<rect class="n db" x="285.7" y="120" width="51.7" height="36" rx="4"/><text class="t sm b mid" x="311.5" y="142">Data</text>
+<rect class="n svc" x="337.3" y="120" width="134.3" height="36" rx="4"/><text class="t sm b mid" x="404.5" y="142">High-level</text>
+<rect class="n cache" x="471.7" y="120" width="206.7" height="36" rx="4"/><text class="t sm b mid" x="575.0" y="142">Deep dives</text>
+<rect class="n queue" x="678.3" y="120" width="51.7" height="36" rx="4"/><text class="t sm b mid" x="704.2" y="142">Wrap</text>
+<text class="t xs mono mute mid" x="110.0" y="172">0</text>
+<text class="t xs mono mute mid" x="182.3" y="172">7</text>
+<text class="t xs mono mute mid" x="234.0" y="172">12</text>
+<text class="t xs mono mute mid" x="285.7" y="172">17</text>
+<text class="t xs mono mute mid" x="337.3" y="172">22</text>
+<text class="t xs mono mute mid" x="471.7" y="172">35</text>
+<text class="t xs mono mute mid" x="678.3" y="172">55</text>
+<text class="t xs mono mute mid" x="730.0" y="172">60</text>
+<path class="line" d="M112,190 V196 H335 V190"/>
+<path class="line" d="M340,190 V196 H469 V190"/>
+<path class="line" d="M474,190 V196 H728 V190"/>
+<text class="t sm b mid" x="223.5" y="214">Agree what to build</text>
+<text class="t sm b mid" x="404.5" y="214">Build it</text>
+<text class="t sm b mid" x="601" y="214">Stress it</text>
+<text class="t xs mute mid" x="223.5" y="228">about a third of the time</text>
+<text class="t xs mute mid" x="404.5" y="228">one coherent picture</text>
+<text class="t xs mute mid" x="601" y="228">where the level signal comes from</text>
+</svg>
+</div>
+<figcaption><b>Where the minutes go.</b> Scoping, sizing and interfaces together take about a third of the slot. The deep dives get the largest single block, because that is where interviewers separate levels. In the longer slot, almost all extra time goes to deep dives.</figcaption>
+</figure>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Phase</th><th class="num">45 min</th><th class="num">60 min</th><th>You leave it with</th></tr></thead>
+<tbody>
+<tr><th>1. Requirements</th><td class="num">5</td><td class="num">7</td><td>3 to 5 functional requirements, the non-functional priorities, what is out of scope</td></tr>
+<tr><th>2. Estimation</th><td class="num">4</td><td class="num">5</td><td>Read and write QPS, storage per year, one or two conclusions drawn from them</td></tr>
+<tr><th>3. API</th><td class="num">4</td><td class="num">5</td><td>The 3 to 5 endpoints that serve the functional requirements</td></tr>
+<tr><th>4. Data model</th><td class="num">4</td><td class="num">5</td><td>Core entities, their keys, the main access patterns, a storage choice</td></tr>
+<tr><th>5. High-level design</th><td class="num">10</td><td class="num">13</td><td>A diagram that serves every functional requirement end to end</td></tr>
+<tr><th>6. Deep dives</th><td class="num">14</td><td class="num">20</td><td>Two or three hard parts solved, with alternatives and trade-offs stated</td></tr>
+<tr><th>7. Wrap-up</th><td class="num">4</td><td class="num">5</td><td>Bottlenecks, failure modes, what you would do next</td></tr>
+</tbody></table></div>
+<p>Treat the budget as a guard rail, not a script. If the interviewer interrupts at minute 8 with "skip the numbers, assume it is big", skip them. If they want to spend 20 minutes on one component, follow them. The budget matters most when nobody steers, because then the default failure is running out of time before the deep dives.</p>
+<div class="callout note">
+<div class="callout-title">Some companies merge or reorder phases</div>
+<p>Many interviewers now say "skip estimation unless a number changes your design". Others want the API before requirements are finished, or the data model folded into the high-level design. The phases still happen, just compressed. Ask early: "I usually go requirements, a quick estimate, API, then design. Does that work for you?"</p>
+</div>
+
+<h2 id="funnel">From vague to concrete</h2>
+<p>Each phase narrows the problem. The prompt allows thousands of designs. Requirements cut that to hundreds, numbers to dozens, interfaces to a handful, and the high-level design to one picture you can then stress. Skipping a level means making the next level's decisions without information.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 300" role="img" aria-label="A funnel of six levels from vague prompt to scope, numbers, interfaces, components and decisions, each with an Instagram example on the right">
+<polygon class="n client" points="10.0,20 390.0,20 370.8,60 29.2,60"/><text class="t b mid" x="200" y="45">Vague prompt</text>
+<path class="line faint" d="M398.0,40.0 H415" style="stroke-dasharray:3 3"/>
+<text class="t sm" x="424" y="36">"Design Instagram"</text>
+<text class="t xs mute" x="424" y="51">no scale, no features, no constraints</text>
+<polygon class="n svc" points="29.2,66 370.8,66 351.7,106 48.3,106"/><text class="t b mid" x="200" y="91">Scope</text>
+<path class="line faint" d="M378.8,86.0 H415" style="stroke-dasharray:3 3"/>
+<text class="t sm" x="424" y="82">post photos, follow users, home feed</text>
+<text class="t xs mute" x="424" y="97">read-heavy; feed p99 under 500 ms</text>
+<polygon class="n ext" points="48.3,112 351.7,112 332.5,152 67.5,152"/><text class="t b mid" x="200" y="137">Numbers</text>
+<path class="line faint" d="M359.7,132.0 H415" style="stroke-dasharray:3 3"/>
+<text class="t sm" x="424" y="128">500M DAU, ~58k feed reads/s</text>
+<text class="t xs mute" x="424" y="143">~1.2k uploads/s, ~200 TB of media per day</text>
+<polygon class="n db" points="67.5,158 332.5,158 313.3,198 86.7,198"/><text class="t b mid" x="200" y="183">Interfaces</text>
+<path class="line faint" d="M340.5,178.0 H415" style="stroke-dasharray:3 3"/>
+<text class="t sm mono" x="424" y="174">POST /v1/posts, GET /v1/feed</text>
+<text class="t xs mute" x="424" y="189">users, posts, follows; feed by user_id</text>
+<polygon class="n svc" points="86.7,204 313.3,204 294.2,244 105.8,244"/><text class="t b mid" x="200" y="229">Components</text>
+<path class="line faint" d="M321.3,224.0 H415" style="stroke-dasharray:3 3"/>
+<text class="t sm" x="424" y="220">post service, feed service, object store</text>
+<text class="t xs mute" x="424" y="235">CDN, feed cache, fan-out queue</text>
+<polygon class="n cache" points="105.8,250 294.2,250 275.0,290 125.0,290"/><text class="t b mid" x="200" y="275">Decisions</text>
+<path class="line faint" d="M302.2,270.0 H415" style="stroke-dasharray:3 3"/>
+<text class="t sm" x="424" y="266">fan-out on write, except celebrities</text>
+<text class="t xs mute" x="424" y="281">and what that costs in storage and lag</text>
+</svg>
+</div>
+<figcaption><b>The design funnel.</b> Each level is decided using the one above it. "Fan-out on write" is only a defensible decision once you know the feed is read 50 times more often than posts are written, and that the feed has a latency target.</figcaption>
+</figure>
+
+<h2 id="requirements">Phase 1: requirements</h2>
+<p>The goal is a short, written list that you and the interviewer agree on. Write it on the board. It becomes the checklist you verify the design against at the end.</p>
+
+<h3 id="functional-vs-nonfunctional">Functional vs non-functional</h3>
+<div class="defs">
+<div><h4>Functional requirements</h4><p>What the system does, phrased as user actions. "A user can upload a photo with a caption." "A user sees a feed of recent posts from people they follow." Each one should map to an API call later.</p></div>
+<div><h4>Non-functional requirements</h4><p>How well it does it: latency, availability, consistency, durability, scale, cost, security. "Feed loads in under 500 ms at p99." "An uploaded photo is never lost." These drive almost every architectural choice.</p></div>
+<div><h4>Out of scope</h4><p>Features you name and deliberately park: stories, direct messages, ads, search. Saying them out loud shows you know they exist, and protects your time.</p></div>
+</div>
+<p>A <dfn>functional requirement</dfn> describes behaviour. A <dfn>non-functional requirement</dfn> describes a quality the behaviour must have. Weak candidates list functional requirements and stop. Strong candidates spend most of the phase on the non-functional side, because two systems with identical features (a bank ledger and a social feed both "show a list of recent items") end up with opposite designs once you ask how stale the list may be.</p>
+
+<h3 id="questions-to-ask">Questions that change the design</h3>
+<p>Every question should be one whose answer moves a box. "What colour is the button?" does not. These do:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Question</th><th>Why it matters</th><th>Design it changes</th></tr></thead>
+<tbody>
+<tr><th>Who are the users and how many?</th><td>Sets every later number</td><td>Single database vs sharded, one region vs many</td></tr>
+<tr><th>What is the read/write ratio?</th><td>Read-heavy systems cache and precompute; write-heavy ones batch and partition</td><td>Fan-out on write vs read, cache vs log</td></tr>
+<tr><th>How fresh must reads be?</th><td>Decides whether replicas and caches may serve slightly stale data</td><td>Consistency model, replication mode (see <a href="consistency-models.html">Consistency Models</a>)</td></tr>
+<tr><th>What happens if we lose data?</th><td>A lost like is fine, a lost payment is not</td><td>Synchronous replication, durable queues, idempotency</td></tr>
+<tr><th>What latency do users feel?</th><td>p99 targets bound how many hops and disk reads a request may take</td><td>Caching, precomputation, regional deployment</td></tr>
+<tr><th>Global or one region?</th><td>Cross-region round trips are roughly 60 to 250 ms (US-Europe ~70-90 ms, US-Asia ~150-250 ms)</td><td>Data placement, multi-region writes, CDN</td></tr>
+</tbody></table></div>
+
+<div class="callout warn">
+<div class="callout-title">Common mistake</div>
+<p>Asking twenty questions and getting no decisions. If the interviewer answers "you decide", decide, say the assumption out loud, and write it down: "I'll assume 500 million daily users and that a feed may be up to a minute stale." A stated assumption is a decision the interviewer can redirect. An open question is just lost time.</p>
+</div>
+
+<h2 id="estimation-phase">Phase 2: estimation</h2>
+<p>Estimate only what will drive a decision: requests per second for reads and writes, storage growth, and sometimes bandwidth or cache size. Round aggressively. A day has 86,400 seconds; use 100,000 and say so. Then <strong>draw a conclusion</strong> from every number, because a number with no consequence is wasted time.</p>
+<div class="calc">Feed reads   500M DAU × 10 opens/day = 5B/day ÷ ~10^5 s  ≈ <span class="r">50k/s</span>  (exact 58k, peak ~2×)
+Uploads      100M photos/day ÷ ~10^5 s                ≈ <span class="r">1k/s</span>   (exact 1.2k)
+Media        100M × ~2 MB (original + resized)        ≈ <span class="r">200 TB/day</span>  ≈ 73 PB/year
+Conclusion   reads outnumber writes ~50:1  →  precompute and cache the feed
+             media dwarfs metadata         →  object store + CDN, not the database</div>
+<p>The <a href="estimation.html">Back-of-Envelope Estimation</a> chapter covers the techniques and the reference numbers in detail.</p>
+
+<h2 id="api-and-data">Phases 3 and 4: API and data model</h2>
+<p>The API turns each functional requirement into a call with inputs and outputs. Keep it to the few endpoints that matter and state the non-obvious details: pagination with a cursor rather than an offset, idempotency keys on writes that clients retry, and who is authenticated. Detail on these choices lives in <a href="api-design.html">API Design</a>.</p>
+<pre><code class="language-http">POST /v1/posts            { caption, media_ids[] }      → 201 { post_id }
+POST /v1/media            (returns a presigned upload URL)
+GET  /v1/feed?cursor=...  → 200 { posts[20], next_cursor }
+POST /v1/follows          { followee_id }               → 204</code></pre>
+<p>For the data model, list the core entities, their primary keys, and above all the <strong>access patterns</strong>: "get the 20 newest posts in a user's feed" is a different storage problem from "get one post by id". Then pick a store that serves those patterns. The choice should follow from the patterns, which <a href="data-modeling.html">Data Modeling</a> and <a href="sql-vs-nosql.html">SQL vs NoSQL</a> cover. One or two sentences of justification is enough here; you will return to it in deep dives if it matters.</p>
+
+<h2 id="high-level-design">Phase 5: the high-level design</h2>
+<p>Draw the simplest diagram that serves every functional requirement, then walk one request through it end to end. Start simple on purpose. A design that grows in response to stated requirements is far more convincing than one that starts with fifteen boxes, because every box then has a reason you can point to.</p>
+
+<figure class="fig wide" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 740 400" role="img" aria-label="Whiteboard evolution for Instagram: v1 is a client, one app server and one database; v2 adds a load balancer, separate feed and post services and an object store; v3 adds a feed cache, a fan-out queue and a CDN">
+<g data-show="1">
+<text class="t sm b" x="20" y="34">v1: one server, one database</text>
+<text class="t xs mute" x="20" y="52">Fine for the first ten thousand users.</text>
+<text class="t xs mute" x="20" y="67">One box to fail, one box to scale.</text>
+<rect class="n svc" x="290" y="145" width="125" height="50" rx="8"/><text class="t b mid" x="352.5" y="167">App server</text><text class="t xs mute mid" x="352.5" y="183">all endpoints</text>
+<rect class="n db" x="610" y="145" width="115" height="50" rx="8"/><text class="t b mid" x="667.5" y="167">Database</text><text class="t xs mute mid" x="667.5" y="183">rows and photos</text>
+<path class="e" d="M110,170 H286"/>
+<path class="e" d="M415,170 H606"/>
+</g>
+<g data-show="2">
+<text class="t sm b" x="20" y="34">v2: split by workload</text>
+<text class="t xs mute" x="20" y="52">Reads and writes scale separately.</text>
+<text class="t xs mute" x="20" y="67">Photo bytes leave the database.</text>
+<text class="t xs mute" x="430" y="60">pull: query follows, then posts</text>
+<path class="e" d="M415,75 C560,75 560,150 606,155"/>
+</g>
+<g data-show="3">
+<text class="t sm b" x="20" y="34">v3: precompute and cache</text>
+<text class="t xs mute" x="20" y="52">Feeds are built on write through a queue.</text>
+<text class="t xs mute" x="20" y="67">Images are served from a CDN.</text>
+<rect class="n cache" x="610" y="40" width="115" height="50" rx="8"/><text class="t b mid" x="667.5" y="62">Feed cache</text><text class="t xs mute mid" x="667.5" y="78">post ids per user</text>
+<rect class="n queue" x="460" y="145" width="110" height="50" rx="8"/><text class="t b mid" x="515" y="167">Fan-out</text><text class="t xs mute mid" x="515" y="183">queue + workers</text>
+<rect class="n ext" x="150" y="320" width="95" height="50" rx="8"/><text class="t b mid" x="197.5" y="349">CDN</text>
+<path class="e" d="M415,65 H606"/>
+<path class="e" d="M415,255 C440,255 440,170 456,170"/>
+<path class="e" d="M515,141 C515,100 560,62 606,62"/>
+<text class="t xs mute" x="532" y="122">push post id</text>
+<path class="e" d="M65,195 C65,300 100,345 146,345"/>
+<text class="t xs mute" x="20" y="320">images</text>
+<path class="e" d="M245,345 H640 C660,345 667.5,330 667.5,304"/>
+<text class="t xs mute mid" x="450" y="338">on miss</text>
+<path class="flow" d="M110,170 H146"/>
+<path class="flow" d="M245,160 C268,160 268,65 286,65"/>
+<path class="flow" d="M415,65 H606"/>
+</g>
+<g data-show="2 3">
+<rect class="n ext" x="150" y="145" width="95" height="50" rx="8"/><text class="t b mid" x="197.5" y="167">Load</text><text class="t b mid" x="197.5" y="183">balancer</text>
+<rect class="n svc" x="290" y="40" width="125" height="50" rx="8"/><text class="t b mid" x="352.5" y="62">Feed service</text><text class="t xs mute mid" x="352.5" y="78">read path</text>
+<rect class="n svc" x="290" y="250" width="125" height="50" rx="8"/><text class="t b mid" x="352.5" y="272">Post service</text><text class="t xs mute mid" x="352.5" y="288">write path</text>
+<rect class="n db" x="610" y="145" width="115" height="50" rx="8"/><text class="t b mid" x="667.5" y="167">Metadata DB</text><text class="t xs mute mid" x="667.5" y="183">users, posts, follows</text>
+<rect class="n db" x="610" y="250" width="115" height="50" rx="8"/><text class="t b mid" x="667.5" y="272">Object store</text><text class="t xs mute mid" x="667.5" y="288">photo bytes</text>
+<path class="e" d="M110,170 H146"/>
+<path class="e" d="M245,160 C268,160 268,65 286,65"/>
+<path class="e" d="M245,180 C268,180 268,275 286,275"/>
+<path class="e" d="M415,265 C560,265 560,190 606,185"/>
+<path class="e" d="M415,285 H606"/>
+<text class="t xs mute mid" x="510" y="300">upload bytes</text>
+</g>
+<rect class="n client" x="20" y="145" width="90" height="50" rx="8"/><text class="t b mid" x="65" y="167">Client</text><text class="t xs mute mid" x="65" y="183">mobile app</text>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">v1: single box</button><button type="button" data-step="2" aria-pressed="false">v2: split services</button><button type="button" data-step="3" aria-pressed="false">v3: cache and queue</button></div>
+</div>
+<figcaption><b>Growing the whiteboard.</b> Each version answers a requirement the previous one could not meet. v2 splits the read and write paths because their load differs by 50 times. v3 precomputes feeds because the pull query in v2 cannot meet a 500 ms p99 for users who follow thousands of accounts. The animated path is the v3 feed read.</figcaption>
+</figure>
+
+<p>Narrate the evolution rather than presenting v3 as if it fell from the sky. "This works, but the feed query joins follows with posts for every request. At 58,000 reads per second and a 500 ms target that will not hold, so I'll precompute feeds." The interviewer now knows why the cache and queue exist, and can push on that reasoning instead of on the boxes.</p>
+<ul>
+<li><strong>Walk a request through it.</strong> "The app calls <code>GET /v1/feed</code>, the load balancer routes to any feed service instance, which reads 20 post ids from the cache and hydrates them." Walking the path catches missing boxes.</li>
+<li><strong>Label the edges, not just the boxes.</strong> Synchronous call, async event, or batch job. Which arrows are on the hot path.</li>
+<li><strong>Check against the requirement list.</strong> Point at each functional requirement and show which path serves it.</li>
+</ul>
+
+<h2 id="deep-dives">Phase 6: deep dives</h2>
+<p>This is the largest block of time and the one that decides senior and staff outcomes. Pick the two or three parts of the design that are genuinely hard for <em>this</em> problem, and say why you picked them. For Instagram: feed generation for users who follow celebrities, media upload and delivery, and ID generation for posts that sort by time. For a payment system it would be idempotency and exactly-once ledger updates instead.</p>
+<p>Often the interviewer chooses. If they do not, offer a menu: "The interesting parts are feed fan-out, the media pipeline and the hot-key problem for celebrities. I'd start with fan-out. Sound good?"</p>
+<p>Every deep dive follows the same shape:</p>
+<ol class="steps">
+<li><strong>State the problem precisely.</strong> "A celebrity with 50 million followers posts. Fan-out on write means 50 million cache writes for one post."</li>
+<li><strong>Offer two or three options.</strong> Fan-out on write, fan-out on read, or a hybrid.</li>
+<li><strong>Compare them on the requirements.</strong> Write amplification, read latency, freshness, storage. Use numbers when you have them.</li>
+<li><strong>Choose, and say what you gave up.</strong> "Hybrid: push for normal accounts, pull for accounts above about 100,000 followers, merged at read time. We pay extra complexity in the read path."</li>
+<li><strong>Name the failure mode.</strong> What happens when the fan-out queue backs up? Feeds go stale, posts still save. That is the right way round for this product.</li>
+</ol>
+<p>Concept chapters such as <a href="caching.html">Caching</a>, <a href="sharding.html">Sharding</a>, <a href="message-queues.html">Message Queues</a> and <a href="fault-tolerance.html">Timeouts, Retries &amp; Circuit Breakers</a> are the raw material for deep dives. The <a href="news-feed.html">News Feed</a> case study runs the fan-out deep dive in full.</p>
+
+<h2 id="wrap-up">Phase 7: wrap-up</h2>
+<p>Reserve the last few minutes, even if the interviewer seems happy to keep going. Use them to show that you can judge your own design:</p>
+<ul>
+<li><strong>Bottlenecks:</strong> "The first thing to break is the hot shard holding a viral post's like counter."</li>
+<li><strong>Failure modes:</strong> what happens when a region, the cache cluster or the queue goes down, and what users see.</li>
+<li><strong>Operations:</strong> the two or three metrics you would alert on, and how you would roll out a schema change.</li>
+<li><strong>Next steps:</strong> the parked features and how the design would absorb them.</li>
+</ul>
+
+<h2 id="driving">Driving the conversation</h2>
+<p>The interviewer is grading whether you can lead a design discussion, so lead it. That does not mean talking non-stop. It means always making clear where you are, where you are going next, and inviting redirection at natural points.</p>
+<div class="defs">
+<div><h4>Signpost</h4><p>"I have the requirements. Next I'll do a two-minute estimate, mainly to size the feed reads." The interviewer always knows the plan and can change it cheaply.</p></div>
+<div><h4>Think out loud</h4><p>Silence gives the interviewer nothing to grade. Say the options you are weighing, even half-formed: "I'm deciding between a queue and a log here. The question is whether anything else needs to replay these events."</p></div>
+<div><h4>Check in at boundaries</h4><p>At the end of each phase: "Anything you'd like me to change before I go deeper?" Not after every sentence, which reads as insecurity.</p></div>
+<div><h4>Treat hints as gifts</h4><p>"What happens if that service is slow?" is rarely idle curiosity. It usually points at a weakness. Answer it directly, then fix the design.</p></div>
+</div>
+<p>The interviewer's questions also tell you what they care about. If they ask twice about consistency, the deep dive should be about consistency, whatever you had planned.</p>
+
+<h2 id="leveling">What interviewers grade, by level</h2>
+<p>Rubrics differ by company but nearly all score the same handful of dimensions: problem navigation (scoping and prioritising), solution design, technical depth, trade-off reasoning, and communication. What changes with level is how much of it you are expected to do without help.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Dimension</th><th>Mid-level (L4, SDE II)</th><th>Senior (L5, Senior SDE)</th><th>Staff (L6+)</th></tr></thead>
+<tbody>
+<tr><th>Scoping</th><td>Gathers requirements when prompted; may miss a key non-functional one</td><td>Drives scoping unprompted; identifies the requirement that dominates the design</td><td>Questions the problem itself; spots business constraints and cost before being asked</td></tr>
+<tr><th>Design</th><td>A working end-to-end design with standard components</td><td>A design fitted to this problem's numbers; every component justified</td><td>Several viable designs compared; chooses one with a clear argument about evolution over years</td></tr>
+<tr><th>Depth</th><td>Explains how a cache or a queue works</td><td>Goes deep on two areas unprompted: failure handling, consistency, hot spots</td><td>Deep in the areas that carry the most risk, including operations, migrations, and multi-team boundaries</td></tr>
+<tr><th>Trade-offs</th><td>Names a trade-off when asked</td><td>States what each choice gives up, with numbers</td><td>Weighs trade-offs against organisational cost: on-call load, team ownership, build vs buy</td></tr>
+<tr><th>Driving</th><td>Follows the interviewer's lead well</td><td>Leads the session; uses hints quickly</td><td>Leads, and steers toward the parts that matter most; the interviewer mostly listens</td></tr>
+</tbody></table></div>
+<p>The same answer can pass at one level and fail at another. "Put a cache in front of the database" is fine at mid-level. At senior the interviewer expects you to say what is cached, the hit rate you expect, how entries are invalidated, and what happens to the database when the cache cluster restarts cold.</p>
+
+<h2 id="dont-know">Handling "I don't know"</h2>
+<p>You will hit a question you cannot answer: the internals of a database you have never used, an exact number, an algorithm you half remember. Bluffing is the worst response, because interviewers often probe precisely where they expect bluffing, and a confident wrong answer damages trust in everything else you said. Instead:</p>
+<ol class="steps">
+<li><strong>Say what you do know.</strong> "I haven't operated Spanner, but I know it uses synchronised clocks with bounded uncertainty to order transactions globally."</li>
+<li><strong>Reason from first principles.</strong> "If I had to build that, I'd need some way to agree on order across regions, so I'd expect a commit to cost at least one cross-region round trip."</li>
+<li><strong>Bound the estimate.</strong> "I don't know the exact write throughput of one Kafka partition. It is sequential disk I/O, so I'd assume tens of megabytes per second and verify with a benchmark."</li>
+<li><strong>Make it a decision point.</strong> "Whichever it is, I'd design so that this component can be swapped, and here is the interface."</li>
+</ol>
+<p>Interviewers grade reasoning more than recall. "I don't know, but here is how I'd find out and here is what I'd assume until then" is a strong answer at every level.</p>
+
+<h2 id="worked-example">Worked example: the first 10 minutes of "Design Instagram"</h2>
+<p>Here is how the opening of a 45-minute session can sound. Notice that the candidate makes a decision after almost every exchange, and that each decision appears later in the design.</p>
+<div class="table-wrap"><table>
+<thead><tr><th class="num">Time</th><th>Who</th><th>What is said</th></tr></thead>
+<tbody>
+<tr><td class="num">0:00</td><th>Interviewer</th><td>Let's design Instagram.</td></tr>
+<tr><td class="num">0:10</td><th>Candidate</th><td>Instagram is big, so I'd like to pick the core. I'm thinking: upload a photo with a caption, follow other users, and see a home feed of posts from people I follow. I'd park stories, direct messages, search, comments and ads. Does that match what you want?</td></tr>
+<tr><td class="num">0:40</td><th>Interviewer</th><td>Yes. Include likes, but only the count.</td></tr>
+<tr><td class="num">0:50</td><th>Candidate</th><td>Got it, a like count per post. Now scale: should I assume something like today's Instagram, hundreds of millions of daily users?</td></tr>
+<tr><td class="num">1:05</td><th>Interviewer</th><td>Say 500 million daily active users.</td></tr>
+<tr><td class="num">1:15</td><th>Candidate</th><td>On quality: I'd assume the feed must load fast, say under 500 ms at p99, and that it may be slightly stale. If someone I follow posts, seeing it a few seconds or even a minute later is fine. Is that acceptable?</td></tr>
+<tr><td class="num">1:40</td><th>Interviewer</th><td>Fine. What about the photos themselves?</td></tr>
+<tr><td class="num">1:50</td><th>Candidate</th><td>Uploaded photos must never be lost, so durability matters more for media than for likes. A lost like is acceptable; a lost photo is not. Like counts can be approximate for a few seconds. I'll write these down.</td></tr>
+<tr><td class="num">2:30</td><th>Candidate</th><td><em>(writes)</em> Functional: post photo, follow, home feed, like count. Non-functional: feed p99 &lt; 500 ms, feed eventually consistent, media durable, highly available reads. Out: stories, DMs, search, comments, ads.</td></tr>
+<tr><td class="num">3:30</td><th>Candidate</th><td>Quick numbers. If an average user opens the feed 10 times a day, that is 5 billion feed reads a day. With about 10<sup>5</sup> seconds in a day that is roughly 50,000 per second, call it 100,000 at peak. If 1 in 5 users posts once a day, that is 100 million uploads, about 1,000 per second.</td></tr>
+<tr><td class="num">5:00</td><th>Candidate</th><td>So reads outnumber writes about 50 to 1. That tells me to do work at write time to make reads cheap. Media: 100 million photos at roughly 2 MB including resized versions is 200 TB a day. That goes in an object store behind a CDN, never in the database.</td></tr>
+<tr><td class="num">6:10</td><th>Interviewer</th><td>Good. Keep going.</td></tr>
+<tr><td class="num">6:20</td><th>Candidate</th><td>API. Upload is two steps: the client asks for a presigned URL and uploads bytes straight to the object store, then calls <code>POST /v1/posts</code> with the caption and media id. That keeps 200 TB a day out of our servers. The feed is <code>GET /v1/feed?cursor=</code> returning 20 posts, cursor-based so new posts at the top don't shift pages. Plus follow and like endpoints.</td></tr>
+<tr><td class="num">7:40</td><th>Candidate</th><td>Data: users, posts keyed by a time-sortable post id, follows as (follower, followee) pairs that I need to query in both directions, and a per-user feed list of post ids. Posts and follows are simple key lookups at huge scale, so a sharded key-value or wide-column store fits. I'll come back to that if we deep dive.</td></tr>
+<tr><td class="num">8:50</td><th>Candidate</th><td>Let me start the diagram with the simplest version and grow it. <em>(draws v1, then explains why the read path splits off, reaching v2 by minute 12)</em></td></tr>
+<tr><td class="num">9:40</td><th>Interviewer</th><td>How do you get a feed for someone who follows 2,000 accounts?</td></tr>
+<tr><td class="num">9:50</td><th>Candidate</th><td>That is the core deep dive. The naive query merges 2,000 timelines per request, which won't hit 500 ms at 100,000 reads per second. Let me finish the high-level picture in two minutes, then I'd like to spend real time on fan-out, including celebrities. OK?</td></tr>
+</tbody></table></div>
+<p>What made this opening strong: the candidate proposed scope instead of asking open questions, turned each answer into a written requirement, derived the two biggest design decisions (precomputed feeds, media out of the database) from the numbers, and when the interviewer jumped ahead, acknowledged the question, placed it in the plan, and kept control of time.</p>
+
+<h2 id="failure-modes">Common failure modes</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Failure mode</th><th>What it looks like</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><th>Jumping to boxes</th><td>Draws Kafka and Cassandra in minute two</td><td>Write requirements first; let every box answer one of them</td></tr>
+<tr><th>Endless scoping</th><td>Minute 15 and still asking questions</td><td>Propose scope and confirm; state assumptions instead of asking</td></tr>
+<tr><th>Numbers with no conclusion</th><td>Computes storage to three significant figures, then never mentions it again</td><td>End every estimate with "so this means..."</td></tr>
+<tr><th>Buzzword design</th><td>"We add a cache, a queue and microservices" without saying what each solves</td><td>For each component, name the requirement and the number that justify it</td></tr>
+<tr><th>One-sided choices</th><td>"I'd use NoSQL because it scales"</td><td>Every choice gets an alternative and a cost</td></tr>
+<tr><th>No failure thinking</th><td>Design only works when everything is up</td><td>Ask "what if this is slow or down?" for each component on the hot path</td></tr>
+<tr><th>Fighting the interviewer</th><td>Defends a choice after a clear hint that it is wrong</td><td>Hints are information. Acknowledge, reconsider, change the design</td></tr>
+<tr><th>Silent thinking</th><td>Long pauses with no narration</td><td>Say the options you are weighing, even when undecided</td></tr>
+<tr><th>Running out of time</th><td>Deep dives never happen</td><td>Watch the clock; by about minute 27 of 45 you should be leaving the high-level design</td></tr>
+</tbody></table></div>
+
+<h2 id="preparation">How to practise</h2>
+<ul>
+<li><strong>Time yourself.</strong> Run case studies against a 45-minute timer and note which phase overran. It is nearly always requirements or the high-level design.</li>
+<li><strong>Say it out loud.</strong> Practising silently trains a skill the interview does not test. Talk to a peer, or record yourself.</li>
+<li><strong>Learn the reference numbers.</strong> Latencies, throughputs and storage sizes from <a href="estimation.html">Estimation</a> and <a href="latency-availability.html">Latency, Throughput &amp; Availability</a> make your reasoning fast and credible.</li>
+<li><strong>Collect trade-offs, not answers.</strong> For every component in this handbook, be able to say what it costs. "Consistent hashing moves 1/N of keys, but does nothing for hot keys" is worth more than knowing its name.</li>
+<li><strong>Read real designs.</strong> Engineering blog posts describe systems under real constraints, including the mistakes. They give you concrete examples to cite.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to use it</h4>
+<p>In every design interview. Say the plan in one sentence at the start ("requirements, a quick estimate, API and data model, a high-level design, then deep dives on the hard parts") and then follow it visibly, so the interviewer can redirect you cheaply.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>"What would you change if traffic grew 10 times?" Name the first bottleneck and the next architecture step, not a whole new design.</li>
+<li>"Which part of this design are you least confident about?" Have an honest answer; it shows self-assessment.</li>
+<li>"How would you roll this out?" Feature flags, shadow traffic, gradual migration, backfills.</li>
+<li>"What would you monitor?" User-facing latency and error rate first, then saturation of the bottleneck you identified.</li>
+<li>"Can you do this with fewer components?" Be ready to remove anything that is not pulling its weight.</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>No requirements written down before the first box.</li>
+<li>Choosing technologies by brand ("Kafka because it's what big companies use") rather than by property.</li>
+<li>Never mentioning a trade-off, a failure, or a number.</li>
+<li>Ignoring the interviewer's hints, or arguing past them.</li>
+<li>Reaching minute 40 with no deep dive.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://github.com/donnemartin/system-design-primer" target="_blank" rel="noopener">The System Design Primer</a><span>Donne Martin. A large open collection of system design topics and interview walkthroughs, including a suggested step-by-step approach.</span></li>
+<li><a href="https://www.oreilly.com/library/view/designing-data-intensive-applications/9781491903063/" target="_blank" rel="noopener">Designing Data-Intensive Applications</a><span>Martin Kleppmann, O'Reilly, 2017. The best single book on the trade-offs that deep dives are made of.</span></li>
+<li><a href="https://sre.google/sre-book/service-level-objectives/" target="_blank" rel="noopener">Site Reliability Engineering: Service Level Objectives</a><span>Google, 2016. How to turn vague non-functional requirements into measurable targets.</span></li>
+<li><a href="https://medium.com/instagram-engineering/sharding-ids-at-instagram-1cf5a71e5a5c" target="_blank" rel="noopener">Sharding &amp; IDs at Instagram</a><span>Instagram Engineering, 2011. A real deep dive from the system used as the worked example: time-sortable IDs generated inside sharded PostgreSQL.</span></li>
+</ul>

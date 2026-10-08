@@ -1,0 +1,355 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">"Design a chat system for 500 million users" is not a design problem until you know what 500 million users means in requests per second, terabytes per day and machines. Is it one database or a thousand? Does the hot data fit in RAM? Will the network card saturate before the CPU does? Two minutes of arithmetic answers these questions, and the answers decide the architecture.</p>
+<p><dfn>Back-of-envelope estimation</dfn> is the habit of computing order-of-magnitude numbers quickly, with round inputs and stated assumptions. The goal is not precision. Being within a factor of two or three is plenty, because the decisions it drives are coarse: does this fit on one machine or need sharding, is this read path served from memory or disk, is the bandwidth bill a rounding error or the main cost.</p>
+<p>In an interview the estimate sits right after requirements (see <a href="approach.html">Approaching a Design Interview</a>). It is short, and every number should end in a conclusion: "about 70,000 reads per second at peak, so the read path has to be served from cache".</p>
+
+<h2 id="toolkit">The toolkit</h2>
+
+<h3 id="powers-of-two">Powers of two and data sizes</h3>
+<p>Storage and memory are counted in powers of two, network and disk vendors in powers of ten. The difference is under 13% even at the petabyte level, so in an estimate treat them as equal: 2<sup>10</sup> ≈ 10<sup>3</sup>.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Power</th><th class="num">Exact</th><th class="num">Approx.</th><th>Name</th><th>A thing that size</th></tr></thead>
+<tbody>
+<tr><td>2<sup>10</sup></td><td class="num">1,024</td><td class="num">10<sup>3</sup></td><td>KB (kilobyte)</td><td>A tweet with its metadata, a small JSON response</td></tr>
+<tr><td>2<sup>20</sup></td><td class="num">1,048,576</td><td class="num">10<sup>6</sup></td><td>MB (megabyte)</td><td>A compressed phone photo is 1 to 4 MB</td></tr>
+<tr><td>2<sup>30</sup></td><td class="num">≈ 1.07 billion</td><td class="num">10<sup>9</sup></td><td>GB (gigabyte)</td><td>About 27 minutes of 1080p video at 5 Mbps</td></tr>
+<tr><td>2<sup>40</sup></td><td class="num">≈ 1.10 trillion</td><td class="num">10<sup>12</sup></td><td>TB (terabyte)</td><td>A large server's RAM, or one consumer hard drive</td></tr>
+<tr><td>2<sup>50</sup></td><td class="num">≈ 1.13 × 10<sup>15</sup></td><td class="num">10<sup>15</sup></td><td>PB (petabyte)</td><td>A large company's data warehouse; dozens of storage servers</td></tr>
+</tbody></table></div>
+<p>Useful sizes for individual values:</p>
+<div class="defs">
+<div><h4>Identifiers</h4><p>Integer id: 8 bytes. UUID: 16 bytes binary, 36 as text. Timestamp: 8 bytes. An IPv4 address: 4 bytes.</p></div>
+<div><h4>Text</h4><p>ASCII character: 1 byte. UTF-8: 1 to 4 bytes per character. A 280-character post with author, ids and timestamps: about 300 bytes to 1 KB.</p></div>
+<div><h4>Media</h4><p>Thumbnail: 10 to 50 KB. Phone photo: 1 to 4 MB. One minute of 1080p video at 5 Mbps: about 40 MB.</p></div>
+<div><h4>Overhead</h4><p>Indexes, row headers and free space typically add 30% to 100% on top of raw values in a database. Replication multiplies everything by the replica count.</p></div>
+</div>
+
+<h3 id="latency-numbers">Latency numbers every programmer should know</h3>
+<p>Jeff Dean popularised this list at Google, building on a table in Peter Norvig's essay "Teach Yourself Programming in Ten Years". The exact values date from the late 2000s and some have moved since, but the <em>ratios</em> between tiers are what matter for design, and those have stayed remarkably stable: a memory reference is thousands of times faster than a datacenter round trip, which in turn is hundreds of times faster than crossing an ocean.</p>
+
+<figure class="fig wide">
+<div class="fig-frame">
+<svg viewBox="0 0 790 390" role="img" aria-label="Log-scale bar chart of classic latency numbers from an L1 cache reference at 0.5 nanoseconds to a California to Netherlands round trip at 150 milliseconds">
+<path class="line faint" d="M250.0,30 V346"/>
+<path class="line faint" d="M296.0,30 V346"/>
+<path class="line faint" d="M342.0,30 V346"/>
+<path class="line faint" d="M388.0,30 V346"/>
+<path class="line faint" d="M434.0,30 V346"/>
+<path class="line faint" d="M480.0,30 V346"/>
+<path class="line faint" d="M526.0,30 V346"/>
+<path class="line faint" d="M572.0,30 V346"/>
+<path class="line faint" d="M618.0,30 V346"/>
+<path class="line faint" d="M664.0,30 V346"/>
+<path class="line faint" d="M710.0,30 V346"/>
+<text class="t xs mono mute mid" x="296.0" y="22">1 ns</text>
+<text class="t xs mono mute mid" x="434.0" y="22">1 µs</text>
+<text class="t xs mono mute mid" x="572.0" y="22">1 ms</text>
+<text class="t xs mono mute mid" x="710.0" y="22">1 s</text>
+<text class="t sm end" x="240" y="47">L1 cache reference</text>
+<rect class="n cache" x="250" y="34" width="32.2" height="17" rx="3"/>
+<text class="t sm end" x="240" y="71">Branch mispredict</text>
+<rect class="n cache" x="250" y="58" width="78.2" height="17" rx="3"/>
+<text class="t sm end" x="240" y="95">L2 cache reference</text>
+<rect class="n cache" x="250" y="82" width="84.9" height="17" rx="3"/>
+<text class="t sm end" x="240" y="119">Main memory reference</text>
+<rect class="n cache" x="250" y="106" width="138.0" height="17" rx="3"/>
+<text class="t sm end" x="240" y="143">Compress 1 KB (Snappy)</text>
+<rect class="n svc" x="250" y="130" width="205.9" height="17" rx="3"/>
+<text class="t sm end" x="240" y="167">Send 2 KB over 1 Gbps</text>
+<rect class="n svc" x="250" y="154" width="243.8" height="17" rx="3"/>
+<text class="t sm end" x="240" y="191">SSD random read</text>
+<rect class="n svc" x="250" y="178" width="284.1" height="17" rx="3"/>
+<text class="t sm end" x="240" y="215">Read 1 MB from memory</text>
+<rect class="n svc" x="250" y="202" width="294.3" height="17" rx="3"/>
+<text class="t sm end" x="240" y="239">Round trip in datacenter</text>
+<rect class="n svc" x="250" y="226" width="308.2" height="17" rx="3"/>
+<text class="t sm end" x="240" y="263">Read 1 MB from SSD</text>
+<rect class="n queue" x="250" y="250" width="322.0" height="17" rx="3"/>
+<text class="t sm end" x="240" y="287">Disk seek</text>
+<rect class="n queue" x="250" y="274" width="368.0" height="17" rx="3"/>
+<text class="t sm end" x="240" y="311">Read 1 MB from disk</text>
+<rect class="n queue" x="250" y="298" width="381.8" height="17" rx="3"/>
+<text class="t sm end" x="240" y="335">Packet CA to Netherlands and back</text>
+<rect class="n queue" x="250" y="322" width="422.1" height="17" rx="3"/>
+<text class="t xs mono mute" x="722" y="47">0.5 ns</text>
+<text class="t xs mono mute" x="722" y="71">5 ns</text>
+<text class="t xs mono mute" x="722" y="95">7 ns</text>
+<text class="t xs mono mute" x="722" y="119">100 ns</text>
+<text class="t xs mono mute" x="722" y="143">3 µs</text>
+<text class="t xs mono mute" x="722" y="167">20 µs</text>
+<text class="t xs mono mute" x="722" y="191">150 µs</text>
+<text class="t xs mono mute" x="722" y="215">250 µs</text>
+<text class="t xs mono mute" x="722" y="239">500 µs</text>
+<text class="t xs mono mute" x="722" y="263">1 ms</text>
+<text class="t xs mono mute" x="722" y="287">10 ms</text>
+<text class="t xs mono mute" x="722" y="311">20 ms</text>
+<text class="t xs mono mute" x="722" y="335">150 ms</text>
+
+<rect class="n cache" x="250" y="362" width="14" height="12" rx="2"/><text class="t xs" x="270" y="372">nanoseconds: CPU and memory</text>
+<rect class="n svc" x="455" y="362" width="14" height="12" rx="2"/><text class="t xs" x="475" y="372">microseconds: SSD, LAN</text>
+<rect class="n queue" x="620" y="362" width="14" height="12" rx="2"/><text class="t xs" x="640" y="372">milliseconds: disk, WAN</text>
+</svg>
+</div>
+<figcaption><b>The latency ladder, drawn to scale on a log axis.</b> Each gridline is ten times the one before (labels every thousand), so equal lengths mean equal multiples, not equal additions. Values are the classic Dean figures, with the SSD rows from the later community version. The ladder spans more than eight orders of magnitude.</figcaption>
+</figure>
+
+<p>To feel the ratios, scale time so that an L1 cache hit takes one second. Every other number below is computed by multiplying by two billion.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Operation</th><th class="num">Classic value</th><th class="num">If L1 = 1 second</th><th>Today (approximate)</th></tr></thead>
+<tbody>
+<tr><th>L1 cache reference</th><td class="num">0.5 ns</td><td class="num">1 second</td><td>About 1 ns; roughly unchanged</td></tr>
+<tr><th>Main memory reference</th><td class="num">100 ns</td><td class="num">3.3 minutes</td><td>Still 80 to 100 ns. DRAM latency has barely improved in 15 years</td></tr>
+<tr><th>Compress 1 KB (Snappy, then called Zippy)</th><td class="num">3 µs</td><td class="num">1.7 hours</td><td>About 2 µs at Snappy's typical 500 MB/s per core</td></tr>
+<tr><th>Send 2 KB over 1 Gbps</th><td class="num">20 µs</td><td class="num">11.1 hours</td><td>Servers now have 25 to 100 Gbps NICs: under 1 µs of wire time</td></tr>
+<tr><th>SSD random 4 KB read</th><td class="num">150 µs</td><td class="num">3.5 days</td><td>NVMe: about 20 to 100 µs</td></tr>
+<tr><th>Read 1 MB sequentially from memory</th><td class="num">250 µs</td><td class="num">5.8 days</td><td>Tens of µs on one core</td></tr>
+<tr><th>Round trip within a datacenter</th><td class="num">500 µs</td><td class="num">11.6 days</td><td>Often 50 to 200 µs; 0.5 ms is a safe planning number</td></tr>
+<tr><th>Read 1 MB sequentially from SSD</th><td class="num">1 ms</td><td class="num">23.1 days</td><td>NVMe at 3 to 7 GB/s: 150 to 350 µs</td></tr>
+<tr><th>Disk seek (spinning HDD)</th><td class="num">10 ms</td><td class="num">231.5 days</td><td>Still 4 to 10 ms: it is mechanical</td></tr>
+<tr><th>Read 1 MB sequentially from HDD</th><td class="num">20 ms</td><td class="num">1.3 years</td><td>About 4 to 10 ms at 100 to 250 MB/s</td></tr>
+<tr><th>Round trip California to Netherlands</th><td class="num">150 ms</td><td class="num">9.5 years</td><td>Still about 140 to 150 ms: bounded by the speed of light in fibre</td></tr>
+</tbody></table></div>
+<p>The lessons that survive every hardware generation:</p>
+<ul>
+<li><strong>Memory beats network beats disk seek.</strong> Reading a value from a cache in the same datacenter (one round trip, about 0.5 ms) is roughly 20 times faster than a random read on a spinning disk. That is the whole case for <a href="caching.html">caching</a>.</li>
+<li><strong>Sequential beats random.</strong> An HDD streams 1 MB in about the time of two seeks. Log-structured storage engines and Kafka exist because of this ratio (see <a href="indexing.html">Indexing</a>).</li>
+<li><strong>Distance is physics.</strong> Light in fibre covers about 200 km per millisecond, so a round trip costs about 1 ms per 100 km of route. No upgrade fixes a 150 ms intercontinental round trip; only moving data closer does (see <a href="cdn.html">CDNs</a>).</li>
+<li><strong>Count round trips, not instructions.</strong> A request that makes 10 sequential calls to a database in another region spends roughly a second waiting, whatever the CPU does.</li>
+</ul>
+
+<h3 id="seconds-per-day">The seconds-per-day trick</h3>
+<p>Almost every estimate converts "per day" into "per second". A day has 86,400 seconds. Round it to <strong>10<sup>5</sup></strong> and division becomes subtracting exponents: 10<sup>9</sup> requests a day is 10<sup>4</sup> per second. The shortcut underestimates by about 14%, which is noise next to your other assumptions; mention it and move on.</p>
+<div class="calc">1 day    = 86,400 s       ≈ 10^5 s
+1 month  ≈ 2.6 million s  ≈ 2.5 × 10^6 s
+1 year   ≈ 31.5 million s ≈ 3 × 10^7 s   (π × 10^7 is a good mnemonic)
+
+1 million / day   ≈ 12 / s
+1 billion / day   ≈ 12,000 / s
+1 request / s     ≈ 86,400 / day ≈ 2.6 million / month</div>
+
+<h2 id="method">The method</h2>
+<p>Every estimate in an interview is a chain of a few multiplications. Write the chain down so the interviewer can follow it and correct one input without redoing everything.</p>
+
+<figure class="fig wide">
+<div class="fig-frame">
+<svg viewBox="0 0 760 165" role="img" aria-label="Estimation pipeline: 200 million daily users times 10 reads equals 2 billion reads per day, divided by 86,400 equals about 23 thousand per second, times 3 for peak equals 69 thousand per second, divided by 2,000 per server equals 35 servers">
+<rect class="n client" x="8" y="40" width="112" height="62" rx="8"/><text class="t b mid" x="64" y="66">200M</text><text class="t xs mute mid" x="64" y="84">daily active users</text>
+<rect class="n svc" x="166" y="40" width="112" height="62" rx="8"/><text class="t b mid" x="222" y="66">2B / day</text><text class="t xs mute mid" x="222" y="84">timeline reads</text>
+<rect class="n svc" x="324" y="40" width="112" height="62" rx="8"/><text class="t b mid" x="380" y="66">~23k / s</text><text class="t xs mute mid" x="380" y="84">average QPS</text>
+<rect class="n cache" x="482" y="40" width="112" height="62" rx="8"/><text class="t b mid" x="538" y="66">~69k / s</text><text class="t xs mute mid" x="538" y="84">peak QPS</text>
+<rect class="n db" x="640" y="40" width="112" height="62" rx="8"/><text class="t b mid" x="696" y="66">35 servers</text><text class="t xs mute mid" x="696" y="84">plus spares</text>
+<path class="e" d="M122,80 H162"/><path class="e" d="M280,80 H320"/><path class="e" d="M438,80 H478"/><path class="e" d="M596,80 H636"/>
+<path class="flow" d="M122,80 H162"/><path class="flow" d="M280,80 H320"/><path class="flow" d="M438,80 H478"/><path class="flow" d="M596,80 H636"/>
+<text class="t sm mono accent mid" x="143" y="68">×10</text>
+<text class="t xs mono accent mid" x="301" y="68">÷86.4k</text>
+<text class="t sm mono accent mid" x="459" y="68">×3</text>
+<text class="t sm mono accent mid" x="617" y="68">÷2k</text>
+<text class="t xs mute mid" x="143" y="124">reads per</text><text class="t xs mute mid" x="143" y="137">user per day</text>
+<text class="t xs mute mid" x="301" y="124">seconds</text><text class="t xs mute mid" x="301" y="137">per day</text>
+<text class="t xs mute mid" x="459" y="124">peak to</text><text class="t xs mute mid" x="459" y="137">average</text>
+<text class="t xs mute mid" x="617" y="124">req/s one</text><text class="t xs mute mid" x="617" y="137">server handles</text>
+<text class="t xs mute" x="8" y="22">each arrow is one stated assumption; change one and only the boxes to its right change</text>
+</svg>
+</div>
+<figcaption><b>From users to machines.</b> The chain for the read path of a Twitter-like timeline. Four assumptions, each written on an arrow, turn a user count into a fleet size. The same chain with different inputs sizes writes, storage and bandwidth.</figcaption>
+</figure>
+
+<h3 id="qps">Requests per second</h3>
+<p>Start from daily active users (<dfn>DAU</dfn>) and how often each does the action: <code>QPS = DAU × actions per user per day ÷ 86,400</code>. Compute reads and writes separately; their ratio is often the most important single number in the design. A 100:1 read-heavy system wants caches and precomputation. A 1:1 or write-heavy system (metrics, chat, logging) wants append-only storage and partitioning.</p>
+
+<h3 id="peak">Peak factors</h3>
+<p>Traffic is not flat. Consumer products follow the sun, with a daily peak about 2 to 3 times the average. Events push harder: a sports final, a product launch or New Year's midnight can produce 5 to 10 times normal load for minutes. Size the system for peak, not average, and say which multiplier you used. When in doubt, 2× to 3× for daily peak is the conventional choice, with a note that known events need more.</p>
+
+<h3 id="storage">Storage</h3>
+<p><code>storage = new items per day × bytes per item × days retained × replication factor</code>, plus index and format overhead. Two things dominate in practice. First, <strong>media dwarfs metadata</strong>: a 2 MB photo weighs as much as several thousand text posts, so estimate them separately and expect different stores. Second, <strong>growth dominates the multi-year number</strong>. A five-year storage figure computed with today's upload rate can be off by more than two times.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 690 305" role="img" aria-label="Bar chart of cumulative raw photo storage over five years: with a flat rate it reaches 36.5 petabytes, with 50 percent yearly growth it reaches 96.3 petabytes">
+<path class="line" d="M66,270.0 H70"/><text class="t xs mono mute end" x="62" y="274.0">0</text>
+<path class="line" d="M66,212.5 H70"/><text class="t xs mono mute end" x="62" y="216.5">25</text>
+<path class="line" d="M66,155.0 H70"/><text class="t xs mono mute end" x="62" y="159.0">50</text>
+<path class="line" d="M66,97.5 H70"/><text class="t xs mono mute end" x="62" y="101.5">75</text>
+<path class="line" d="M66,40.0 H70"/><text class="t xs mono mute end" x="62" y="44.0">100</text>
+<text class="t xs mute" x="62" y="28.0" style="text-anchor:end">PB</text>
+<rect class="n svc" x="93.0" y="253.2" width="34" height="16.8" rx="2"/>
+<text class="t xs mono mid" x="110.0" y="247.2">7.3</text>
+<rect class="n cache" x="133.0" y="253.2" width="34" height="16.8" rx="2"/>
+<text class="t xs mono mid" x="150.0" y="247.2">7.3</text>
+<text class="t sm mid" x="130.0" y="290">Year 1</text>
+<rect class="n svc" x="213.0" y="236.4" width="34" height="33.6" rx="2"/>
+<text class="t xs mono mid" x="230.0" y="230.4">14.6</text>
+<rect class="n cache" x="253.0" y="228.1" width="34" height="41.9" rx="2"/>
+<text class="t xs mono mid" x="270.0" y="222.1">18.2</text>
+<text class="t sm mid" x="250.0" y="290">Year 2</text>
+<rect class="n svc" x="333.0" y="219.6" width="34" height="50.4" rx="2"/>
+<text class="t xs mono mid" x="350.0" y="213.6">21.9</text>
+<rect class="n cache" x="373.0" y="190.2" width="34" height="79.8" rx="2"/>
+<text class="t xs mono mid" x="390.0" y="184.2">34.7</text>
+<text class="t sm mid" x="370.0" y="290">Year 3</text>
+<rect class="n svc" x="453.0" y="202.8" width="34" height="67.2" rx="2"/>
+<text class="t xs mono mid" x="470.0" y="196.8">29.2</text>
+<rect class="n cache" x="493.0" y="133.6" width="34" height="136.4" rx="2"/>
+<text class="t xs mono mid" x="510.0" y="127.6">59.3</text>
+<text class="t sm mid" x="490.0" y="290">Year 4</text>
+<rect class="n svc" x="573.0" y="186.1" width="34" height="83.9" rx="2"/>
+<text class="t xs mono mid" x="590.0" y="180.1">36.5</text>
+<rect class="n cache" x="613.0" y="48.5" width="34" height="221.5" rx="2"/>
+<text class="t xs mono mid" x="630.0" y="42.5">96.3</text>
+<text class="t sm mid" x="610.0" y="290">Year 5</text>
+<path class="line" d="M70,270 H670 M70,270 V40.0"/>
+
+<rect class="n svc" x="90" y="52" width="14" height="12" rx="2"/><text class="t xs" x="110" y="62">flat: 10M photos a day every year</text>
+<rect class="n cache" x="90" y="72" width="14" height="12" rx="2"/><text class="t xs" x="110" y="82">uploads grow 50% a year</text>
+</svg>
+</div>
+<figcaption><b>Cumulative raw storage, photo service.</b> 10 million uploads a day at about 2 MB each adds 7.3 PB in the first year. After five years the flat estimate says 36.5 PB; with 50% yearly growth in uploads it is 96.3 PB. Multiply by 3 for replicated storage, or about 1.5 with erasure coding.</figcaption>
+</figure>
+
+<h3 id="bandwidth">Bandwidth</h3>
+<p><code>bandwidth = QPS × bytes per request or response</code>. Compute ingress (uploads) and egress (downloads) separately; for media products egress is usually far larger and is the line item that justifies a CDN. Convert to bits when comparing with network links: 1 GB/s is 8 Gbps. A single server typically has a 10 to 100 Gbps NIC, but serving at more than half of line rate for long is optimistic.</p>
+
+<h3 id="cache-memory">Memory for caches</h3>
+<p>Access patterns are usually skewed: a small fraction of items gets most of the reads. A common rule of thumb is to cache the hottest 20% of a day's read volume, then check that against server RAM. Ask: does the hot set fit on one machine (under a few hundred GB), on a small cluster (a few TB), or not at all? The answer decides between an in-process cache, a Redis or Memcached cluster, or redesigning what you cache. Store compact representations: a list of 8-byte post ids is much smaller than rendered timelines.</p>
+
+<h3 id="servers">Number of servers</h3>
+<p><code>servers = peak QPS ÷ QPS one server sustains</code>, then add redundancy: at least one spare per availability zone so that losing a zone or deploying a release does not overload the rest. Per-server throughput depends wildly on the work done, so state your assumption. Rough orders of magnitude for planning:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Component</th><th class="num">Rough per-node throughput</th><th>Depends mostly on</th></tr></thead>
+<tbody>
+<tr><th>Stateless API server doing light work</th><td class="num">1k to 10k req/s</td><td>Serialization, downstream calls, language runtime</td></tr>
+<tr><th>Redis or Memcached, simple gets and sets</th><td class="num">100k+ ops/s</td><td>Value size, pipelining, network</td></tr>
+<tr><th>Relational database, indexed point queries</th><td class="num">thousands to tens of thousands/s</td><td>Working set in RAM, write mix, query shape</td></tr>
+<tr><th>Kafka broker</th><td class="num">hundreds of MB/s</td><td>Disks, replication factor, batching</td></tr>
+<tr><th>WebSocket gateway, mostly idle connections</th><td class="num">100k to 1M connections</td><td>Memory per connection, kernel tuning</td></tr>
+</tbody></table></div>
+<div class="callout warn">
+<div class="callout-title">Common mistake</div>
+<p>Quoting per-server numbers as facts. They vary by an order of magnitude with workload. Say "assuming a server handles about 2,000 of these per second" so the interviewer can adjust it, and treat the resulting server count as a range. The useful output is "tens of servers" versus "thousands", not "35".</p>
+</div>
+
+<h2 id="worked-timeline">Worked example 1: a Twitter-like timeline</h2>
+<p>Assume 200 million DAU. Half of them post once a day, so 100 million tweets a day. Each user loads the home timeline 10 times a day. A stored tweet with metadata is about 300 bytes; a timeline page returns 20 tweets, about 6 KB before media. The average user has 200 followers.</p>
+<div class="stats">
+<div><b>~3.5k/s</b><span>tweet writes at peak</span></div>
+<div><b>~69k/s</b><span>timeline reads at peak</span></div>
+<div><b>~231k/s</b><span>timeline inserts if fanned out on write</span></div>
+<div><b>~1.3 TB</b><span>RAM for 800 cached ids per user</span></div>
+</div>
+<div class="calc">Writes      100M tweets/day ÷ 86,400          ≈ 1,157/s      peak ×3 ≈ <span class="r">3.5k/s</span>
+Reads       200M × 10 = 2B/day ÷ 86,400         ≈ 23,148/s     peak ×3 ≈ <span class="r">69k/s</span>
+Ratio       reads : writes                      ≈ 20 : 1
+Storage     100M × 300 B = 30 GB/day  → × 365 × 5 × 3 replicas ≈ <span class="r">164 TB</span> of text
+Fan-out     100M tweets × 200 followers = 20B timeline inserts/day ≈ <span class="r">231k/s</span>
+Cache       200M users × 800 ids × 8 B          ≈ <span class="r">1.28 TB</span>  → a few dozen cache nodes
+Egress      69k/s × 6 KB                        ≈ 417 MB/s ≈ 3.3 Gbps, text only
+Servers     69k/s ÷ 2,000 per server            ≈ 35, plus spares per zone</div>
+<p>The conclusions: text storage is small (one modest cluster). The read rate requires serving timelines from memory. And the fan-out figure is the surprise: pushing each tweet into every follower's timeline costs about 231,000 cache writes per second on average, more than three times the peak read rate, and a celebrity with 50 million followers turns one tweet into 50 million writes. That single number motivates the hybrid push/pull design in the <a href="news-feed.html">News Feed</a> case study.</p>
+
+<h2 id="worked-photos">Worked example 2: photo storage</h2>
+<p>A photo-sharing service receives 10 million uploads a day. Each upload is stored as the original (about 1.7 MB) plus resized variants (about 300 KB total), so call it 2 MB per photo.</p>
+<div class="calc">Ingest      10M × 2 MB = 20 TB/day  ÷ 86,400     ≈ 231 MB/s ≈ <span class="r">1.9 Gbps</span> average upload
+Year 1      20 TB × 365                         ≈ <span class="r">7.3 PB</span> raw
+5 years     flat rate: 36.5 PB    with 50%/yr growth: <span class="r">96.3 PB</span> raw
+Replicated  × 3 copies   → ~290 PB      erasure coded (× ~1.5) → ~145 PB
+Drives      145 PB ÷ 20 TB per drive        ≈ 7,000+ drives before spares</div>
+<p>The conclusions: this is an <a href="blob-storage.html">object storage</a> problem, never a database one; the database holds only metadata (id, owner, object key, dimensions), about 1 KB per photo. The replication scheme is a cost decision worth tens of petabytes, which is why large stores use erasure coding for cold data. And the upload path should send bytes straight to the object store with presigned URLs, so 2 Gbps of uploads never passes through application servers.</p>
+
+<h2 id="worked-chat">Worked example 3: chat messages</h2>
+<p>A messaging app has 500 million DAU, each sending 40 messages a day. A message is about 100 bytes of text plus 100 bytes of metadata (ids, timestamps, status). At peak, 30% of DAU are connected at once.</p>
+<div class="calc">Messages    500M × 40 = 20B/day ÷ 86,400        ≈ 231k/s     peak ×3 ≈ <span class="r">700k/s</span>
+Storage     20B × 200 B                          = <span class="r">4 TB/day</span>  ≈ 1.46 PB/year, before replication
+Connections 30% × 500M                           = <span class="r">150M concurrent</span>
+Gateways    150M ÷ 100k connections per server   ≈ 1,500 servers   (÷ 1M per tuned server ≈ 150)</div>
+<p>The conclusions: the write rate (hundreds of thousands per second) rules out a single relational primary and points to a partitioned, write-optimised store keyed by conversation. Persistent connections, not request rate, size the gateway fleet, and the per-server connection limit swings the answer by ten times, so it is worth a sentence on memory per connection. WhatsApp famously reported over two million connections on one tuned server in 2012. Whether to keep history at all is a product question that changes storage from 4 TB a day kept forever to "until delivered". The <a href="chat-system.html">Chat System</a> case study builds on these numbers.</p>
+
+<h2 id="python-helper">A parameterised helper</h2>
+<p>When practising, it helps to check your mental arithmetic. This helper takes the usual inputs and prints the numbers an interviewer expects. The output in the comment is from a real run with the timeline example's inputs.</p>
+<pre><code class="language-python">import math
+
+DAY = 86_400                       # seconds; use 10**5 when doing it in your head
+
+
+def human(n, unit=""):
+    for div, suffix in ((1e15, "P"), (1e12, "T"), (1e9, "G"), (1e6, "M"), (1e3, "k")):
+        if n &gt;= div:
+            return f"{n / div:.1f} {suffix}{unit}"
+    return f"{n:.0f} {unit}"
+
+
+def estimate(dau, writes_per_user, reads_per_user, write_bytes, read_bytes,
+             years=5, replicas=3, peak=3, per_server_rps=2_000, cache_fraction=0.2):
+    w_avg = dau * writes_per_user / DAY
+    r_avg = dau * reads_per_user / DAY
+    stored_per_day = dau * writes_per_user * write_bytes
+    servers = math.ceil(r_avg * peak / per_server_rps)
+    return {
+        "write QPS (avg / peak)": f"{w_avg:,.0f} / {w_avg * peak:,.0f}",
+        "read QPS (avg / peak)": f"{r_avg:,.0f} / {r_avg * peak:,.0f}",
+        "new data per day": human(stored_per_day, "B"),
+        f"storage after {years} y x{replicas}": human(stored_per_day * 365 * years * replicas, "B"),
+        "read egress at peak": human(r_avg * peak * read_bytes, "B/s"),
+        "cache (20% of a day's reads)": human(dau * reads_per_user * read_bytes * cache_fraction, "B"),
+        "read servers at peak": servers,
+    }
+
+
+# Twitter-like: 200M DAU, 0.5 tweets and 10 timeline loads per user per day,
+# 300 B per tweet stored, a timeline page of 20 tweets returned (~6 KB)
+for k, v in estimate(200e6, 0.5, 10, 300, 6_000).items():
+    print(f"{k:30s} {v}")
+
+# write QPS (avg / peak)         1,157 / 3,472
+# read QPS (avg / peak)          23,148 / 69,444
+# new data per day               30.0 GB
+# storage after 5 y x3           164.2 TB
+# read egress at peak            416.7 MB/s
+# cache (20% of a day's reads)   2.4 TB
+# read servers at peak           35</code></pre>
+<p>Notice the two cache figures for the same system: 2.4 TB if you cache 20% of rendered timeline pages, 1.28 TB if you cache 800 tweet ids per user and hydrate tweets from a separate, much smaller tweet cache. Choosing what to cache changed the answer by half; that is the kind of observation that earns credit.</p>
+
+<h2 id="pitfalls">Pitfalls and how to sound credible</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Pitfall</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>False precision ("23,148.15 QPS")</th><td>"About 23,000, call it 70,000 at peak." Round at every step</td></tr>
+<tr><th>Mixing bits and bytes</th><td>Network links are in bits per second; divide by 8 for bytes. A 10 Gbps link moves about 1.25 GB/s</td></tr>
+<tr><th>Forgetting replication and overhead</th><td>State "× 3 replicas" and "+ 50% for indexes" explicitly</td></tr>
+<tr><th>Sizing for average</th><td>Always apply a peak factor and say which one</td></tr>
+<tr><th>Ignoring growth</th><td>For multi-year storage, ask about growth or assume one, and show both numbers</td></tr>
+<tr><th>Estimating everything</th><td>Compute only the numbers that change a decision; skip the rest out loud</td></tr>
+<tr><th>Numbers without conclusions</th><td>End each line with "so...": "so it fits in RAM", "so we need sharding"</td></tr>
+</tbody></table></div>
+<div class="callout note">
+<div class="callout-title">Sanity checks</div>
+<p>Compare against things you know. If your estimate says a chat app needs less storage than a single laptop, or more servers than Google, re-check the units. Off-by-1,000 errors (KB vs MB, per second vs per day) are far more common than wrong assumptions, and a quick comparison catches them.</p>
+</div>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>Right after requirements, for two to five minutes. Ask whether the interviewer wants it; some skip it. Estimate read and write QPS, storage, and anything else the design hinges on (connections for chat, egress for video, RAM for a cache). Then say the conclusions aloud.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>"How many servers do you need?" Give the chain, the per-server assumption, and redundancy.</li>
+<li>"Does it fit in memory?" Compute the hot set size and compare with RAM per node.</li>
+<li>"What if traffic grows 10 times?" Show which numbers scale linearly and which component crosses a threshold first.</li>
+<li>"Why is this request slow?" Reason from the latency ladder: count round trips and disk accesses.</li>
+<li>"How much does the bandwidth cost?" Convert egress to TB per month; a CDN is usually the answer for media.</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>Spending ten minutes on arithmetic, or doing long division on the board instead of rounding.</li>
+<li>Getting units wrong by a factor of 1,000 and not noticing.</li>
+<li>Sizing for average load only.</li>
+<li>Numbers that never influence the design.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://norvig.com/21-days.html" target="_blank" rel="noopener">Teach Yourself Programming in Ten Years</a><span>Peter Norvig. Contains the original table of approximate timings for common operations.</span></li>
+<li><a href="https://www.cs.cornell.edu/projects/ladis2009/talks/dean-keynote-ladis2009.pdf" target="_blank" rel="noopener">Designs, Lessons and Advice from Building Large Distributed Systems</a><span>Jeff Dean, LADIS 2009 keynote. The "numbers everyone should know" slide and the back-of-envelope method applied to real Google designs.</span></li>
+<li><a href="https://gist.github.com/jboner/2841832" target="_blank" rel="noopener">Latency Numbers Every Programmer Should Know</a><span>Jonas Bonér's widely shared gist of the Dean and Norvig numbers, with SSD rows added.</span></li>
+<li><a href="https://sre.google/sre-book/software-engineering-in-sre/" target="_blank" rel="noopener">Site Reliability Engineering: Software Engineering in SRE</a><span>Google, 2016. Includes Auxon, a capacity-planning tool built on intent-based estimates of demand and per-component cost.</span></li>
+</ul>
