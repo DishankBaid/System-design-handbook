@@ -1,0 +1,327 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">Users of a photo app upload 50 million photos a day. Each one is a few megabytes, written once, read many times, never edited, and expected to exist forever. Putting them in a relational database would bloat its storage, backups and replication with data the database cannot query anyway. Putting them on a server's disk ties them to one machine that will eventually die. The answer every large system uses is an <dfn>object store</dfn>: Amazon S3, Google Cloud Storage, Azure Blob Storage, or a self-hosted equivalent such as Ceph or MinIO.</p>
+<p>The pattern is the same everywhere: the <strong>bytes</strong> go to the object store, and a <strong>row of metadata</strong> (owner, key, size, content type, status) goes to the database. Video platforms, chat attachments, backups, data lakes, machine learning datasets and static websites all follow it. This chapter covers how object stores are built, how they make data survive hardware failure at low cost, and how clients move large files in and out of them safely.</p>
+
+<h2 id="storage-types">Object, block and file storage</h2>
+<p>Three storage abstractions are in common use, and interviewers like to check that you can tell them apart.</p>
+<div class="defs">
+<div><h4>Block storage</h4><p>A virtual disk: a range of fixed-size blocks addressed by number, with no notion of files. A file system or database on one host formats and owns it. Lowest latency, attached to one machine at a time. AWS EBS, a SAN LUN, a local NVMe drive.</p></div>
+<div><h4>File storage</h4><p>A shared POSIX file system: directories, files, permissions, byte-range writes, locks, mounted by many hosts at once over NFS or SMB. Familiar to applications, harder to scale because directory operations and locking need coordination. AWS EFS, NetApp, CephFS.</p></div>
+<div><h4>Object storage</h4><p>A flat namespace of <em>keys</em> mapped to immutable <em>objects</em> (bytes plus metadata) in <em>buckets</em>, accessed over HTTP with PUT, GET, DELETE and LIST. No in-place edits, no rename, no real directories (<code>photos/2026/10/a.jpg</code> is just a key containing slashes). In return: practically unlimited scale, very high durability and the lowest cost per gigabyte.</p></div>
+</div>
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Block</th><th>File</th><th>Object</th></tr></thead>
+<tbody>
+<tr><th>Interface</th><td>Read/write block N</td><td>POSIX: open, seek, write, rename</td><td>HTTP: PUT, GET, DELETE, LIST</td></tr>
+<tr><th>Partial update</th><td class="yes">Any block</td><td class="yes">Any byte range</td><td class="no">Replace the whole object</td></tr>
+<tr><th>Shared by many hosts</th><td class="no">One at a time (mostly)</td><td class="yes">Yes</td><td class="yes">Yes, from anywhere</td></tr>
+<tr><th>Latency</th><td class="yes">Sub-millisecond</td><td class="meh">Milliseconds</td><td class="meh">Tens of milliseconds to first byte</td></tr>
+<tr><th>Scale</th><td class="meh">Terabytes per volume</td><td class="meh">Petabytes, with effort</td><td class="yes">Exabytes, trillions of objects</td></tr>
+<tr><th>Cost per GB</th><td class="no">Highest</td><td class="meh">High</td><td class="yes">Lowest, with cold tiers far lower</td></tr>
+<tr><th>Use for</th><td>Database volumes, VM disks</td><td>Legacy apps, shared home directories</td><td>Media, backups, logs, data lakes, static assets</td></tr>
+</tbody></table></div>
+
+<h2 id="architecture">Inside an object store</h2>
+<p>Every large object store separates two very different problems. <strong>Metadata</strong> (which key maps to which version, which chunks, on which nodes) is small, must be strongly consistent, and is read on every request. <strong>Data</strong> (the bytes) is enormous, immutable once written, and needs cheap, durable capacity.</p>
+<figure class="fig wide">
+<div class="fig-frame">
+<svg viewBox="0 0 750 380" role="img" aria-label="Object store architecture: stateless front end, a metadata service mapping keys to chunk locations, a placement service, storage nodes in three zones, and background repair">
+<rect class="n client" x="20" y="150" width="100" height="50" rx="8"/>
+<text class="t b mid" x="70.0" y="172.0">Client</text><text class="t xs mute mid" x="70.0" y="188.0">PUT / GET</text>
+<rect class="n svc" x="160" y="150" width="130" height="50" rx="8"/>
+<text class="t b mid" x="225.0" y="172.0">API front end</text><text class="t xs mute mid" x="225.0" y="188.0">auth, routing</text>
+<rect class="n svc" x="340" y="30" width="170" height="56" rx="8"/>
+<text class="t b mid" x="425.0" y="55.0">Metadata service</text><text class="t xs mute mid" x="425.0" y="71.0">key → version, chunks</text>
+<rect class="n ext" x="560" y="30" width="170" height="56" rx="8"/>
+<text class="t b mid" x="645.0" y="55.0">Placement</text><text class="t xs mute mid" x="645.0" y="71.0">picks nodes, balances</text>
+<rect class="zone" x="330" y="170" width="120" height="150" rx="10"/><text class="t xs mute mid" x="390" y="188">zone a</text>
+<rect class="n db" x="344" y="198" width="92" height="48" rx="6"/><text class="t sm b mid" x="390" y="217">storage</text>
+<circle class="dot db" cx="363" cy="231" r="3"/>
+<circle class="dot db" cx="372" cy="231" r="3"/>
+<circle class="dot db" cx="381" cy="231" r="3"/>
+<circle class="dot db" cx="390" cy="231" r="3"/>
+<rect class="n db" x="344" y="256" width="92" height="48" rx="6"/><text class="t sm b mid" x="390" y="275">storage</text>
+<circle class="dot db" cx="363" cy="289" r="3"/>
+<circle class="dot db" cx="372" cy="289" r="3"/>
+<circle class="dot db" cx="381" cy="289" r="3"/>
+<circle class="dot db" cx="390" cy="289" r="3"/>
+<rect class="zone" x="470" y="170" width="120" height="150" rx="10"/><text class="t xs mute mid" x="530" y="188">zone b</text>
+<rect class="n db" x="484" y="198" width="92" height="48" rx="6"/><text class="t sm b mid" x="530" y="217">storage</text>
+<circle class="dot db" cx="503" cy="231" r="3"/>
+<circle class="dot db" cx="512" cy="231" r="3"/>
+<circle class="dot db" cx="521" cy="231" r="3"/>
+<circle class="dot db" cx="530" cy="231" r="3"/>
+<rect class="n db" x="484" y="256" width="92" height="48" rx="6"/><text class="t sm b mid" x="530" y="275">storage</text>
+<circle class="dot db" cx="503" cy="289" r="3"/>
+<circle class="dot db" cx="512" cy="289" r="3"/>
+<circle class="dot db" cx="521" cy="289" r="3"/>
+<circle class="dot db" cx="530" cy="289" r="3"/>
+<rect class="zone" x="610" y="170" width="120" height="150" rx="10"/><text class="t xs mute mid" x="670" y="188">zone c</text>
+<rect class="n db" x="624" y="198" width="92" height="48" rx="6"/><text class="t sm b mid" x="670" y="217">storage</text>
+<circle class="dot db" cx="643" cy="231" r="3"/>
+<circle class="dot db" cx="652" cy="231" r="3"/>
+<circle class="dot db" cx="661" cy="231" r="3"/>
+<circle class="dot db" cx="670" cy="231" r="3"/>
+<rect class="n db" x="624" y="256" width="92" height="48" rx="6"/><text class="t sm b mid" x="670" y="275">storage</text>
+<circle class="dot db" cx="643" cy="289" r="3"/>
+<circle class="dot db" cx="652" cy="289" r="3"/>
+<circle class="dot db" cx="661" cy="289" r="3"/>
+<circle class="dot db" cx="670" cy="289" r="3"/>
+<rect class="n ext" x="160" y="270" width="130" height="50" rx="8"/>
+<text class="t b mid" x="225.0" y="292.0">Background</text><text class="t xs mute mid" x="225.0" y="308.0">repair, scrub, GC</text>
+<path class="e" d="M120,175 H156"/>
+<path class="e" d="M260,150 C270,90 300,58 336,58"/>
+<path class="e both" d="M510,58 H556"/>
+<path class="e" d="M290,165 C330,128 360,128 390,166"/><path class="flow" d="M290,165 C330,128 360,128 390,166"/>
+<path class="e" d="M290,165 C330,128 500,128 530,166"/><path class="flow" d="M290,165 C330,128 500,128 530,166"/>
+<path class="e" d="M290,165 C330,128 640,128 670,166"/><path class="flow" d="M290,165 C330,128 640,128 670,166"/>
+<path class="flow" d="M120,175 H156"/>
+<path class="e dash" d="M290,295 H326"/>
+<text class="t xs mute end" x="252" y="112">1 lookup / commit</text>
+<text class="t xs mute" x="420" y="118">2 write chunks to three zones</text>
+<text class="t sm" x="20" y="350">Metadata is small and needs strong consistency; chunk data is huge and needs cheap capacity.</text>
+<text class="t sm" x="20" y="368">Separating the two lets each scale on its own terms.</text>
+</svg>
+</div>
+<figcaption><b>Object store architecture.</b> The animated paths are a PUT: the front end streams chunks to storage nodes in three zones, then commits the key in the metadata service. The object only becomes visible once that commit succeeds.</figcaption>
+</figure>
+<ul>
+<li><strong>Front end.</strong> Stateless HTTP servers that authenticate the request (for S3, a signature over the request with the caller's key), check bucket policies, and stream bytes to and from storage nodes. They scale horizontally behind load balancers.</li>
+<li><strong>Metadata service.</strong> A sharded, replicated key-value store mapping <code>(bucket, key)</code> to the current version and its chunk locations. It is partitioned by key, often by key prefix ranges that split as they get hot. Writes to it are the commit point: a PUT first writes all the data, then atomically records the new version. A crash before the commit leaves orphaned chunks that garbage collection reclaims later, never a half-visible object.</li>
+<li><strong>Placement.</strong> Chooses which storage nodes receive each chunk: spread across failure domains (disks, hosts, racks, availability zones), weighted by free space, and avoiding hot nodes. Ceph computes placement with a deterministic function (CRUSH) so clients need no lookup at all; S3 and Azure use placement services.</li>
+<li><strong>Storage nodes.</strong> Many disks per host, storing chunks in large append-only files rather than one file per object, so small objects do not each cost a file system inode and seek. Facebook's Haystack showed why: with one file per photo, the file system metadata lookups alone cost several disk reads per photo served.</li>
+<li><strong>Background work.</strong> Scrubbers re-read chunks and verify checksums to catch silent corruption; repair rebuilds chunks from failed disks; garbage collection reclaims deleted and orphaned data; lifecycle jobs move objects between tiers.</li>
+</ul>
+
+<h2 id="durability">Durability: replication vs erasure coding</h2>
+<p>Disks fail at a rate of roughly 1 to 2% per year each, so a fleet of a million disks loses dozens a day. Durability comes from storing redundant data across independent failure domains and repairing faster than failures accumulate.</p>
+<h3 id="replication-copies">Replication</h3>
+<p>Store <code>r</code> full copies on different nodes. Three copies tolerate two simultaneous losses at 3× the storage. Reads are cheap (any copy), and repair copies one chunk. Simple, fast, and expensive at exabyte scale.</p>
+<h3 id="erasure-coding">Erasure coding</h3>
+<p><dfn>Erasure coding</dfn> splits an object into <code>k</code> data chunks and computes <code>m</code> parity chunks such that <strong>any <code>k</code> of the <code>k + m</code> chunks</strong> reconstruct the original. Reed-Solomon codes, written <code>RS(k, m)</code>, are the standard. Storage overhead is <code>(k + m) / k</code> and the scheme tolerates <code>m</code> lost chunks.</p>
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 724 326" role="img" aria-label="Erasure coding RS(10,4): an object split into 10 data chunks plus 4 parity chunks on 14 nodes; four can fail; rebuilding one chunk reads ten others">
+<rect class="n client" x="15" y="20" width="494" height="34" rx="6"/><text class="t b mid" x="262" y="42">photo.jpg, 10 MB</text>
+<rect class="n ghost" x="515" y="20" width="194" height="34" rx="6"/><text class="t sm mute mid" x="612" y="41">computed parity</text>
+<path class="e" d="M262,54 V100"/><text class="t xs mute" x="270" y="82">split into 10 × 1 MB</text>
+<path class="e" d="M612,54 V100"/><text class="t xs mute end" x="604" y="82">Reed-Solomon: 4 × 1 MB</text>
+<rect class="n db" x="15" y="106" width="44" height="40" rx="6"/>
+<text class="t mono mid" x="37" y="130">d1</text>
+<rect class="n db" x="65" y="106" width="44" height="40" rx="6"/>
+<text class="t mono mid" x="87" y="130">d2</text>
+<rect class="n db" x="115" y="106" width="44" height="40" rx="6"/>
+<text class="t mono mid" x="137" y="130" data-show="1">d3</text>
+<g data-show="2 3"><rect x="115" y="106" width="44" height="40" rx="6" style="fill:var(--surface);stroke:var(--d-red);stroke-width:2"/><text class="t mono red mid" x="137" y="124">d3</text><text class="t xs red mid" x="137" y="138">lost</text></g>
+<rect class="n db" x="165" y="106" width="44" height="40" rx="6"/>
+<text class="t mono mid" x="187" y="130">d4</text>
+<rect class="n db" x="215" y="106" width="44" height="40" rx="6"/>
+<text class="t mono mid" x="237" y="130">d5</text>
+<rect class="n db" x="265" y="106" width="44" height="40" rx="6"/>
+<text class="t mono mid" x="287" y="130">d6</text>
+<rect class="n db" x="315" y="106" width="44" height="40" rx="6"/>
+<text class="t mono mid" x="337" y="130" data-show="1">d7</text>
+<g data-show="2 3"><rect x="315" y="106" width="44" height="40" rx="6" style="fill:var(--surface);stroke:var(--d-red);stroke-width:2"/><text class="t mono red mid" x="337" y="124">d7</text><text class="t xs red mid" x="337" y="138">lost</text></g>
+<rect class="n db" x="365" y="106" width="44" height="40" rx="6"/>
+<text class="t mono mid" x="387" y="130">d8</text>
+<rect class="n db" x="415" y="106" width="44" height="40" rx="6"/>
+<text class="t mono mid" x="437" y="130">d9</text>
+<rect class="n db" x="465" y="106" width="44" height="40" rx="6"/>
+<text class="t mono mid" x="487" y="130">d10</text>
+<rect class="n queue" x="515" y="106" width="44" height="40" rx="6"/>
+<text class="t mono mid" x="537" y="130">p1</text>
+<rect class="n queue" x="565" y="106" width="44" height="40" rx="6"/>
+<text class="t mono mid" x="587" y="130" data-show="1">p2</text>
+<g data-show="2 3"><rect x="565" y="106" width="44" height="40" rx="6" style="fill:var(--surface);stroke:var(--d-red);stroke-width:2"/><text class="t mono red mid" x="587" y="124">p2</text><text class="t xs red mid" x="587" y="138">lost</text></g>
+<rect class="n queue" x="615" y="106" width="44" height="40" rx="6"/>
+<text class="t mono mid" x="637" y="130">p3</text>
+<rect class="n queue" x="665" y="106" width="44" height="40" rx="6"/>
+<text class="t mono mid" x="687" y="130" data-show="1">p4</text>
+<g data-show="2 3"><rect x="665" y="106" width="44" height="40" rx="6" style="fill:var(--surface);stroke:var(--d-red);stroke-width:2"/><text class="t mono red mid" x="687" y="124">p4</text><text class="t xs red mid" x="687" y="138">lost</text></g>
+<g data-show="3">
+<rect class="n good" x="105" y="226" width="64" height="40" rx="6"/><text class="t mono mid" x="137" y="250">d3</text>
+<path class="line" d="M37,146 C37,190 137,190 137,222" style="stroke:var(--accent);stroke-width:1.2;opacity:.8"/>
+<path class="line" d="M87,146 C87,190 137,190 137,222" style="stroke:var(--accent);stroke-width:1.2;opacity:.8"/>
+<path class="line" d="M187,146 C187,190 137,190 137,222" style="stroke:var(--accent);stroke-width:1.2;opacity:.8"/>
+<path class="line" d="M237,146 C237,190 137,190 137,222" style="stroke:var(--accent);stroke-width:1.2;opacity:.8"/>
+<path class="line" d="M287,146 C287,190 137,190 137,222" style="stroke:var(--accent);stroke-width:1.2;opacity:.8"/>
+<path class="line" d="M387,146 C387,190 137,190 137,222" style="stroke:var(--accent);stroke-width:1.2;opacity:.8"/>
+<path class="line" d="M437,146 C437,190 137,190 137,222" style="stroke:var(--accent);stroke-width:1.2;opacity:.8"/>
+<path class="line" d="M487,146 C487,190 137,190 137,222" style="stroke:var(--accent);stroke-width:1.2;opacity:.8"/>
+<path class="line" d="M537,146 C537,190 137,190 137,222" style="stroke:var(--accent);stroke-width:1.2;opacity:.8"/>
+<path class="line" d="M637,146 C637,190 137,190 137,222" style="stroke:var(--accent);stroke-width:1.2;opacity:.8"/>
+<text class="t xs accent" x="180" y="250">read any 10 surviving chunks (10 MB) to rebuild 1 MB</text>
+</g>
+<g data-show="1"><text class="t sm" x="15" y="296">RS(10,4): 10 data chunks and 4 parity chunks on 14 different nodes. Any 10 of the 14 are enough</text><text class="t sm" x="15" y="314">to rebuild the object. Storage is 14 MB for 10 MB of data: 1.4×, versus 30 MB for three full copies.</text></g>
+<g data-show="2"><text class="t sm" x="15" y="296">Four nodes fail at once, including parity. Ten chunks survive, so no data is lost. A fifth</text><text class="t sm" x="15" y="314">failure before repair would lose the object. Three-way replication only survives two.</text></g>
+<g data-show="3"><text class="t sm" x="15" y="296">Repair is the price: rebuilding one lost chunk reads ten others over the network. Replication would</text><text class="t sm" x="15" y="314">copy one. This is why erasure coding suits large, cooler data and why LRC codes exist.</text></g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Encode</button><button type="button" data-step="2" aria-pressed="false">Four failures</button><button type="button" data-step="3" aria-pressed="false">Repair</button></div>
+</div>
+<figcaption><b>Erasure coding with RS(10,4).</b> More fault tolerance than three copies at less than half the storage. The cost moves to reconstruction: degraded reads and repairs must fetch ten chunks.</figcaption>
+</figure>
+<div class="table-wrap"><table>
+<thead><tr><th>Scheme</th><th class="num">Raw per 1 PB</th><th>Tolerates</th><th>Repair reads</th><th>Normal reads</th></tr></thead>
+<tbody>
+<tr><th>3× replication</th><td class="num">3.0 PB</td><td>2</td><td>1 chunk</td><td class="yes">Any copy, cheapest</td></tr>
+<tr><th>RS(6,3)</th><td class="num">1.5 PB</td><td>3</td><td>6 chunks</td><td class="meh">Normal reads touch 6 nodes</td></tr>
+<tr><th>RS(10,4)</th><td class="num">1.4 PB</td><td>4</td><td>10 chunks</td><td class="meh">Normal reads touch 10 nodes</td></tr>
+<tr><th>Azure LRC(12,2,2)</th><td class="num">1.33 PB</td><td>Any 3, most 4-loss patterns</td><td>6 chunks for one data chunk</td><td class="meh">Local parity groups cut repair cost</td></tr>
+</tbody></table></div>
+<p>How many nines does each buy? A simple model treats disk failures as independent and asks how likely it is that more chunks of one stripe fail within one repair window than the code tolerates:</p>
+<pre><code class="language-python">from math import comb, expm1, log10, log1p
+
+AFR = 0.02                       # 2% of disks fail per year
+REPAIR_HOURS = 24                # time to detect a failure and rebuild the lost chunk
+p = AFR * REPAIR_HOURS / 8760    # chance a given chunk's disk fails within one repair window
+windows = 8760 / REPAIR_HOURS    # repair windows per year
+
+
+def p_loss(total, tolerate):
+    """Chance that more than `tolerate` of `total` chunks fail in the same window."""
+    return sum(comb(total, i) * p**i * (1 - p)**(total - i) for i in range(tolerate + 1, total + 1))
+
+
+schemes = {                      # name: (chunks stored, failures tolerated, storage overhead)
+    "3x replication": (3, 2, 3.0),
+    "RS(6,3)":        (9, 3, 9 / 6),
+    "RS(10,4)":       (14, 4, 14 / 10),
+}
+for name, (n, m, overhead) in schemes.items():
+    annual = -expm1(windows * log1p(-p_loss(n, m)))   # 1 - (1 - x)^windows, without rounding to 0
+    print(f"{name:15} overhead {overhead:.1f}x   annual loss {annual:.1e}   ~{-log10(annual):.0f} nines")
+
+# 3x replication  overhead 3.0x   annual loss 6.0e-11   ~10 nines
+# RS(6,3)         overhead 1.5x   annual loss 4.1e-13   ~12 nines
+# RS(10,4)        overhead 1.4x   annual loss 3.6e-16   ~15 nines</code></pre>
+<p>Treat the absolute numbers with suspicion: real failures are correlated (a power event, a bad firmware batch, a whole zone), and those dominate. The relative lesson holds, though. Erasure coding gives more fault tolerance for less storage, and <strong>faster repair improves durability sharply</strong>: annual loss scales roughly with the repair window raised to the power of the failures tolerated, so halving repair time cuts RS(10,4)'s loss about 16×.</p>
+
+<h3 id="eleven-nines">What 11 nines means</h3>
+<p>S3 is designed for 99.999999999% (11 nines) annual durability of objects. That is an expected annual loss rate of 10<sup>-11</sup> per object. AWS's own illustration: store 10 million objects and you can expect to lose one about every 10,000 years. Two things it does not mean:</p>
+<ul>
+<li><strong>It is not availability.</strong> S3 Standard is designed for 99.99% availability, so requests can fail for minutes a month while every byte stays safe.</li>
+<li><strong>It does not protect you from yourself.</strong> A buggy deletion job or a leaked credential destroys data at 100% "durability". Versioning, object lock and cross-account backups cover that risk.</li>
+</ul>
+
+<h2 id="uploads">Uploading large files</h2>
+<h3 id="multipart">Multipart and chunked uploads</h3>
+<p>A single 4 GB PUT over a mobile connection fails at 3.9 GB and starts over. <dfn>Multipart upload</dfn> fixes that: start an upload and get an upload id, send the file as independent parts in parallel, retry any part that fails, then complete the upload with the list of part numbers and their ETags, which assembles the object atomically. In S3, parts are 5 MiB to 5 GiB (the last may be smaller), up to 10,000 per upload (so objects up to 48.8 TiB, raised from 5 TiB in December 2025), and a single plain PUT is capped at 5 GB. Parallel parts also raise throughput well beyond one TCP connection. Abandoned uploads keep their parts (and their storage cost) until aborted, so a lifecycle rule to abort incomplete multipart uploads after a few days is standard hygiene.</p>
+<h3 id="resumable">Resumable uploads</h3>
+<p>A <dfn>resumable upload</dfn> goes one step further for unreliable clients: the server creates an upload session with its own URL, the client sends bytes, and after a disconnect it asks "how much did you receive?" and continues from that offset. Google Cloud Storage's resumable uploads and the open <code>tus</code> protocol work this way, and YouTube and Vimeo uploads are built on the same idea.</p>
+
+<h3 id="presigned">Presigned URLs</h3>
+<p>Proxying every upload through your application servers wastes their bandwidth and memory. A <dfn>presigned URL</dfn> lets the client talk to the object store directly while your service keeps control: the server signs a URL that permits one operation (PUT this key, or GET this key), optionally with a fixed content type and size, for a short time.</p>
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 358" role="img" aria-label="Presigned upload: the client asks the app for an upload URL, the app signs it, the client uploads directly to the object store, an event triggers a worker that marks the upload ready">
+<rect class="n client" x="30" y="16" width="120" height="36" rx="7"/><text class="t sm b mid" x="90" y="39">Client</text>
+<path class="line faint" d="M90,52 V300" style="stroke-dasharray:3 4"/>
+<rect class="n svc" x="220" y="16" width="120" height="36" rx="7"/><text class="t sm b mid" x="280" y="39">App API</text>
+<path class="line faint" d="M280,52 V300" style="stroke-dasharray:3 4"/>
+<rect class="n db" x="410" y="16" width="120" height="36" rx="7"/><text class="t sm b mid" x="470" y="39">Object store</text>
+<path class="line faint" d="M470,52 V300" style="stroke-dasharray:3 4"/>
+<rect class="n svc" x="590" y="16" width="120" height="36" rx="7"/><text class="t sm b mid" x="650" y="39">Worker</text>
+<path class="line faint" d="M650,52 V300" style="stroke-dasharray:3 4"/>
+<path class="e " d="M90,85 H276"/><text class="t sm mid " x="185.0" y="78">1 POST /uploads (name, size, type)</text>
+<path class="e" d="M284,104 H316 V124 H284"/><text class="t xs mute" x="324" y="118">check quota, sign URL locally</text>
+<path class="e dash" d="M280,150 H94"/><text class="t sm mid " x="185.0" y="143">2 presigned PUT URL, 15 min</text>
+<path class="e accent" d="M90,195 H466"/><text class="t sm mid accent" x="280.0" y="188">3 PUT 48 MB directly</text><path class="flow" d="M90,195 H466"/>
+<path class="e dash" d="M470,235 H646"/><text class="t sm mid " x="560.0" y="228">4 ObjectCreated event</text>
+<path class="e" d="M654,250 H686 V270 H654"/><text class="t xs mute end" x="646" y="266">scan, thumbnail</text>
+<path class="e green" d="M650,290 H284"/><text class="t sm mid green" x="465.0" y="283">5 mark photo ready</text>
+<text class="t sm" x="20" y="328">The app server never touches the bytes. It authorises one specific key, size and type for 15 minutes,</text>
+<text class="t sm" x="20" y="346">and learns about the finished upload from an event, not from the client's word.</text>
+</svg>
+</div>
+<figcaption><b>Direct upload with a presigned URL.</b> Signing is a local HMAC computation with the service's credentials, so step 2 needs no call to the object store. The animated step is the only one that moves the 48 MB.</figcaption>
+</figure>
+<ul>
+<li><strong>Scope tightly.</strong> Sign for a key the server chooses (<code>uploads/u42/7f3a9c.jpg</code>), never one the client chooses, so a client cannot overwrite another user's object. Use a POST policy or signed headers to cap size and fix the content type.</li>
+<li><strong>Keep expiry short.</strong> Minutes, not days. A presigned URL is a bearer credential: anyone holding it can use it until it expires.</li>
+<li><strong>Trust the event, not the client.</strong> Mark the upload complete when the store's notification arrives (S3 event to a queue, then a worker), and validate the file there: real content type, size, malware scan, image dimensions. Then create thumbnails or transcodes.</li>
+<li><strong>Downloads too.</strong> Private files are served with short-lived presigned GET URLs, or through a CDN with signed URLs or cookies, so the application never streams bytes.</li>
+</ul>
+
+<h2 id="dedup">Content-addressed storage and deduplication</h2>
+<p>In <dfn>content-addressed storage</dfn> the key is a hash of the content: <code>sha256(bytes)</code>. Identical content gets the same key, so it is stored once, and the key doubles as an integrity check. Git stores objects this way, container registries store image layers this way, and backup systems and Dropbox deduplicate at the chunk level: split files into chunks (fixed size, or content-defined chunking so an insertion does not shift every later boundary), hash each chunk, and upload only chunks the server does not already have. Editing one page of a 200 MB document then uploads a few megabytes.</p>
+<p>The costs: deleting becomes reference counting, because a chunk may belong to many files, so deletes turn into a garbage collection job. And cross-user deduplication leaks information: if uploading a file completes instantly, the uploader learns someone else already has it. Systems that care deduplicate only within one user's data, or use convergent encryption with care.</p>
+
+<h2 id="lifecycle">Lifecycle and storage tiers</h2>
+<p>Access to stored objects drops sharply with age: last week's photos get viewed, last decade's almost never. Object stores offer tiers that trade retrieval cost and latency for cheaper storage, and lifecycle rules move objects between them automatically.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>S3 class</th><th>Cost</th><th>First byte</th><th>Minimum</th><th>Use for</th></tr></thead>
+<tbody>
+<tr><th>Standard</th><td class="num">1×</td><td>Milliseconds</td><td>None</td><td>Hot data, anything read often</td></tr>
+<tr><th>Standard-IA</th><td class="num">~0.5×, plus retrieval fee</td><td>Milliseconds</td><td>30 days</td><td>Read about monthly</td></tr>
+<tr><th>Glacier Instant Retrieval</th><td class="num">~0.17×</td><td>Milliseconds</td><td>90 days</td><td>Read about quarterly</td></tr>
+<tr><th>Glacier Flexible Retrieval</th><td class="num">~0.16×</td><td>Minutes to hours</td><td>90 days</td><td>Backups, rarely restored</td></tr>
+<tr><th>Glacier Deep Archive</th><td class="num">~0.04×</td><td>Within 12 hours (48 h bulk)</td><td>180 days</td><td>Compliance archives</td></tr>
+</tbody></table></div>
+<p>Cost is storage price relative to Standard. Ratios use approximate list prices for one region at the time of writing; they change, but the shape does not. A typical rule for user media: Standard for 30 days, Standard-IA until a year, then Glacier Instant Retrieval, with S3 Intelligent-Tiering as an alternative when access patterns are unknown. Watch the minimum durations and per-request fees: moving millions of tiny objects to a cold tier can cost more in transition requests than it saves.</p>
+
+<h2 id="consistency">Consistency</h2>
+<p>Since December 2020, S3 provides strong read-after-write consistency for all PUTs and DELETEs, including overwrites, and for LIST: once a write is acknowledged, every subsequent read and list sees it. Before that, overwrites and deletes were only eventually consistent, and a lot of folklore (and code) about "S3 eventual consistency" is now out of date. Google Cloud Storage and Azure Blob Storage are also strongly consistent.</p>
+<p>Strong consistency is not concurrency control. Two clients that PUT the same key race, and the last write wins. For coordination, use conditional requests: S3 added <code>If-None-Match: *</code> (create only if absent) in 2024 and <code>If-Match</code> on an ETag (replace only if unchanged) shortly after; GCS has had generation preconditions for years. Or design keys so writers never collide: one key per upload, with the database recording which one is current.</p>
+
+<h2 id="worked-example">Worked example: storage for a photo app</h2>
+<p>50 million uploads a day, 3 MB per original on average, plus three resized versions totalling about 300 KB.</p>
+<div class="stats">
+<div><b>~165 TB</b><span>new data per day</span></div>
+<div><b>~15 Gbit/s</b><span>average upload bandwidth</span></div>
+<div><b>~60 PB</b><span>logical data per year</span></div>
+<div><b>84 PB</b><span>raw per year with RS(10,4), vs 181 PB at 3×</span></div>
+</div>
+<div class="calc">Per photo     3 MB + 0.3 MB                          = 3.3 MB
+Per day       50,000,000 × 3.3 MB                    = <span class="r">165 TB</span>
+Bandwidth     165 TB / 86,400 s ≈ 1.9 GB/s           ≈ <span class="r">15 Gbit/s</span> average (peaks 2 to 3× higher)
+Per year      165 TB × 365                           ≈ <span class="r">60 PB</span>
+Raw storage   × 3.0 (replication)                    ≈ 181 PB
+              × 1.4 (RS(10,4))                       ≈ <span class="r">84 PB</span>, saving ~96 PB a year
+Uploads/s     50,000,000 / 86,400                    ≈ 580 originals/s, ~2,300 objects/s with resized copies</div>
+<p>Design decisions that follow:</p>
+<ul>
+<li><strong>Direct uploads</strong> with presigned URLs: 15 Gbit/s through application servers would need a fleet just to forward bytes.</li>
+<li><strong>Keys spread by a random component</strong> (<code>u/7f3a9c.../orig.jpg</code>) rather than by date, so no single metadata partition takes all of today's writes. S3 scales request rates per prefix automatically, but spreading keys still avoids warm-up throttling.</li>
+<li><strong>CDN in front</strong> for reads: popular photos are served from the edge, and the store sees mostly cache misses for the long tail. See <a href="cdn.html">CDN</a>.</li>
+<li><strong>Tiering</strong>: originals move to infrequent-access after 30 days; resized versions, which are what most views use, stay hot longer.</li>
+<li><strong>Metadata in the database</strong>: one row per photo with owner, key, dimensions and status. The <a href="video-streaming.html">video platform</a> case study follows the same pattern with a transcoding pipeline in place of thumbnailing.</li>
+</ul>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+<li><strong>Amazon S3</strong> stores objects across at least three availability zones for its standard classes and rebuilt its storage node software (ShardStore) in Rust with lightweight formal verification.</li>
+<li><strong>Facebook</strong> moved hot photos into Haystack (OSDI 2010), which packs many photos into large volume files and keeps the per-photo metadata in memory, then moved warm data to f4 (2014), which uses RS(10,4) within a data centre plus XOR across regions for an effective replication factor of 2.1 instead of 3.6.</li>
+<li><strong>Azure Storage</strong> uses Local Reconstruction Codes, which add local parity groups so that most single-chunk repairs read 6 chunks instead of 12.</li>
+<li><strong>Dropbox</strong> moved file storage from S3 to its own system, Magic Pocket, in 2016, using erasure coding and content-addressed blocks.</li>
+<li><strong>Ceph</strong> (open source) places objects with the CRUSH algorithm, so any client can compute where an object lives from the cluster map alone.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>Whenever a design stores files, images, video, documents or backups. Say: "Bytes go to an object store, metadata to the database, uploads go direct with presigned URLs, reads go through a CDN." Then size it, and mention erasure coding if the interviewer asks how the store itself works.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>How does a client upload a 10 GB file over a flaky network? (Multipart or resumable, parallel parts, retries per part.)</li>
+<li>How do you stop users from uploading to each other's paths? (Server-chosen keys in tightly scoped, short-lived presigned URLs.)</li>
+<li>Replication or erasure coding, and what does each cost? (3× vs 1.4× storage; repair and read amplification.)</li>
+<li>What does 11 nines of durability mean, and what does it not protect against?</li>
+<li>How do you know an upload finished and is valid? (Store event, then server-side validation.)</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>Storing images or video as BLOB columns in the main database.</li>
+<li>Streaming every upload and download through application servers.</li>
+<li>Presigned URLs valid for days, or with client-chosen keys.</li>
+<li>Confusing durability with availability.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://www.usenix.org/conference/osdi14/technical-sessions/presentation/muralidhar" target="_blank" rel="noopener">f4: Facebook's Warm BLOB Storage System</a><span>Muralidhar et al., OSDI 2014. Moving warm data from replication to Reed-Solomon coding at exabyte scale.</span></li>
+<li><a href="https://www.usenix.org/conference/osdi10/finding-needle-haystack-facebooks-photo-storage" target="_blank" rel="noopener">Finding a Needle in Haystack: Facebook's Photo Storage</a><span>Beaver et al., OSDI 2010. Why one file per object fails at scale, and the volume-file design that replaced it.</span></li>
+<li><a href="https://www.usenix.org/conference/atc12/technical-sessions/presentation/huang" target="_blank" rel="noopener">Erasure Coding in Windows Azure Storage</a><span>Huang et al., USENIX ATC 2012. Local Reconstruction Codes and the repair-cost trade-off.</span></li>
+<li><a href="https://aws.amazon.com/s3/consistency/" target="_blank" rel="noopener">Amazon S3 strong consistency</a><span>AWS. The read-after-write consistency model S3 has provided since December 2020.</span></li>
+<li><a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html" target="_blank" rel="noopener">Amazon S3: uploading and copying objects using multipart upload</a><span>Part sizes, limits, and how parts are assembled atomically.</span></li>
+</ul>

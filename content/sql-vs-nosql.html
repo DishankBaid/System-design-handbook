@@ -1,0 +1,558 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">Picking a database is the one early decision that is genuinely expensive to undo. Code can be refactored in a sprint; moving two billion rows to a different data model, while the product keeps running, takes quarters. In an interview, "which store and why" is where the interviewer learns whether you reason from access patterns or from fashion.</p>
+<p>The question is usually framed as "SQL or NoSQL", which is the wrong frame. "NoSQL" is not one thing. It is a label for at least five different data models that have little in common except that they are not relational. The useful question is: <strong>given how this data is written and read, which data model makes the common operations cheap and the important invariants easy to keep?</strong></p>
+<p>This chapter walks through each family using the same small dataset, a customer and her orders, so the differences are concrete. Then it gives a decision framework, covers NewSQL, retires a few myths, and picks stores for a real e-commerce system.</p>
+
+<h2 id="relational">The relational model</h2>
+<p>In 1970 Edgar Codd proposed storing data as <dfn>relations</dfn>: sets of rows (tuples) with named, typed columns, where relationships are expressed by values rather than by pointers. An order does not contain a pointer to its customer; it contains <code>user_id = 42</code>, and any query can follow that value to the <code>users</code> table with a <dfn>join</dfn>. You declare <em>what</em> you want in SQL and the <dfn>query planner</dfn> decides <em>how</em> to fetch it, choosing indexes and join algorithms from statistics about the data.</p>
+
+<h3 id="relational-strengths">What it is good at</h3>
+<ul>
+<li><strong>Ad-hoc queries.</strong> Because data is stored once in a neutral shape, you can ask questions nobody planned for: revenue by country by week, customers who ordered twice but never reviewed. Add an index and the query is fast. Other models make you design for each question up front.</li>
+<li><strong>Integrity enforced by the database.</strong> Foreign keys, <code>UNIQUE</code>, <code>CHECK</code> and <code>NOT NULL</code> constraints hold no matter which service or script writes the data. In a document store these rules live in application code, and every writer must remember them.</li>
+<li><strong>Multi-row transactions.</strong> Moving money between two accounts, or decrementing stock while inserting an order, happens atomically and in isolation from other transactions. See <a href="transactions.html">ACID &amp; Isolation Levels</a>.</li>
+<li><strong>Normalization.</strong> Each fact is stored once (<a href="data-modeling.html">Data Modeling</a> covers the normal forms), so updating a customer's email is one row, not a hunt through every document that copied it.</li>
+<li><strong>Maturity.</strong> Fifty years of query optimisation, tooling, backups, replication and people who know how to run it at 3 a.m.</li>
+</ul>
+
+<h3 id="relational-limits">Where it strains</h3>
+<ul>
+<li><strong>One primary for writes.</strong> A classic PostgreSQL or MySQL deployment accepts writes on a single node. Read replicas scale reads, but write throughput and data size are bounded by one machine until you shard, and sharding a relational database by hand gives up cross-shard joins and transactions. See <a href="sharding.html">Sharding</a>.</li>
+<li><strong>Rigid schema changes on huge tables.</strong> Adding a column is instant in modern PostgreSQL, but changing a type or backfilling a column on a 2 TB table needs careful online migration tooling.</li>
+<li><strong>The object-relational mismatch.</strong> Application code works with nested objects (an order with its items and shipping address); the database stores flat rows. ORMs bridge the gap, and that bridge is where N+1 query bugs come from.</li>
+</ul>
+
+<h2 id="families">The non-relational families</h2>
+<p>Each family below gave up some part of the relational model (joins, a fixed schema, multi-row transactions, or a general query language) to gain something specific: easier partitioning, a data shape closer to the application, or much faster writes. Step through the same customer, Asha (user 42), with her two orders, in each model.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 340" role="img" aria-label="The same user and two orders modelled as relational tables, key-value pairs, a document, a wide-column partition, a graph and a time series">
+<g data-show="1">
+<rect class="n db" x="20" y="40" width="260" height="72" rx="6"/>
+<text class="t b" x="30" y="56">users</text>
+<path class="line faint" d="M20,64 H280"/>
+<path class="line faint" d="M20,88 H280"/>
+<text class="t xs mute" x="28" y="80">id</text>
+<text class="t xs mute" x="68" y="80">name</text>
+<text class="t xs mute" x="148" y="80">email</text>
+<text class="t mono" x="28" y="104">42</text>
+<text class="t mono" x="68" y="104">Asha Rao</text>
+<text class="t mono" x="148" y="104">asha@example.com</text>
+<rect class="n db" x="410" y="40" width="290" height="96" rx="6"/>
+<text class="t b" x="420" y="56">orders</text>
+<path class="line faint" d="M410,64 H700"/>
+<path class="line faint" d="M410,88 H700"/>
+<text class="t xs mute" x="418" y="80">id</text>
+<text class="t xs mute" x="470" y="80">user_id</text>
+<text class="t xs mute" x="540" y="80">total</text>
+<text class="t xs mute" x="606" y="80">created_at</text>
+<text class="t mono" x="418" y="104">9001</text>
+<text class="t mono accent" x="470" y="104">42</text>
+<text class="t mono" x="540" y="104">64.50</text>
+<text class="t mono" x="606" y="104">2026-10-02</text>
+<text class="t mono" x="418" y="128">9002</text>
+<text class="t mono accent" x="470" y="128">42</text>
+<text class="t mono" x="540" y="128">18.00</text>
+<text class="t mono" x="606" y="128">2026-10-07</text>
+<rect class="n db" x="410" y="170" width="290" height="120" rx="6"/>
+<text class="t b" x="420" y="186">order_items</text>
+<path class="line faint" d="M410,194 H700"/>
+<path class="line faint" d="M410,218 H700"/>
+<text class="t xs mute" x="418" y="210">order_id</text>
+<text class="t xs mute" x="498" y="210">sku</text>
+<text class="t xs mute" x="588" y="210">qty</text>
+<text class="t xs mute" x="638" y="210">price</text>
+<text class="t mono accent" x="418" y="234">9001</text>
+<text class="t mono" x="498" y="234">BK-1031</text>
+<text class="t mono" x="588" y="234">1</text>
+<text class="t mono" x="638" y="234">42.50</text>
+<text class="t mono accent" x="418" y="258">9001</text>
+<text class="t mono" x="498" y="258">MG-220</text>
+<text class="t mono" x="588" y="258">2</text>
+<text class="t mono" x="638" y="258">11.00</text>
+<text class="t mono accent" x="418" y="282">9002</text>
+<text class="t mono" x="498" y="282">TE-118</text>
+<text class="t mono" x="588" y="282">1</text>
+<text class="t mono" x="638" y="282">18.00</text>
+<path class="e accent" d="M406,100 H284"/><text class="t xs accent mid" x="345" y="92">FK user_id</text>
+<path class="e accent" d="M406,230 C376,230 376,124 406,124"/><text class="t xs accent end" x="370" y="150">FK order_id</text>
+<rect class="n ghost" x="20" y="166" width="300" height="100" rx="6"/>
+<text class="t mono" x="32" y="192">SELECT o.id, o.total, i.sku</text>
+<text class="t mono" x="32" y="212">FROM orders o</text>
+<text class="t mono" x="32" y="232">JOIN order_items i ON i.order_id = o.id</text>
+<text class="t mono" x="32" y="252">WHERE o.user_id = 42;</text>
+<text class="t sm mid" x="360" y="325">Each fact is stored once. A join reassembles an order at read time.</text>
+</g>
+<g data-show="2">
+<text class="t sm b" x="30" y="34">key</text><text class="t sm b" x="230" y="34">value: opaque bytes to the store</text>
+<rect class="n cache" x="30" y="50" width="150" height="38" rx="6"/><text class="t mono b mid" x="105" y="73">user:42</text>
+<path class="e" d="M180,69 H226"/>
+<rect class="n ext" x="230" y="50" width="340" height="38" rx="6"/><text class="t mono mute" x="242" y="73">{"name":"Asha Rao","email":"asha@example.com"}</text>
+<rect class="n cache" x="30" y="106" width="150" height="38" rx="6"/><text class="t mono b mid" x="105" y="129">user:42:orders</text>
+<path class="e" d="M180,125 H226"/>
+<rect class="n ext" x="230" y="106" width="340" height="38" rx="6"/><text class="t mono mute" x="242" y="129">[9001, 9002]</text>
+<text class="t xs mute" x="582" y="129">app keeps in sync</text>
+<rect class="n cache" x="30" y="162" width="150" height="38" rx="6"/><text class="t mono b mid" x="105" y="185">order:9001</text>
+<path class="e" d="M180,181 H226"/>
+<rect class="n ext" x="230" y="162" width="340" height="38" rx="6"/><text class="t mono mute" x="242" y="185">{"user":42,"total":64.50,"items":[...]}</text>
+<rect class="n cache" x="30" y="218" width="150" height="38" rx="6"/><text class="t mono b mid" x="105" y="241">cart:42</text>
+<path class="e" d="M180,237 H226"/>
+<rect class="n ext" x="230" y="218" width="340" height="38" rx="6"/><text class="t mono mute" x="242" y="241">{"BK-1031":1}</text>
+<text class="t xs mute" x="582" y="241">TTL 30 days</text>
+<text class="t sm mid" x="360" y="300">GET, PUT and DELETE by exact key. No query by email or by date</text>
+<text class="t sm mid" x="360" y="320">unless the application maintains another key for it.</text>
+</g>
+<g data-show="3">
+<text class="t sm b" x="30" y="30">collection users, one document</text>
+<rect class="n db" x="30" y="42" width="446" height="224" rx="6"/>
+<text class="t mono" x="44" y="64" xml:space="preserve">{ "_id": 42,</text>
+<text class="t mono" x="44" y="85" xml:space="preserve">  "name": "Asha Rao",</text>
+<text class="t mono" x="44" y="106" xml:space="preserve">  "email": "asha@example.com",</text>
+<text class="t mono" x="44" y="127" xml:space="preserve">  "orders": [</text>
+<text class="t mono" x="44" y="148" xml:space="preserve">    { "id": 9001, "total": 64.50, "created": "2026-10-02",</text>
+<text class="t mono" x="44" y="169" xml:space="preserve">      "items": [ { "sku": "BK-1031", "qty": 1 },</text>
+<text class="t mono" x="44" y="190" xml:space="preserve">                 { "sku": "MG-220",  "qty": 2 } ] },</text>
+<text class="t mono" x="44" y="211" xml:space="preserve">    { "id": 9002, "total": 18.00, "created": "2026-10-07",</text>
+<text class="t mono" x="44" y="232" xml:space="preserve">      "items": [ { "sku": "TE-118", "qty": 1 } ] }</text>
+<text class="t mono" x="44" y="253" xml:space="preserve">  ] }</text>
+<circle class="dot accent" cx="500" cy="62" r="3"/>
+<text class="t sm" x="512" y="66">One read returns the whole</text>
+<text class="t sm" x="512" y="83">aggregate, no joins.</text>
+<circle class="dot accent" cx="500" cy="118" r="3"/>
+<text class="t sm" x="512" y="122">Secondary indexes on any</text>
+<text class="t sm" x="512" y="139">field: email, orders.created.</text>
+<circle class="dot accent" cx="500" cy="174" r="3"/>
+<text class="t sm" x="512" y="178">Unbounded arrays are a smell:</text>
+<text class="t sm" x="512" y="195">move orders to their own</text>
+<text class="t sm" x="512" y="212">collection once they grow.</text>
+<text class="t sm mid" x="360" y="325">Data read together is stored together, shaped like the object in the code.</text>
+</g>
+<g data-show="4">
+<text class="t mono" x="20" y="26">PRIMARY KEY ((user_id), created_at, order_id)</text>
+<rect class="zone" x="20" y="40" width="560" height="114" rx="8"/>
+<text class="t sm b" x="34" y="61">partition user_id = 42</text>
+<rect class="n db" x="34" y="72" width="532" height="72" rx="6"/>
+<path class="line faint" d="M34,96 H566"/>
+<text class="t xs mute" x="42" y="88">created_at (desc)</text>
+<text class="t xs mute" x="160" y="88">order_id</text>
+<text class="t xs mute" x="232" y="88">total</text>
+<text class="t xs mute" x="292" y="88">items</text>
+<text class="t mono" x="42" y="112">2026-10-07</text>
+<text class="t mono" x="160" y="112">9002</text>
+<text class="t mono" x="232" y="112">18.00</text>
+<text class="t mono" x="292" y="112">{TE-118: 1}</text>
+<text class="t mono" x="42" y="136">2026-10-02</text>
+<text class="t mono" x="160" y="136">9001</text>
+<text class="t mono" x="232" y="136">64.50</text>
+<text class="t mono" x="292" y="136">{BK-1031: 1, MG-220: 2}</text>
+<rect class="n ext" x="606" y="79.0" width="94" height="36" rx="6"/><text class="t sm b mid" x="653" y="101.0">node A</text>
+<path class="e dash" d="M580,97.0 H602"/>
+<rect class="zone" x="20" y="168" width="560" height="114" rx="8"/>
+<text class="t sm b" x="34" y="189">partition user_id = 77</text>
+<rect class="n db" x="34" y="200" width="532" height="72" rx="6"/>
+<path class="line faint" d="M34,224 H566"/>
+<text class="t xs mute" x="42" y="216">created_at (desc)</text>
+<text class="t xs mute" x="160" y="216">order_id</text>
+<text class="t xs mute" x="232" y="216">total</text>
+<text class="t xs mute" x="292" y="216">items</text>
+<text class="t mono" x="42" y="240">2026-10-08</text>
+<text class="t mono" x="160" y="240">7310</text>
+<text class="t mono" x="232" y="240">23.90</text>
+<text class="t mono" x="292" y="240">{MG-220: 1, NB-400: 1}</text>
+<text class="t mono" x="42" y="264">2026-09-21</text>
+<text class="t mono" x="160" y="264">6604</text>
+<text class="t mono" x="232" y="264">9.99</text>
+<text class="t mono" x="292" y="264">{TE-118: 1}</text>
+<rect class="n ext" x="606" y="207.0" width="94" height="36" rx="6"/><text class="t sm b mid" x="653" y="229.0">node B</text>
+<path class="e dash" d="M580,225.0 H602"/>
+<text class="t sm mid" x="360" y="305">The partition key picks the node. The clustering key keeps rows sorted inside it,</text>
+<text class="t sm mid" x="360" y="325">so "latest 20 orders for user 42" is one sequential read. Queries must name the partition.</text>
+</g>
+<g data-show="5">
+<path class="e accent" d="M117.5,148.1 L208.8,108.5"/>
+<path class="e" d="M116.8,173.4 L209.6,219.8"/>
+<path class="e" d="M269.3,88.6 L366.8,67.3"/>
+<path class="e accent" d="M267.8,106.3 L368.5,147.2"/>
+<path class="e" d="M269.6,239.6 L366.4,254.8"/>
+<path class="e accent" d="M510.0,160.0 L434.0,160.0"/>
+<path class="e" d="M623.7,114.4 L569.8,143.7"/>
+<path class="e accent" d="M565.3,176.1 L621.3,211.7"/>
+<circle class="n client" cx="90" cy="160" r="30"/><text class="t xs mute mid" x="90" y="157">User</text><text class="t sm b mid" x="90" y="172">Asha</text>
+<circle class="n svc" cx="240" cy="95" r="30"/><text class="t xs mute mid" x="240" y="92">Order</text><text class="t sm b mid" x="240" y="107">9001</text>
+<circle class="n svc" cx="240" cy="235" r="30"/><text class="t xs mute mid" x="240" y="232">Order</text><text class="t sm b mid" x="240" y="247">9002</text>
+<circle class="n db" cx="400" cy="60" r="30"/><text class="t xs mute mid" x="400" y="57">Product</text><text class="t sm b mid" x="400" y="72">BK-1031</text>
+<circle class="n db" cx="400" cy="160" r="30"/><text class="t xs mute mid" x="400" y="157">Product</text><text class="t sm b mid" x="400" y="172">MG-220</text>
+<circle class="n db" cx="400" cy="260" r="30"/><text class="t xs mute mid" x="400" y="257">Product</text><text class="t sm b mid" x="400" y="272">TE-118</text>
+<circle class="n svc" cx="540" cy="160" r="30"/><text class="t xs mute mid" x="540" y="157">Order</text><text class="t sm b mid" x="540" y="172">7310</text>
+<circle class="n client" cx="650" cy="100" r="30"/><text class="t xs mute mid" x="650" y="97">User</text><text class="t sm b mid" x="650" y="112">Ben</text>
+<circle class="n db" cx="650" cy="230" r="30"/><text class="t xs mute mid" x="650" y="227">Product</text><text class="t sm b mid" x="650" y="242">NB-400</text>
+<text class="t xs mute mid" x="160" y="112">PLACED</text>
+<text class="t xs mute mid" x="318" y="62">CONTAINS</text>
+<text class="t xs mute mid" x="580" y="114">PLACED</text>
+<text class="t mono" x="20" y="306">MATCH (:User {id:42})-[:PLACED]-&gt;()-[:CONTAINS]-&gt;(p)&lt;-[:CONTAINS]-(o),</text>
+<text class="t mono" x="20" y="326">      (o)-[:CONTAINS]-&gt;(rec) WHERE rec &lt;&gt; p RETURN rec   // NB-400</text>
+</g>
+<g data-show="6">
+<path class="line faint" d="M50,250 H434"/>
+<text class="t xs mute end" x="44" y="254.0">0</text>
+<text class="t xs mute end" x="44" y="190.7">20</text>
+<path class="line faint" d="M50,186.7 H434" style="stroke-dasharray:2 4"/>
+<text class="t xs mute end" x="44" y="127.3">40</text>
+<path class="line faint" d="M50,123.3 H434" style="stroke-dasharray:2 4"/>
+<text class="t xs mute end" x="44" y="64.0">60</text>
+<path class="line faint" d="M50,60.0 H434" style="stroke-dasharray:2 4"/>
+<rect x="56" y="151.8" width="30" height="98.2" rx="2" style="fill:var(--d-queue-s);opacity:.8"/>
+<text class="t xs mute mid" x="71.0" y="266">12:00</text>
+<rect x="94" y="142.3" width="30" height="107.7" rx="2" style="fill:var(--d-queue-s);opacity:.8"/>
+<rect x="132" y="158.2" width="30" height="91.8" rx="2" style="fill:var(--d-queue-s);opacity:.8"/>
+<rect x="170" y="123.3" width="30" height="126.7" rx="2" style="fill:var(--d-queue-s);opacity:.8"/>
+<text class="t xs mute mid" x="185.0" y="266">12:03</text>
+<rect x="208" y="85.3" width="30" height="164.7" rx="2" style="fill:var(--d-queue-s);opacity:.8"/>
+<rect x="246" y="101.2" width="30" height="148.8" rx="2" style="fill:var(--d-queue-s);opacity:.8"/>
+<rect x="284" y="129.7" width="30" height="120.3" rx="2" style="fill:var(--d-queue-s);opacity:.8"/>
+<text class="t xs mute mid" x="299.0" y="266">12:06</text>
+<rect x="322" y="136.0" width="30" height="114.0" rx="2" style="fill:var(--d-queue-s);opacity:.8"/>
+<rect x="360" y="110.7" width="30" height="139.3" rx="2" style="fill:var(--d-queue-s);opacity:.8"/>
+<rect x="398" y="120.2" width="30" height="129.8" rx="2" style="fill:var(--d-queue-s);opacity:.8"/>
+<text class="t xs mute mid" x="413.0" y="266">12:09</text>
+<text class="t sm b" x="50" y="34">orders per minute, region=eu</text>
+<text class="t sm b" x="470" y="70">One point per write:</text>
+<text class="t mono" x="470" y="92">orders,region=eu</text>
+<text class="t mono" x="470" y="110">  count=52,revenue=2311.40</text>
+<text class="t mono" x="470" y="128">  2026-10-07T12:04:00Z</text>
+<text class="t sm" x="470" y="170">Append-only, ordered by time.</text>
+<text class="t sm" x="470" y="188">Old data is downsampled</text>
+<text class="t sm" x="470" y="206">(1 min to 1 h) and dropped</text>
+<text class="t sm" x="470" y="224">whole chunks at a time.</text>
+<text class="t sm mid" x="360" y="320">Not the orders themselves: a derived stream of measurements about them.</text>
+</g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Relational</button><button type="button" data-step="2" aria-pressed="false">Key-value</button><button type="button" data-step="3" aria-pressed="false">Document</button><button type="button" data-step="4" aria-pressed="false">Wide-column</button><button type="button" data-step="5" aria-pressed="false">Graph</button><button type="button" data-step="6" aria-pressed="false">Time-series</button></div>
+</div>
+<figcaption><b>One dataset, six models.</b> Notice what each model makes cheap. Relational keeps facts once and joins them; key-value and document store the answer pre-assembled; wide-column sorts rows inside a partition; graph makes multi-hop traversals a first-class query; time-series keeps a measurement stream rather than the records.</figcaption>
+</figure>
+
+<h3 id="key-value">Key-value stores</h3>
+<p>A <dfn>key-value store</dfn> is a giant distributed hash map: <code>GET key</code>, <code>PUT key value</code>, <code>DELETE key</code>. The value is opaque bytes, so the store cannot filter on anything inside it. That restriction is the point. Every operation touches exactly one key, so the data partitions trivially by hashing the key (see <a href="consistent-hashing.html">Consistent Hashing</a>), and latency is predictable: Redis answers in well under a millisecond from memory, DynamoDB in single-digit milliseconds at any table size.</p>
+<p>The cost shows up the first time someone asks "find the user with this email". Either you scan everything, or the application maintains a second key (<code>email:asha@example.com → 42</code>) and keeps it in sync on every write, with no transaction to protect it. Use key-value stores when the key is always known: sessions, carts, rate-limit counters, feature flags, cached objects, idempotency keys.</p>
+
+<h3 id="document">Document stores</h3>
+<p>A <dfn>document store</dfn> keeps self-describing, nested records (JSON or BSON) grouped in collections. Unlike key-value, the store understands the structure: MongoDB can index <code>email</code> or <code>orders.created</code> and filter on them. The big win is <dfn>locality</dfn>: an aggregate that is always read together (a product page with its variants, a user profile with settings) is one document, fetched with one disk read and no joins, in the same shape the code uses.</p>
+<p>The trade-off is relationships. Embedding works for one-to-few data that belongs to its parent. It breaks for many-to-many data (products appear in many orders; you do not copy the product into each) and for unbounded growth (a user with 40,000 orders makes a 40,000-element array, and MongoDB caps a document at 16 MB). Then you reference by id and do the join in application code, which is a slower, hand-written version of what SQL does for you. Schema flexibility is real but is better described as <dfn>schema-on-read</dfn>: the schema still exists, it just lives in every piece of code that reads the data.</p>
+
+<h3 id="wide-column">Wide-column stores</h3>
+<p>Cassandra, ScyllaDB, HBase and Google Bigtable are usually called <dfn>wide-column</dfn> stores, a name inherited from Bigtable's column families. The model that matters in practice is a two-part primary key. The <dfn>partition key</dfn> (here <code>user_id</code>) is hashed to pick the nodes that own the data. The <dfn>clustering key</dfn> (here <code>created_at, order_id</code>) keeps rows sorted inside that partition on disk. "The 20 newest orders for user 42" becomes one seek and a sequential read on one node.</p>
+<p>These stores are built on <a href="indexing.html">LSM trees</a>, so writes are sequential appends and a cluster can absorb millions of writes per second. In return, queries must name the partition: there are no joins, secondary indexes are limited, and you usually store the same data several times, once per query (an <code>orders_by_user</code> table and an <code>orders_by_day</code> table). You design tables from queries, not from entities. Discord's message store (trillions of messages, partitioned by channel and time bucket) is the canonical fit.</p>
+
+<h3 id="graph">Graph databases</h3>
+<p>A <dfn>graph database</dfn> stores nodes and typed edges with properties, and its query languages (Cypher, Gremlin, SPARQL) express paths: "products bought by people who bought what Asha bought". In SQL that is a chain of self-joins whose number must be fixed in the query; recursive CTEs can do variable depth but get slow as depth grows. Native graph engines like Neo4j store adjacency directly, so each hop costs roughly the number of edges followed, not a lookup in a table-wide index.</p>
+<p>Use a graph store when traversal is the main workload: fraud rings (accounts sharing devices and cards), access-control hierarchies, knowledge graphs, network topology. Do not use one as a general-purpose system of record; graph databases are hard to partition, because any cut through a graph severs edges that queries will want to follow.</p>
+
+<h3 id="time-series">Time-series databases</h3>
+<p>A <dfn>time-series database</dfn> stores measurements: a metric name, a set of tags, a timestamp and values. Data arrives in time order, is almost never updated, is queried by time range with aggregation (rate per minute, p99 per hour), and loses value as it ages. Engines exploit all four facts. Facebook's Gorilla showed that delta-of-delta timestamps and XOR-compressed floats shrink a 16-byte point to about 1.37 bytes on average. Old data is downsampled and whole time chunks are dropped at once instead of deleting rows one by one. Prometheus, InfluxDB and TimescaleDB (a PostgreSQL extension) are common choices. Note that the orders themselves do not belong here; the per-minute order rate does.</p>
+
+<h3 id="search-engines">Search engines</h3>
+<p>Elasticsearch, OpenSearch and Solr store documents in an <dfn>inverted index</dfn> (term to list of documents) and rank results by relevance. They answer "running shoes waterproof" with typo tolerance, stemming and facets, which no B-tree index can do well. They are almost always a <strong>secondary</strong> store: fed from the system of record via change data capture, rebuilt from it if lost, and never the place where an order is first committed. The <a href="search.html">Search &amp; Inverted Indexes</a> chapter covers how they work.</p>
+
+<h2 id="comparison">Side-by-side comparison</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Family</th><th>Queries</th><th>Transactions</th><th>Scale-out</th><th>Typical use</th></tr></thead>
+<tbody>
+<tr><th>Relational</th><td class="yes">Full SQL, joins, ad-hoc</td><td class="yes">Multi-row ACID</td><td class="meh">Replicas for reads; manual or middleware sharding for writes</td><td>System of record: orders, payments, users</td></tr>
+<tr><th>NewSQL</th><td class="yes">Full SQL</td><td class="yes">Distributed ACID; serializable in Spanner and CockroachDB</td><td class="yes">Automatic range or hash sharding</td><td>Relational workloads that outgrow one primary</td></tr>
+<tr><th>Key-value</th><td class="no">By key only</td><td class="meh">Single key; some offer small multi-key</td><td class="yes">Hash partitioning, trivial</td><td>Sessions, carts, caches, counters</td></tr>
+<tr><th>Document</th><td class="meh">Rich filters, weak joins</td><td class="meh">Single document; multi-document is slower</td><td class="yes">Built-in sharding by a shard key</td><td>Catalogs, profiles, content</td></tr>
+<tr><th>Wide-column</th><td class="no">Must name the partition</td><td class="no">Per-row; conditional writes via Paxos</td><td class="yes">Linear, masterless, multi-region</td><td>Messages, events, feeds, IoT</td></tr>
+<tr><th>Graph</th><td class="yes">Path and pattern queries</td><td class="meh">ACID on one machine (Neo4j)</td><td class="no">Hard to partition</td><td>Fraud, permissions, recommendations</td></tr>
+<tr><th>Time-series</th><td class="meh">Range scans and aggregations</td><td class="no">Rarely needed</td><td class="yes">Shard by series and time</td><td>Metrics, monitoring, sensor data</td></tr>
+<tr><th>Search</th><td class="yes">Full text, relevance, facets</td><td class="no">None, near-real-time</td><td class="yes">Index shards plus replicas</td><td>Product search, logs</td></tr>
+</tbody></table></div>
+
+<h2 id="deciding">A decision framework</h2>
+<p>Four questions, asked in this order, settle almost every choice. Write the main queries down first, with rough rates; the answers fall out of them.</p>
+
+<h3 id="by-access-pattern">1. Access pattern</h3>
+<p>List the reads and writes the system must serve and how often. "Get cart by user id, 20k/s" is a key-value pattern. "Latest 50 messages in a channel, 100k/s" is a partition-plus-range pattern. "Revenue by category last quarter, a few times a day" is an analytical query that belongs in a warehouse, not in the operational store. If the list includes many different filters on the same data, or you cannot predict the queries yet, that is a strong signal for relational.</p>
+
+<h3 id="by-consistency">2. Consistency and invariants</h3>
+<p>Ask which rules must never be broken. "Stock never goes below zero", "a seat is sold once", "a transfer debits and credits or does neither". Rules that span rows need multi-row transactions or a careful single-row design. Relational and NewSQL make these easy. In Cassandra you would need lightweight transactions on every write that touches the invariant, at several times the latency. If the data tolerates staleness (a like count, a product description), eventual consistency is fine and buys availability; see <a href="cap-pacelc.html">CAP &amp; PACELC</a>.</p>
+
+<h3 id="by-scale">3. Scale, honestly estimated</h3>
+<p>Compute the numbers before reaching for a distributed store. A single PostgreSQL primary on modern hardware handles tens of thousands of simple writes per second and tens of terabytes of data, more with read replicas absorbing reads. Most products never exceed that. Reach for a natively partitioned store when sustained writes are in the hundreds of thousands per second, when the dataset is hundreds of terabytes, or when you need active writes in several regions. See <a href="estimation.html">Back-of-Envelope Estimation</a>.</p>
+
+<h3 id="by-schema">4. Schema shape and change</h3>
+<p>Heterogeneous records (a catalog where a laptop has <code>ram_gb</code> and a shirt has <code>sleeve_length</code>) fit documents naturally, though a relational table with a JSONB column also handles them. Strongly interconnected data with many-to-many relationships fits relational or graph. Schema flexibility is about who enforces the schema, not whether one exists.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 426" role="img" aria-label="Decision ladder: questions on the left, each yes leads to a store family on the right, each no continues down">
+<rect class="n" x="20" y="20" width="380" height="46" rx="8"/>
+<text class="t b" x="34" y="40">Invariants across rows or tables?</text>
+<text class="t xs mute" x="34" y="56">money, stock, bookings, uniqueness</text>
+<rect class="n db" x="450" y="20" width="250" height="46" rx="8"/>
+<text class="t b" x="464" y="40">Relational</text>
+<text class="t xs mute" x="464" y="56">PostgreSQL, MySQL (NewSQL at scale)</text>
+<path class="e green" d="M400,43.0 H446"/>
+<text class="t xs green mid" x="425" y="37.0">yes</text>
+<path class="e" d="M60,66 V84"/>
+<text class="t xs mute" x="68" y="81">no</text>
+<rect class="n" x="20" y="88" width="380" height="46" rx="8"/>
+<text class="t b" x="34" y="108">Every read is by one known key?</text>
+<text class="t xs mute" x="34" y="124">sessions, carts, feature flags</text>
+<rect class="n cache" x="450" y="88" width="250" height="46" rx="8"/>
+<text class="t b" x="464" y="108">Key-value</text>
+<text class="t xs mute" x="464" y="124">Redis, DynamoDB, Memcached</text>
+<path class="e green" d="M400,111.0 H446"/>
+<text class="t xs green mid" x="425" y="105.0">yes</text>
+<path class="e" d="M60,134 V152"/>
+<text class="t xs mute" x="68" y="149">no</text>
+<rect class="n" x="20" y="156" width="380" height="46" rx="8"/>
+<text class="t b" x="34" y="176">Reads fetch one self-contained aggregate?</text>
+<text class="t xs mute" x="34" y="192">profile, catalog item, CMS page</text>
+<rect class="n svc" x="450" y="156" width="250" height="46" rx="8"/>
+<text class="t b" x="464" y="176">Document</text>
+<text class="t xs mute" x="464" y="192">MongoDB, Firestore, Postgres JSONB</text>
+<path class="e green" d="M400,179.0 H446"/>
+<text class="t xs green mid" x="425" y="173.0">yes</text>
+<path class="e" d="M60,202 V220"/>
+<text class="t xs mute" x="68" y="217">no</text>
+<rect class="n" x="20" y="224" width="380" height="46" rx="8"/>
+<text class="t b" x="34" y="244">Huge write rate, reads by key + time range?</text>
+<text class="t xs mute" x="34" y="260">messages, events, IoT readings</text>
+<rect class="n queue" x="450" y="224" width="250" height="46" rx="8"/>
+<text class="t b" x="464" y="244">Wide-column</text>
+<text class="t xs mute" x="464" y="260">Cassandra, ScyllaDB, Bigtable</text>
+<path class="e green" d="M400,247.0 H446"/>
+<text class="t xs green mid" x="425" y="241.0">yes</text>
+<path class="e" d="M60,270 V288"/>
+<text class="t xs mute" x="68" y="285">no</text>
+<rect class="n" x="20" y="292" width="380" height="46" rx="8"/>
+<text class="t b" x="34" y="312">Queries walk relationships many hops?</text>
+<text class="t xs mute" x="34" y="328">fraud rings, social graph, permissions</text>
+<rect class="n ext" x="450" y="292" width="250" height="46" rx="8"/>
+<text class="t b" x="464" y="312">Graph</text>
+<text class="t xs mute" x="464" y="328">Neo4j, Amazon Neptune</text>
+<path class="e green" d="M400,315.0 H446"/>
+<text class="t xs green mid" x="425" y="309.0">yes</text>
+<path class="e" d="M60,338 V356"/>
+<text class="t xs mute" x="68" y="353">no</text>
+<rect class="n ghost" x="20" y="360" width="380" height="46" rx="8"/>
+<text class="t b" x="34" y="380">Nothing special?</text>
+<text class="t xs mute" x="34" y="396">most CRUD apps land here</text>
+<rect class="n db" x="450" y="360" width="250" height="46" rx="8"/>
+<text class="t b" x="464" y="380">Relational, the default</text>
+<text class="t xs mute" x="464" y="396">add specialised stores beside it later</text>
+<path class="e green" d="M400,383.0 H446"/>
+</svg>
+</div>
+<figcaption><b>A decision ladder.</b> Ask the questions top to bottom and stop at the first yes. Most systems answer yes to the first question for their core data and then add specialised stores for specific access patterns.</figcaption>
+</figure>
+
+<div class="callout warn">
+<div class="callout-title">Common mistake</div>
+<p>Picking the store per system instead of per dataset. A real product has several datasets with different access patterns: orders, carts, a catalog, search, metrics. Using one database for all of them forces compromises; using a different store for each without reason multiplies operational cost. Choose per dataset, then consolidate where the differences do not matter.</p>
+</div>
+
+<h2 id="newsql">NewSQL: SQL that shards itself</h2>
+<p><dfn>NewSQL</dfn> (or distributed SQL) databases keep the relational model, SQL and ACID transactions (serializable by default in Spanner and CockroachDB; TiDB and YugabyteDB default to snapshot isolation), and partition data automatically across many nodes. Google Spanner (2012) proved it could be done at planet scale; CockroachDB, YugabyteDB and TiDB brought the design to everyone else.</p>
+<p>The common architecture: the key space of every table and index is split into contiguous <dfn>ranges</dfn> (CockroachDB) or tablets/regions (YugabyteDB, TiDB). Each range is replicated three or five ways and kept consistent by a <a href="consensus.html">Raft or Paxos</a> group. One replica holds a lease and serves reads and proposes writes. Ranges split when they grow or get hot and move between nodes to balance load, which gives you the elasticity of a NoSQL store with the semantics of a relational one.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 332" role="img" aria-label="Three NewSQL nodes; each runs a SQL layer and holds replicas of three key ranges; a client update is routed by node 1 to the leaseholder of range r2 on node 2, which replicates to the other two copies">
+<rect class="zone" x="150" y="20" width="170" height="250" rx="10"/>
+<text class="t sm b mid" x="235" y="40">node 1</text>
+<rect class="n svc" x="165" y="52" width="140" height="36" rx="6"/><text class="t sm b mid" x="235" y="74">SQL layer</text>
+<rect class="n db" x="165" y="112" width="140" height="36" rx="6" style="stroke:var(--accent);stroke-width:2.5"/>
+<text class="t sm b" x="177" y="134">r1</text><text class="t xs mute" x="200" y="134">keys a to g</text>
+<rect class="n cache" x="165" y="164" width="140" height="36" rx="6"/>
+<text class="t sm b" x="177" y="186">r2</text><text class="t xs mute" x="200" y="186">keys g to p</text>
+<rect class="n queue" x="165" y="216" width="140" height="36" rx="6"/>
+<text class="t sm b" x="177" y="238">r3</text><text class="t xs mute" x="200" y="238">keys p to z</text>
+<rect class="zone" x="345" y="20" width="170" height="250" rx="10"/>
+<text class="t sm b mid" x="430" y="40">node 2</text>
+<rect class="n svc" x="360" y="52" width="140" height="36" rx="6"/><text class="t sm b mid" x="430" y="74">SQL layer</text>
+<rect class="n db" x="360" y="112" width="140" height="36" rx="6"/>
+<text class="t sm b" x="372" y="134">r1</text><text class="t xs mute" x="395" y="134">keys a to g</text>
+<rect class="n cache" x="360" y="164" width="140" height="36" rx="6" style="stroke:var(--accent);stroke-width:2.5"/>
+<text class="t sm b" x="372" y="186">r2</text><text class="t xs mute" x="395" y="186">keys g to p</text>
+<rect class="n queue" x="360" y="216" width="140" height="36" rx="6"/>
+<text class="t sm b" x="372" y="238">r3</text><text class="t xs mute" x="395" y="238">keys p to z</text>
+<rect class="zone" x="540" y="20" width="170" height="250" rx="10"/>
+<text class="t sm b mid" x="625" y="40">node 3</text>
+<rect class="n svc" x="555" y="52" width="140" height="36" rx="6"/><text class="t sm b mid" x="625" y="74">SQL layer</text>
+<rect class="n db" x="555" y="112" width="140" height="36" rx="6"/>
+<text class="t sm b" x="567" y="134">r1</text><text class="t xs mute" x="590" y="134">keys a to g</text>
+<rect class="n cache" x="555" y="164" width="140" height="36" rx="6"/>
+<text class="t sm b" x="567" y="186">r2</text><text class="t xs mute" x="590" y="186">keys g to p</text>
+<rect class="n queue" x="555" y="216" width="140" height="36" rx="6" style="stroke:var(--accent);stroke-width:2.5"/>
+<text class="t sm b" x="567" y="238">r3</text><text class="t xs mute" x="590" y="238">keys p to z</text>
+<rect class="n client" x="20" y="52" width="96" height="36" rx="6"/><text class="t sm b mid" x="68" y="74">Client</text>
+<path class="e" d="M116,70 H161"/>
+<path class="e accent" d="M305,74 C338,74 326,174 356,174"/>
+<path class="flow" d="M116,70 H161"/><path class="flow" d="M305,74 C338,74 326,174 356,174"/>
+<path class="e dash" d="M360,192 H309"/><path class="e dash" d="M500,183 H551"/>
+<text class="t xs mono mute" x="20" y="112">UPDATE accounts</text><text class="t xs mono mute" x="20" y="126">WHERE id='kiran'</text>
+<rect x="160" y="286" width="22" height="14" rx="3" class="n" style="stroke:var(--accent);stroke-width:2.5"/>
+<text class="t sm" x="190" y="297">leaseholder: serves reads and proposes writes for its range</text>
+<text class="t sm" x="160" y="320">Each range is its own Raft group of three replicas; a write commits once two have it.</text>
+</svg>
+</div>
+<figcaption><b>Distributed SQL.</b> Any node can accept the query. Its SQL layer turns it into key-value operations and sends them to the leaseholder of each range touched. A transaction that spans ranges on different nodes uses a distributed commit protocol on top.</figcaption>
+</figure>
+
+<p>What you pay for this:</p>
+<ul>
+<li><strong>Write latency.</strong> Every commit waits for a quorum of replicas. Within one region that is a millisecond or two of network; with replicas spread across regions it is a cross-region round trip, often 50 to 150 ms.</li>
+<li><strong>Clock uncertainty.</strong> Serializable ordering across nodes needs timestamps that mean something. Spanner uses TrueTime, GPS and atomic clocks with a bounded uncertainty of a few milliseconds, and waits out that uncertainty before acknowledging a commit (<dfn>commit wait</dfn>). CockroachDB uses hybrid logical clocks and restarts reads that hit values inside its uncertainty window.</li>
+<li><strong>Cross-range transactions cost more</strong> than single-range ones, and contention between transactions shows up as retries that the application must handle.</li>
+<li><strong>Operational complexity</strong> is lower than hand-sharding but higher than a single PostgreSQL node.</li>
+</ul>
+<p>Do not confuse NewSQL with Amazon Aurora or AlloyDB. Those separate compute from a distributed, replicated storage layer, which makes storage, failover and read replicas far better, but they still have a single writer node (outside Aurora's separate Limitless sharded option). They scale storage and reads, not writes.</p>
+
+<h2 id="blurring">The lines have blurred</h2>
+<p>The 2010 version of this debate no longer describes the products. PostgreSQL has a binary JSON type (<code>jsonb</code>) with GIN indexes, so a relational table can hold schema-flexible documents and query inside them. MongoDB added multi-document ACID transactions in 4.0 (2018) and across shards in 4.2. DynamoDB has <code>TransactWriteItems</code> covering up to 100 items. Cassandra has lightweight transactions for compare-and-set. Even SQLite, in the Python standard library, can store JSON and return document-shaped results:</p>
+<pre><code class="language-python">import json
+import sqlite3
+
+db = sqlite3.connect(":memory:")
+db.executescript("""
+CREATE TABLE users  (id INTEGER PRIMARY KEY, name TEXT, email TEXT UNIQUE);
+CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id),
+                     total REAL, created_at TEXT,
+                     attrs TEXT);                       -- free-form JSON column
+CREATE INDEX orders_by_user ON orders(user_id, created_at);
+INSERT INTO users  VALUES (42, 'Asha Rao', 'asha@example.com');
+INSERT INTO orders VALUES (9001, 42, 64.50, '2026-10-02', '{"gift": true, "coupon": "FALL10"}'),
+                          (9002, 42, 18.00, '2026-10-07', '{"gift": false}');
+""")
+
+# Relational storage, document-shaped answer: one query builds the aggregate.
+row = db.execute("""
+SELECT json_object('id', u.id, 'name', u.name,
+         'orders', json_group_array(json_object('id', o.id, 'total', o.total)))
+FROM users u JOIN orders o ON o.user_id = u.id
+WHERE u.id = 42 GROUP BY u.id
+""").fetchone()
+print(json.loads(row[0]))
+
+# Schema-flexible attributes, still queryable with SQL.
+print(db.execute("SELECT id FROM orders WHERE json_extract(attrs, '$.coupon') = 'FALL10'").fetchall())
+
+# {'id': 42, 'name': 'Asha Rao', 'orders': [{'id': 9001, 'total': 64.5}, {'id': 9002, 'total': 18.0}]}
+# [(9001,)]</code></pre>
+<p>So the real question is rarely "can this database do X". It is "which operations does this engine make cheap by default, and which does it merely allow". A multi-document transaction in MongoDB works, but the engine and its documentation still steer you toward single-document atomicity. A JSONB column works, but a catalog that is 95% free-form attributes is fighting the relational planner, whose statistics know nothing about the inside of a JSON value.</p>
+
+<h2 id="myths">Myths to retire</h2>
+<div class="defs">
+<div><h4>"NoSQL scales, SQL doesn't"</h4><p>Relational databases scale; what is hard is scaling <em>writes and joins across machines</em>. YouTube ran MySQL behind Vitess, Instagram, Notion and Figma shard PostgreSQL, and Spanner is relational at global scale. Meanwhile a NoSQL store with a hot partition key does not scale either.</p></div>
+<div><h4>"NoSQL is schemaless"</h4><p>The schema moved from the database into the code that reads the data. Every reader must handle every historical shape of every record, which is harder to get right than a migration.</p></div>
+<div><h4>"NoSQL can't do transactions"</h4><p>Most can now, with limits: single-partition, a capped number of items, or higher latency. Know the limits of the one you pick.</p></div>
+<div><h4>"Joins are slow"</h4><p>An indexed join of an order to its items on one machine costs a few page reads. What is slow is a join across shards or over unindexed columns. Avoiding joins by denormalizing moves the cost to writes and to keeping copies consistent.</p></div>
+<div><h4>"Pick the right database"</h4><p>Singular. Large systems use several stores, a pattern called <dfn>polyglot persistence</dfn>, with one system of record per dataset and derived stores fed from it.</p></div>
+<div><h4>"Document stores are faster"</h4><p>Reading one pre-assembled aggregate is faster than joining three tables. Updating a field duplicated in a million documents is much slower than updating one row. Speed depends on the access pattern, not on the family.</p></div>
+</div>
+
+<h2 id="worked-example">Worked example: an e-commerce app</h2>
+<p>A mid-size online store: 5 million products, 20 million registered users, 2 million orders a day, peaking at ten times the average during a sale. Start with the numbers, then choose per dataset.</p>
+<div class="stats">
+<div><b>~23/s</b><span>orders on average</span></div>
+<div><b>~230/s</b><span>orders at sale peak</span></div>
+<div><b>~2.2 TB</b><span>three years of orders</span></div>
+<div><b>~20 GB</b><span>active carts in memory</span></div>
+</div>
+<div class="calc">Orders      2,000,000 / 86,400 s                     ≈ <span class="r">23/s</span>   (×10 peak ≈ 230/s)
+Writes      each order: 1 order row + ~3 item rows + 3 stock updates ≈ 7 row writes
+            230 × 7                                   ≈ <span class="r">1,600 row writes/s</span> at peak
+Order data  2M/day × 365 × 3 years ≈ 2.2B orders × ~1 KB (rows + indexes) ≈ <span class="r">2.2 TB</span>
+Carts       10M active carts × ~2 KB                  ≈ <span class="r">20 GB</span>
+Catalog     5M products × ~10 KB (attributes, variants, text) ≈ 50 GB
+Browsing    ~50 product views per order → 2M × 50 / 86,400 ≈ 1,160/s, ×10 peak ≈ 11,600/s</div>
+<p>The order path, the part that touches money and stock, peaks around 1,600 row writes per second. That is comfortably inside one PostgreSQL primary, and it is exactly the data that needs multi-row transactions. The large numbers are reads of the catalog, which caches and replicas handle.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Dataset</th><th>Main access patterns</th><th>Store</th><th>Why</th></tr></thead>
+<tbody>
+<tr><th>Orders, payments, stock</th><td>Insert order + decrement stock atomically; orders by user by date; ad-hoc finance queries</td><td>PostgreSQL</td><td>Invariants across rows ("stock ≥ 0") need transactions. Volume fits one primary; partition the orders table by month for maintenance.</td></tr>
+<tr><th>Product catalog</th><td>Get product by id; attributes vary by category</td><td>MongoDB, or PostgreSQL with JSONB</td><td>Each product is one aggregate read as a unit. If the team already runs PostgreSQL, JSONB avoids a second database; that is a fine answer.</td></tr>
+<tr><th>Carts and sessions</th><td>Get/put by user id, expire when idle</td><td>Redis (or DynamoDB with TTL)</td><td>Pure key access, high churn, built-in expiry. Losing a cart is annoying, not catastrophic; persist to the order database at checkout.</td></tr>
+<tr><th>Product search</th><td>Full-text, typo tolerance, facets by brand and price</td><td>Elasticsearch / OpenSearch</td><td>Needs an inverted index and relevance ranking. Fed from the catalog via change data capture; rebuildable.</td></tr>
+<tr><th>Clickstream, metrics</th><td>Append-only events, aggregate by time</td><td>Kafka into a warehouse; Prometheus for metrics</td><td>Huge, immutable, analytical. Keep it off the transactional database.</td></tr>
+<tr><th>"Also bought" recommendations</th><td>Precomputed list per product</td><td>Key-value, computed offline</td><td>A graph database is tempting, but a nightly batch job writing <code>product_id → [related ids]</code> serves the same page at a fraction of the cost.</td></tr>
+</tbody></table></div>
+
+<figure class="fig wide">
+<div class="fig-frame">
+<svg viewBox="0 0 750 360" role="img" aria-label="E-commerce data architecture: catalog in MongoDB, carts in Redis, orders in PostgreSQL, change data capture through Kafka into Elasticsearch and a warehouse">
+<rect class="n client" x="20" y="150" width="90" height="46" rx="8"/><text class="t b mid" x="65.0" y="170">Client</text><text class="t xs mute mid" x="65.0" y="186">web / app</text>
+<rect class="n svc" x="160" y="20" width="120" height="46" rx="8"/><text class="t b mid" x="220.0" y="40">Catalog</text><text class="t xs mute mid" x="220.0" y="56">service</text>
+<rect class="n svc" x="160" y="95" width="120" height="46" rx="8"/><text class="t b mid" x="220.0" y="115">Cart</text><text class="t xs mute mid" x="220.0" y="131">service</text>
+<rect class="n svc" x="160" y="170" width="120" height="46" rx="8"/><text class="t b mid" x="220.0" y="190">Checkout</text><text class="t xs mute mid" x="220.0" y="206">service</text>
+<rect class="n svc" x="160" y="245" width="120" height="46" rx="8"/><text class="t b mid" x="220.0" y="265">Search</text><text class="t xs mute mid" x="220.0" y="281">service</text>
+<rect class="n db" x="330" y="20" width="160" height="46" rx="8"/><text class="t b mid" x="410.0" y="40">MongoDB</text><text class="t xs mute mid" x="410.0" y="56">catalog, varied attributes</text>
+<rect class="n cache" x="330" y="95" width="160" height="46" rx="8"/><text class="t b mid" x="410.0" y="115">Redis</text><text class="t xs mute mid" x="410.0" y="131">carts, sessions, TTL</text>
+<rect class="n db" x="330" y="170" width="160" height="46" rx="8"/><text class="t b mid" x="410.0" y="190">PostgreSQL</text><text class="t xs mute mid" x="410.0" y="206">orders, payments, stock</text>
+<rect class="n queue" x="560" y="95" width="170" height="46" rx="8"/><text class="t b mid" x="645.0" y="115">Kafka (CDC)</text><text class="t xs mute mid" x="645.0" y="131">Debezium change events</text>
+<rect class="n ext" x="560" y="20" width="170" height="46" rx="8"/><text class="t b mid" x="645.0" y="40">Warehouse</text><text class="t xs mute mid" x="645.0" y="56">analytics, BigQuery</text>
+<rect class="n db" x="560" y="245" width="170" height="46" rx="8"/><text class="t b mid" x="645.0" y="265">Elasticsearch</text><text class="t xs mute mid" x="645.0" y="281">full text, facets</text>
+<path class="e" d="M110,173 C135,173 132,43 156,43"/>
+<path class="e" d="M110,173 C135,173 132,118 156,118"/>
+<path class="e" d="M110,173 C135,173 132,193 156,193"/>
+<path class="e" d="M110,173 C135,173 132,268 156,268"/>
+<path class="e" d="M280,43 H326"/><path class="e" d="M280,118 H326"/><path class="e" d="M280,193 H326"/>
+<path class="e" d="M280,268 H556"/>
+<path class="e dash" d="M490,43 C525,43 520,110 556,110"/>
+<path class="e dash" d="M490,193 C525,193 520,126 556,126"/>
+<path class="e dash" d="M645,95 V70"/>
+<path class="e dash" d="M645,141 V241"/>
+<text class="t xs mute" x="652" y="196">index updates</text>
+<text class="t xs mute" x="652" y="86">load</text>
+<text class="t xs mute mid" x="420" y="262">query</text>
+<path class="flow" d="M110,173 C135,173 132,193 156,193"/><path class="flow" d="M280,193 H326"/>
+<text class="t sm" x="20" y="330">Solid arrows are the request path; dashed arrows are asynchronous. PostgreSQL is the</text>
+<text class="t sm" x="20" y="348">source of truth for money and stock; every other store can be rebuilt from a source of truth.</text>
+</svg>
+</div>
+<figcaption><b>Polyglot persistence.</b> The animated path is checkout, the one path that must be transactional. Search and analytics never receive writes from services directly; they consume change events, so they can lag by seconds and be rebuilt from scratch.</figcaption>
+</figure>
+<p>Two decisions here deserve to be said out loud in an interview. First, the derived stores are fed by <dfn>change data capture</dfn> (reading the database's replication log) rather than by services writing to two stores, because dual writes drift apart on partial failures; see <a href="event-streaming.html">Event Streaming</a>. Second, if this store grew 50 times, the order database would be the first thing to change, by sharding by <code>user_id</code> or moving to a distributed SQL database, and the rest of the design would stay.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+<li><strong>Amazon DynamoDB</strong> descends from the 2007 Dynamo paper, written after shopping-cart outages during peak season. AWS's own guidance is to design DynamoDB tables from access patterns, often with several entity types in one table (see <a href="data-modeling.html">Data Modeling</a>).</li>
+<li><strong>Discord</strong> stores trillions of messages in a wide-column store partitioned by channel and time bucket, moving from Cassandra to ScyllaDB in 2022 to cut tail latency, while its other data lives elsewhere.</li>
+<li><strong>Google</strong> built Bigtable (2006) for web-scale sparse tables, then Spanner (2012) partly because teams found Bigtable hard to use for applications that needed cross-row transactions and strong consistency across regions, as the Spanner paper explains.</li>
+<li><strong>Instagram, Notion and Figma</strong> all scaled on sharded PostgreSQL rather than switching data models, keeping SQL and transactions within each shard.</li>
+<li><strong>Uber</strong> built Schemaless, an append-only, sharded store on top of MySQL, which shows that the line between "SQL" and "NoSQL" is often just an API layered over the same engine.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>In the data model step of every design. State the main queries, then name a store per dataset with one sentence of reasoning: "Orders need atomic stock updates and the write rate is about 2k/s, so PostgreSQL; messages are append-heavy and always read by channel and time, so Cassandra partitioned by channel." Then move on.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>Why not just use PostgreSQL for everything? (Often you can. Say what would force a change: write rate, data size, multi-region writes.)</li>
+<li>Your NoSQL choice: how do you enforce a uniqueness constraint, like one account per email? (Conditional write on a key derived from the email.)</li>
+<li>How do you query by a field that is not the partition key? (Secondary index, a second table, or a search engine fed by CDC.)</li>
+<li>What happens to cross-entity transactions after you shard? (See <a href="distributed-transactions.html">Distributed Transactions</a>.)</li>
+<li>How does Spanner offer serializable transactions across continents, and what does it cost?</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>"NoSQL because it scales" with no numbers showing that one relational node is not enough.</li>
+<li>Putting money or inventory in an eventually consistent store without a plan for the invariants.</li>
+<li>Using a search engine or cache as the system of record.</li>
+<li>One database for clickstream analytics and order processing.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://dl.acm.org/doi/10.1145/362384.362685" target="_blank" rel="noopener">A Relational Model of Data for Large Shared Data Banks</a><span>E. F. Codd, Communications of the ACM, 1970. The paper that started it, and still readable.</span></li>
+<li><a href="https://static.googleusercontent.com/media/research.google.com/en//archive/bigtable-osdi06.pdf" target="_blank" rel="noopener">Bigtable: A Distributed Storage System for Structured Data</a><span>Chang et al., OSDI 2006. The origin of the wide-column model.</span></li>
+<li><a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf" target="_blank" rel="noopener">Dynamo: Amazon's Highly Available Key-value Store</a><span>DeCandia et al., SOSP 2007. Why Amazon traded consistency for availability in the cart.</span></li>
+<li><a href="https://www.usenix.org/conference/osdi12/technical-sessions/presentation/corbett" target="_blank" rel="noopener">Spanner: Google's Globally-Distributed Database</a><span>Corbett et al., OSDI 2012. TrueTime, commit wait and SQL at global scale.</span></li>
+<li><a href="https://dataintensive.net/" target="_blank" rel="noopener">Designing Data-Intensive Applications</a><span>Martin Kleppmann, O'Reilly, 2017. Chapter 2 compares data models with more nuance than any blog post.</span></li>
+</ul>

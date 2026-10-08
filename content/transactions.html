@@ -1,0 +1,462 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">Two customers press "Buy" on the last concert ticket within the same millisecond. Two requests read <code>seats_left = 1</code>, both see a seat, both insert an order. You have sold one seat twice, and no line of your code is wrong on its own. The bug lives in how the two requests interleaved, and whether the database allowed that interleaving is decided by one setting most developers never look at: the isolation level.</p>
+<p>Transactions are the database's promise to hide two hard problems from application code: <strong>failures</strong> part way through a set of writes, and <strong>concurrency</strong> between requests touching the same data. The promise is weaker than most people assume. The default isolation level in PostgreSQL, MySQL, Oracle and SQL Server allows anomalies that lose money. Knowing exactly which ones, and the cheap fixes for each, is what this chapter is about.</p>
+
+<h2 id="acid">ACID, precisely</h2>
+<p>A <dfn>transaction</dfn> groups several reads and writes into one logical unit that either commits or aborts. The acronym <dfn>ACID</dfn> (Haerder and Reuter, 1983) names four guarantees. They are often recited and rarely defined well.</p>
+<div class="defs">
+<div><h4>Atomicity</h4><p>All of a transaction's writes take effect, or none do. If the process crashes, a constraint fails or the client disconnects half way, the database rolls back what was done. It is about <em>abortability</em>, not concurrency: it means retrying a failed transaction is safe.</p></div>
+<div><h4>Consistency</h4><p>Application invariants hold before and after each transaction: debits equal credits, stock is never negative. This is mostly the application's job. The database helps with declared constraints (<code>CHECK</code>, <code>UNIQUE</code>, foreign keys) and with the other three properties. It is not the "C" of CAP.</p></div>
+<div><h4>Isolation</h4><p>Concurrent transactions do not see each other's partial work. The ideal is <dfn>serializability</dfn>: the result equals some one-at-a-time ordering of the transactions. Real databases offer weaker levels by default because they are cheaper.</p></div>
+<div><h4>Durability</h4><p>Once commit returns, the data survives a crash. On one machine that means the commit record has been forced to disk with <code>fsync</code>. In a cluster it can also mean the record reached other replicas. No durability is absolute; it is a statement about which failures you survive.</p></div>
+</div>
+<p>Atomicity and durability are about failures and are implemented by logging, covered at the end of the chapter. Isolation is about concurrency, and it is where the subtlety lies.</p>
+
+<h2 id="anomalies">The anomalies, one at a time</h2>
+<p>An <dfn>anomaly</dfn> is an outcome that could not happen if the transactions ran one after another. Each isolation level is defined by which anomalies it rules out, so you need the anomalies first. The two diagrams below show each one as a timeline: transaction T1 on top, T2 on the bottom, the database state in between. Accent arrows are writes; plain arrows are reads.</p>
+
+<h3 id="single-item">Anomalies on a single item</h3>
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 30 760 300" role="img" aria-label="Timelines of two transactions T1 and T2 against the database, showing dirty read, dirty write, non-repeatable read and lost update">
+<text class="t b" x="20" y="77">T1</text>
+<text class="t b" x="20" y="155">DB</text>
+<text class="t b" x="20" y="233">T2</text>
+<path class="line faint" d="M60,72 H744"/>
+<path class="line faint" d="M60,150 H744"/>
+<path class="line faint" d="M60,228 H744"/>
+<path class="e plain" d="M60,272 H744" style="stroke-width:1"/>
+<text class="t xs mute end" x="744" y="266">time</text>
+<g data-show="1">
+<rect class="n svc" x="88.0" y="52.0" width="124" height="40" rx="6"/>
+<text class="t sm b mid" x="150" y="69">write x = 50</text><text class="t xs mute mid" x="150" y="84">not committed</text>
+<path class="e accent" d="M150,92.0 V133"/>
+<rect class="n bad" x="220.0" y="208.0" width="124" height="40" rx="6"/>
+<text class="t sm b mid" x="282" y="232">read x → 50</text>
+<path class="e" d="M282,163 V204.0"/>
+<rect class="n svc" x="352.0" y="52.0" width="124" height="40" rx="6"/>
+<text class="t sm b mid" x="414" y="76">ROLLBACK</text>
+<path class="e accent" d="M414,92.0 V133"/>
+<rect class="n bad" x="484.0" y="208.0" width="124" height="40" rx="6"/>
+<text class="t sm b mid" x="546" y="225">pay out 50</text><text class="t xs mute mid" x="546" y="240">commit</text>
+<rect class="n bad" x="92.0" y="137" width="116" height="26" rx="13"/><text class="t mono mid" x="150" y="154">x=50 (dirty)</text>
+<rect class="n bad" x="224.0" y="137" width="116" height="26" rx="13"/><text class="t mono mid" x="282" y="154">x=50 (dirty)</text>
+<rect class="n good" x="356.0" y="137" width="116" height="26" rx="13"/><text class="t mono mid" x="414" y="154">x=100</text>
+<text class="t sm" x="20" y="296">Dirty read: T2 read a value T1 never committed, then T1 rolled back. T2 acted on data that never existed.</text>
+<text class="t sm accent" x="20" y="316">Prevented by READ COMMITTED and every stronger level.</text>
+</g>
+<g data-show="2">
+<rect class="n svc" x="88.0" y="52.0" width="124" height="40" rx="6"/>
+<text class="t sm b mid" x="150" y="69">write x = Alice</text><text class="t xs mute mid" x="150" y="84">not committed</text>
+<path class="e accent" d="M150,92.0 V133"/>
+<rect class="n bad" x="220.0" y="208.0" width="124" height="40" rx="6"/>
+<text class="t sm b mid" x="282" y="225">write x = Bob</text><text class="t xs mute mid" x="282" y="240">overwrites it</text>
+<path class="e accent" d="M282,208.0 V167"/>
+<rect class="n svc" x="352.0" y="208.0" width="124" height="40" rx="6"/>
+<text class="t sm b mid" x="414" y="225">write y = Bob</text><text class="t xs mute mid" x="414" y="240">commit</text>
+<path class="e accent" d="M414,208.0 V167"/>
+<rect class="n svc" x="484.0" y="52.0" width="124" height="40" rx="6"/>
+<text class="t sm b mid" x="546" y="69">write y = Alice</text><text class="t xs mute mid" x="546" y="84">commit</text>
+<path class="e accent" d="M546,92.0 V133"/>
+<rect class="n db" x="92.0" y="137" width="116" height="26" rx="13"/><text class="t mono mid" x="150" y="154">x=Alice (dirty)</text>
+<rect class="n bad" x="224.0" y="137" width="116" height="26" rx="13"/><text class="t mono mid" x="282" y="154">x=Bob (dirty)</text>
+<rect class="n db" x="356.0" y="137" width="116" height="26" rx="13"/><text class="t mono mid" x="414" y="154">x=Bob y=Bob</text>
+<rect class="n bad" x="488.0" y="137" width="116" height="26" rx="13"/><text class="t mono mid" x="546" y="154">x=Bob y=Alice</text>
+<text class="t sm" x="20" y="296">Dirty write: T2 overwrote T1's uncommitted x. The listing says Bob bought the car, the invoice goes to Alice.</text>
+<text class="t sm accent" x="20" y="316">Prevented at every level in real databases: row write locks are held until commit.</text>
+</g>
+<g data-show="3">
+<rect class="n svc" x="88.0" y="52.0" width="124" height="40" rx="6"/>
+<text class="t sm b mid" x="150" y="76">read x → 100</text>
+<path class="e" d="M150,137 V96.0"/>
+<rect class="n svc" x="220.0" y="208.0" width="124" height="40" rx="6"/>
+<text class="t sm b mid" x="282" y="225">write x = 150</text><text class="t xs mute mid" x="282" y="240">commit</text>
+<path class="e accent" d="M282,208.0 V167"/>
+<rect class="n bad" x="352.0" y="52.0" width="124" height="40" rx="6"/>
+<text class="t sm b mid" x="414" y="69">read x → 150</text><text class="t xs mute mid" x="414" y="84">same query</text>
+<path class="e" d="M414,137 V96.0"/>
+<rect class="n db" x="92.0" y="137" width="116" height="26" rx="13"/><text class="t mono mid" x="150" y="154">x=100</text>
+<rect class="n db" x="224.0" y="137" width="116" height="26" rx="13"/><text class="t mono mid" x="282" y="154">x=150</text>
+<rect class="n db" x="356.0" y="137" width="116" height="26" rx="13"/><text class="t mono mid" x="414" y="154">x=150</text>
+<text class="t sm" x="20" y="296">Non-repeatable read: the same row read twice inside one transaction returns two different values.</text>
+<text class="t sm accent" x="20" y="316">Prevented by REPEATABLE READ / snapshot isolation and SERIALIZABLE.</text>
+</g>
+<g data-show="4">
+<rect class="n svc" x="88.0" y="52.0" width="124" height="40" rx="6"/>
+<text class="t sm b mid" x="150" y="76">read x → 100</text>
+<path class="e" d="M150,137 V96.0"/>
+<rect class="n svc" x="220.0" y="208.0" width="124" height="40" rx="6"/>
+<text class="t sm b mid" x="282" y="232">read x → 100</text>
+<path class="e" d="M282,163 V204.0"/>
+<rect class="n svc" x="352.0" y="52.0" width="124" height="40" rx="6"/>
+<text class="t sm b mid" x="414" y="69">write x = 110</text><text class="t xs mute mid" x="414" y="84">+10, commit</text>
+<path class="e accent" d="M414,92.0 V133"/>
+<rect class="n bad" x="484.0" y="208.0" width="124" height="40" rx="6"/>
+<text class="t sm b mid" x="546" y="225">write x = 105</text><text class="t xs mute mid" x="546" y="240">+5, commit</text>
+<path class="e accent" d="M546,208.0 V167"/>
+<rect class="n db" x="92.0" y="137" width="116" height="26" rx="13"/><text class="t mono mid" x="150" y="154">x=100</text>
+<rect class="n db" x="224.0" y="137" width="116" height="26" rx="13"/><text class="t mono mid" x="282" y="154">x=100</text>
+<rect class="n db" x="356.0" y="137" width="116" height="26" rx="13"/><text class="t mono mid" x="414" y="154">x=110</text>
+<rect class="n bad" x="488.0" y="137" width="116" height="26" rx="13"/><text class="t mono mid" x="546" y="154">x=105</text>
+<text class="t sm" x="20" y="296">Lost update: two read-modify-write cycles (+10 and +5) end at 105, not 115. T1's update vanished.</text>
+<text class="t sm accent" x="20" y="316">Fixed by atomic UPDATE, FOR UPDATE, compare-and-set, PostgreSQL REPEATABLE READ. Not MySQL REPEATABLE READ.</text>
+</g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Dirty read</button><button type="button" data-step="2" aria-pressed="false">Dirty write</button><button type="button" data-step="3" aria-pressed="false">Non-repeatable read</button><button type="button" data-step="4" aria-pressed="false">Lost update</button></div>
+</div>
+<figcaption><b>Single-item anomalies.</b> The first two involve uncommitted data and are stopped by READ COMMITTED. The last two involve only committed data, which is why READ COMMITTED does not stop them.</figcaption>
+</figure>
+<ul>
+<li><dfn>Dirty write</dfn>: overwriting another transaction's uncommitted write. Every real database prevents it at every level by holding a row lock from the write until commit, because without that even rollback is ill-defined.</li>
+<li><dfn>Dirty read</dfn>: reading another transaction's uncommitted write. If the writer aborts, the reader acted on a value that never existed.</li>
+<li><dfn>Non-repeatable read</dfn> (or fuzzy read): reading the same row twice in one transaction and getting different committed values, because someone committed in between.</li>
+<li><dfn>Lost update</dfn>: two transactions each read a value, compute a new one, and write it back. The second write silently overwrites the first. This is the most common concurrency bug in web applications, because "load the object, change a field, save it" is exactly this pattern.</li>
+</ul>
+
+<h3 id="multi-item">Anomalies across several items</h3>
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 30 760 300" role="img" aria-label="Timelines of two transactions T1 and T2 showing read skew, write skew and a phantom double booking">
+<text class="t b" x="20" y="77">T1</text>
+<text class="t b" x="20" y="155">DB</text>
+<text class="t b" x="20" y="233">T2</text>
+<path class="line faint" d="M60,72 H744"/>
+<path class="line faint" d="M60,150 H744"/>
+<path class="line faint" d="M60,228 H744"/>
+<path class="e plain" d="M60,272 H744" style="stroke-width:1"/>
+<text class="t xs mute end" x="744" y="266">time</text>
+<g data-show="1">
+<rect class="n svc" x="88.0" y="52.0" width="124" height="40" rx="6"/>
+<text class="t sm b mid" x="150" y="76">read A → 500</text>
+<path class="e" d="M150,137 V96.0"/>
+<rect class="n svc" x="220.0" y="208.0" width="124" height="40" rx="6"/>
+<text class="t sm b mid" x="282" y="225">A=400, B=600</text><text class="t xs mute mid" x="282" y="240">transfer, commit</text>
+<path class="e accent" d="M282,208.0 V167"/>
+<rect class="n bad" x="352.0" y="52.0" width="124" height="40" rx="6"/>
+<text class="t sm b mid" x="414" y="76">read B → 600</text>
+<path class="e" d="M414,137 V96.0"/>
+<rect class="n bad" x="484.0" y="52.0" width="124" height="40" rx="6"/>
+<text class="t sm b mid" x="546" y="69">total = 1,100</text><text class="t xs mute mid" x="546" y="84">should be 1,000</text>
+<rect class="n db" x="92.0" y="137" width="116" height="26" rx="13"/><text class="t mono mid" x="150" y="154">A=500 B=500</text>
+<rect class="n db" x="224.0" y="137" width="116" height="26" rx="13"/><text class="t mono mid" x="282" y="154">A=400 B=600</text>
+<rect class="n db" x="356.0" y="137" width="116" height="26" rx="13"/><text class="t mono mid" x="414" y="154">A=400 B=600</text>
+<text class="t sm" x="20" y="296">Read skew: T1 saw A before the transfer and B after it. Every value was committed, the total is still wrong.</text>
+<text class="t sm accent" x="20" y="316">Prevented by snapshot isolation / REPEATABLE READ. Bites backups and reports under READ COMMITTED.</text>
+</g>
+<g data-show="2">
+<rect class="n svc" x="88.0" y="52.0" width="124" height="40" rx="6"/>
+<text class="t sm b mid" x="150" y="69">on call? → 2</text><text class="t xs mute mid" x="150" y="84">alice checks</text>
+<path class="e" d="M150,137 V96.0"/>
+<rect class="n svc" x="220.0" y="208.0" width="124" height="40" rx="6"/>
+<text class="t sm b mid" x="282" y="225">on call? → 2</text><text class="t xs mute mid" x="282" y="240">bob checks</text>
+<path class="e" d="M282,163 V204.0"/>
+<rect class="n svc" x="352.0" y="52.0" width="124" height="40" rx="6"/>
+<text class="t sm b mid" x="414" y="69">set alice off</text><text class="t xs mute mid" x="414" y="84">commit</text>
+<path class="e accent" d="M414,92.0 V133"/>
+<rect class="n bad" x="484.0" y="208.0" width="124" height="40" rx="6"/>
+<text class="t sm b mid" x="546" y="225">set bob off</text><text class="t xs mute mid" x="546" y="240">commit</text>
+<path class="e accent" d="M546,208.0 V167"/>
+<rect class="n db" x="92.0" y="137" width="116" height="26" rx="13"/><text class="t mono mid" x="150" y="154">alice+bob on</text>
+<rect class="n db" x="224.0" y="137" width="116" height="26" rx="13"/><text class="t mono mid" x="282" y="154">alice+bob on</text>
+<rect class="n db" x="356.0" y="137" width="116" height="26" rx="13"/><text class="t mono mid" x="414" y="154">only bob on</text>
+<rect class="n bad" x="488.0" y="137" width="116" height="26" rx="13"/><text class="t mono mid" x="546" y="154">nobody on</text>
+<text class="t sm" x="20" y="296">Write skew: both checked "at least one doctor on call" on the same snapshot, then wrote different rows.</text>
+<text class="t sm accent" x="20" y="316">Prevented only by SERIALIZABLE, or by locking both rows with SELECT ... FOR UPDATE. Snapshot isolation allows it.</text>
+</g>
+<g data-show="3">
+<rect class="n svc" x="88.0" y="52.0" width="124" height="40" rx="6"/>
+<text class="t sm b mid" x="150" y="69">room 7 free?</text><text class="t xs mute mid" x="150" y="84">→ no rows</text>
+<path class="e" d="M150,137 V96.0"/>
+<rect class="n svc" x="220.0" y="208.0" width="124" height="40" rx="6"/>
+<text class="t sm b mid" x="282" y="225">room 7 free?</text><text class="t xs mute mid" x="282" y="240">→ no rows</text>
+<path class="e" d="M282,163 V204.0"/>
+<rect class="n svc" x="352.0" y="52.0" width="124" height="40" rx="6"/>
+<text class="t sm b mid" x="414" y="69">insert booking</text><text class="t xs mute mid" x="414" y="84">commit</text>
+<path class="e accent" d="M414,92.0 V133"/>
+<rect class="n bad" x="484.0" y="208.0" width="124" height="40" rx="6"/>
+<text class="t sm b mid" x="546" y="225">insert booking</text><text class="t xs mute mid" x="546" y="240">commit</text>
+<path class="e accent" d="M546,208.0 V167"/>
+<rect class="n db" x="92.0" y="137" width="116" height="26" rx="13"/><text class="t mono mid" x="150" y="154">0 bookings</text>
+<rect class="n db" x="224.0" y="137" width="116" height="26" rx="13"/><text class="t mono mid" x="282" y="154">0 bookings</text>
+<rect class="n db" x="356.0" y="137" width="116" height="26" rx="13"/><text class="t mono mid" x="414" y="154">1 booking</text>
+<rect class="n bad" x="488.0" y="137" width="116" height="26" rx="13"/><text class="t mono mid" x="546" y="154">2 bookings</text>
+<text class="t sm" x="20" y="296">Phantom: each search found no rows, so there was nothing to lock. Each insert changed the other's search result.</text>
+<text class="t sm accent" x="20" y="316">Prevented by SERIALIZABLE (predicate locks or SSI), an exclusion constraint, or one pre-created row per slot.</text>
+</g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Read skew</button><button type="button" data-step="2" aria-pressed="false">Write skew</button><button type="button" data-step="3" aria-pressed="false">Phantom</button></div>
+</div>
+<figcaption><b>Multi-item anomalies.</b> None of these involve two transactions writing the same row, so row locks taken on write do nothing. Read skew needs a consistent snapshot; write skew and phantoms need true serializability.</figcaption>
+</figure>
+<ul>
+<li><dfn>Read skew</dfn>: a transaction sees part of the database before another transaction committed and part after. Each value is committed, the combination never existed. It wrecks backups, consistency checks and analytics queries that run for minutes.</li>
+<li><dfn>Write skew</dfn>: two transactions read an overlapping set of rows, check a condition, and then write <em>different</em> rows. Each write is valid alone; together they break the invariant. Since nobody wrote the same row, there is no conflict for a database to detect unless it tracks reads.</li>
+<li><dfn>Phantom</dfn>: a write in one transaction changes the result of a search query in another. The booking example is the dangerous form: the check "is room 7 free at 14:00?" returns no rows, so there is no row to lock, and both inserts succeed. <code>SELECT ... FOR UPDATE</code> cannot lock a row that does not exist yet.</li>
+</ul>
+
+<h2 id="levels">Isolation levels</h2>
+<p>The SQL-92 standard defines four levels by three phenomena: dirty read, non-repeatable read and phantom. In 1995 Berenson and colleagues, in <em>A Critique of ANSI SQL Isolation Levels</em>, showed those definitions are ambiguous and incomplete. They added dirty write, lost update, read skew and write skew, and described <dfn>snapshot isolation</dfn>, a level the standard does not mention but that most databases actually implement. The table uses their analysis, with RU, RC, RR and SI standing for read uncommitted, read committed, lock-based repeatable read and snapshot isolation.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Anomaly</th><th>RU</th><th>RC</th><th>RR (locking)</th><th>SI</th><th>Serializable</th></tr></thead>
+<tbody>
+<tr><th>Dirty write</th><td class="yes">No</td><td class="yes">No</td><td class="yes">No</td><td class="yes">No</td><td class="yes">No</td></tr>
+<tr><th>Dirty read</th><td class="no">Yes</td><td class="yes">No</td><td class="yes">No</td><td class="yes">No</td><td class="yes">No</td></tr>
+<tr><th>Non-repeatable read</th><td class="no">Yes</td><td class="no">Yes</td><td class="yes">No</td><td class="yes">No</td><td class="yes">No</td></tr>
+<tr><th>Lost update</th><td class="no">Yes</td><td class="no">Yes</td><td class="yes">No</td><td class="yes">No</td><td class="yes">No</td></tr>
+<tr><th>Read skew</th><td class="no">Yes</td><td class="no">Yes</td><td class="yes">No</td><td class="yes">No</td><td class="yes">No</td></tr>
+<tr><th>Phantom</th><td class="no">Yes</td><td class="no">Yes</td><td class="no">Yes</td><td class="meh">Reads: no. Inserts: yes</td><td class="yes">No</td></tr>
+<tr><th>Write skew</th><td class="no">Yes</td><td class="no">Yes</td><td class="meh">Only via phantoms</td><td class="no">Yes</td><td class="yes">No</td></tr>
+</tbody></table></div>
+<p>"Yes" means the anomaly can happen. Two columns deserve a note. Locking repeatable read holds read locks on every row read until commit, so write skew over <em>existing</em> rows ends in a deadlock instead of a bad result, but a phantom insert still slips through. Snapshot isolation reads from a frozen snapshot, so a repeated search never shows new rows, but that does not stop two transactions from each inserting a row the other's search would have found. Snapshot isolation and locking repeatable read are incomparable: each prevents something the other allows.</p>
+
+<h3 id="real-databases">What real databases actually give you</h3>
+<p>Level names are not portable. The same keyword means different guarantees in different products, which is a common source of production bugs after a migration.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Database</th><th>Default</th><th>What the levels really are</th></tr></thead>
+<tbody>
+<tr><th>PostgreSQL</th><td>Read committed</td><td><code>READ UNCOMMITTED</code> behaves as read committed. <code>READ COMMITTED</code> takes a new snapshot per statement. <code>REPEATABLE READ</code> is snapshot isolation: no phantoms in reads, and a transaction that updates a row changed by a concurrent committed transaction fails with "could not serialize access due to concurrent update", so lost updates are prevented; write skew is allowed. <code>SERIALIZABLE</code> is Serializable Snapshot Isolation (since 9.1).</td></tr>
+<tr><th>MySQL (InnoDB)</th><td>Repeatable read</td><td>Plain <code>SELECT</code>s read a snapshot taken at the first read. But <code>UPDATE</code>, <code>DELETE</code> and locking reads (<code>FOR UPDATE</code>, <code>FOR SHARE</code>) act on the <em>latest committed</em> rows, not the snapshot, and there is no first-updater-wins check. So lost updates and write skew are possible, and a transaction can update rows its own snapshot does not show. Next-key (gap) locks stop phantom inserts into ranges read with locking reads. <code>SERIALIZABLE</code> turns plain <code>SELECT</code>s into <code>FOR SHARE</code> when autocommit is off: lock-based, with deadlocks instead of anomalies.</td></tr>
+<tr><th>Oracle</th><td>Read committed</td><td><code>SERIALIZABLE</code> is snapshot isolation. Write skew is possible despite the name.</td></tr>
+<tr><th>SQL Server</th><td>Read committed (locking)</td><td><code>READ_COMMITTED_SNAPSHOT</code> switches read committed to statement snapshots. <code>SNAPSHOT</code> is snapshot isolation with update-conflict detection. <code>SERIALIZABLE</code> uses key-range locks.</td></tr>
+<tr><th>CockroachDB</th><td>Serializable</td><td>Serializable by default; read committed was added in version 23.2 as a preview and enabled by default from 24.1, for compatibility. Clients must retry on serialization errors.</td></tr>
+</tbody></table></div>
+<div class="callout warn">
+<div class="callout-title">Common mistake</div>
+<p>Saying "we use REPEATABLE READ, so we are safe from lost updates". On PostgreSQL that is true. On MySQL with InnoDB it is not: a read-modify-write that computes the new value in application code will silently lose updates. Martin Kleppmann's Hermitage project tests each database's actual behaviour and is worth checking before you rely on a level.</p>
+</div>
+
+<h2 id="implementation">How isolation is implemented</h2>
+<p>Three mechanisms cover almost every engine. Knowing them explains why each level allows what it allows and what it costs.</p>
+
+<h3 id="two-phase-locking">Two-phase locking (2PL)</h3>
+<p>In <dfn>two-phase locking</dfn>, a transaction takes a shared lock on everything it reads and an exclusive lock on everything it writes, and (in the strong strict (rigorous) form databases use) holds them all until commit or abort. Shared locks are compatible with each other; an exclusive lock waits for all other locks on that item. Readers block writers and writers block readers. That is serializable for existing rows. For phantoms the engine must also lock <em>ranges</em>: true predicate locks are too expensive to check, so engines lock index ranges instead, which is what InnoDB's next-key locks and SQL Server's key-range locks are. A search for <code>room = 7 AND slot = '14:00'</code> locks the gap in the index where such a row would go, so a concurrent insert into that gap waits.</p>
+<p>The costs are waiting and deadlocks. Two transactions that each hold a lock the other wants form a cycle; the database detects it and aborts one. A long-running read (a report scanning a million rows) holds shared locks on all of them and blocks every writer behind it. That is why 2PL lost favour as the default.</p>
+
+<h3 id="mvcc">Multi-version concurrency control (MVCC)</h3>
+<p><dfn>MVCC</dfn> keeps several versions of each row. A write never overwrites in place; it creates a new version tagged with the writing transaction's id. Each transaction (or each statement, under read committed) reads from a <dfn>snapshot</dfn>: the set of transactions that had committed when it started. A version is visible if the transaction that created it is in the snapshot and the transaction that deleted or replaced it is not.</p>
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 294" role="img" aria-label="MVCC: an update creates a new row version; an older snapshot still sees the old version while a newer snapshot sees the new one">
+<rect class="n client" x="20" y="34" width="180" height="60" rx="8"/><text class="t b" x="34" y="56">Report (txid 225)</text><text class="t xs mute" x="34" y="74">snapshot: 230 still running</text>
+<rect class="n client" x="20" y="168" width="180" height="60" rx="8"/><text class="t b" x="34" y="190">Reader (txid 241)</text><text class="t xs mute" x="34" y="208">snapshot: 230 committed</text>
+<rect class="n db" x="270" y="34" width="210" height="60" rx="8"/><text class="t b" x="284" y="56">v1  balance = 500</text><text class="t mono mute" x="284" y="78">xmin 100  xmax 230</text>
+<rect class="n db" x="270" y="168" width="210" height="60" rx="8"/><text class="t b" x="284" y="190">v2  balance = 400</text><text class="t mono mute" x="284" y="212">xmin 230  xmax -</text>
+<path class="e dash" d="M375,94 V164"/><text class="t xs mute" x="383" y="134">newer version</text>
+<rect class="n svc" x="540" y="101" width="160" height="60" rx="8"/><text class="t b" x="554" y="123">Writer (txid 230)</text><text class="t xs mute" x="554" y="141">UPDATE ... SET 400</text>
+<path class="e accent" d="M540,118 C510,118 510,64 484,64"/><text class="t xs accent" x="552" y="90">sets xmax on v1</text>
+<path class="e accent" d="M540,144 C510,144 510,198 484,198"/><text class="t xs accent" x="552" y="180">inserts v2</text>
+<path class="e green" d="M200,64 H266"/><text class="t xs green mid" x="233" y="58">sees</text>
+<path class="e green" d="M200,198 H266"/><text class="t xs green mid" x="233" y="192">sees</text>
+<text class="t sm" x="20" y="262">A version is visible if its xmin committed before the snapshot and its xmax did not.</text>
+<text class="t sm" x="20" y="282">Nobody waits: the report keeps reading 500 while the writer commits 400. VACUUM removes v1 later.</text>
+</svg>
+</div>
+<figcaption><b>MVCC in PostgreSQL terms.</b> Each row version records the transaction that created it (<code>xmin</code>) and the one that replaced it (<code>xmax</code>). Two readers with different snapshots see different versions of the same row at the same moment, and neither blocks the writer.</figcaption>
+</figure>
+<p>The rule that makes MVCC so popular: <strong>readers never block writers and writers never block readers</strong>. Writers still block other writers on the same row. The cost is garbage: old versions pile up until no snapshot can see them, then PostgreSQL's <code>VACUUM</code> (or InnoDB's purge thread, which cleans up undo logs) removes them. A transaction left open for hours pins every version created since it started, so tables and indexes bloat. Monitor the age of the oldest open transaction.</p>
+<p>MVCC gives snapshot isolation almost for free. To also prevent lost updates, the engine adds a check at write time: if the row you are updating has a newer committed version than your snapshot, abort (PostgreSQL's "first updater wins"). That check is the difference between PostgreSQL and InnoDB repeatable read.</p>
+
+<h3 id="ssi">Serializable Snapshot Isolation (SSI)</h3>
+<p>Snapshot isolation fails only on write skew and its phantom variants. <dfn>Serializable Snapshot Isolation</dfn> (Cahill, Röhm and Fekete, 2008) keeps MVCC's non-blocking reads and adds tracking of <dfn>read-write dependencies</dfn>: transaction T1 read something that T2, running concurrently, later wrote. Every non-serializable execution under snapshot isolation contains a "dangerous structure": a transaction with an incoming and an outgoing read-write dependency among concurrent transactions. When SSI detects one, it aborts a transaction with a serialization failure (SQLSTATE <code>40001</code>).</p>
+<p>In the on-call example, both transactions read the set of on-call doctors and each wrote a row the other had read. SSI sees the two dependencies and aborts the second commit. PostgreSQL tracks reads with predicate locks on index ranges (called SIREAD locks), which never block anyone; they only feed the detector. SSI can abort transactions that would have been fine (false positives), so the application must be prepared to retry the whole transaction. Its throughput is close to snapshot isolation for most workloads and far better than 2PL for read-heavy ones.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Two-phase locking</th><th>MVCC snapshot isolation</th><th>SSI</th></tr></thead>
+<tbody>
+<tr><th>Readers block writers</th><td class="no">Yes</td><td class="yes">No</td><td class="yes">No</td></tr>
+<tr><th>Write skew</th><td class="yes">Prevented (range locks)</td><td class="no">Allowed</td><td class="yes">Prevented</td></tr>
+<tr><th>How conflicts surface</th><td>Waiting, deadlock aborts</td><td>Update-conflict aborts (if checked)</td><td>Serialization-failure aborts</td></tr>
+<tr><th>Long read-only queries</th><td class="no">Block writers for their whole run</td><td class="yes">Free</td><td class="yes">Free (cheaper still if declared read only)</td></tr>
+<tr><th>Used by</th><td>MySQL SERIALIZABLE, SQL Server SERIALIZABLE</td><td>PostgreSQL RR, Oracle, InnoDB snapshot reads</td><td>PostgreSQL SERIALIZABLE</td></tr>
+</tbody></table></div>
+
+<h2 id="practical-tools">Preventing anomalies without SERIALIZABLE</h2>
+<p>Most applications run at read committed and fix the few places that matter with targeted techniques. These are the ones to know.</p>
+
+<h3 id="atomic-updates">Atomic updates</h3>
+<p>Let the database do the read-modify-write in one statement. The row is locked for the duration of the statement and the new value is computed from the latest committed value, so concurrent increments never get lost.</p>
+<pre><code class="language-sql">-- Lost-update-proof at any isolation level
+UPDATE accounts SET balance = balance + 10 WHERE id = 7;
+
+-- Conditional: sell a seat only if one is left. Check the row count: 0 means sold out.
+UPDATE events SET sold = sold + 1 WHERE id = 912 AND sold &lt; capacity;</code></pre>
+
+<h3 id="select-for-update">Pessimistic locking: SELECT ... FOR UPDATE</h3>
+<p>When the new value needs application logic, lock the rows you read. <code>FOR UPDATE</code> takes the same lock an update would, so a second transaction doing the same thing waits until the first commits. Under PostgreSQL read committed, the waiting statement then re-checks its <code>WHERE</code> clause against the newly committed row version before proceeding.</p>
+<pre><code class="language-sql">BEGIN;
+SELECT doctor_id FROM shifts
+ WHERE shift_id = 1234 AND on_call
+   FOR UPDATE;                         -- locks every on-call row for this shift
+-- application checks: more than one doctor left?
+UPDATE shifts SET on_call = false WHERE shift_id = 1234 AND doctor_id = 'alice';
+COMMIT;</code></pre>
+<p>This fixes the write skew because both transactions now lock the same set of rows. It does not fix the booking phantom, because there are no rows to lock. For that, either create the rows ahead of time (one row per room per slot, then lock it), or let a constraint enforce the rule. PostgreSQL's exclusion constraint does exactly that: <code>EXCLUDE USING gist (room WITH =, during WITH &amp;&amp;)</code> rejects any two overlapping bookings for the same room. <code>FOR UPDATE SKIP LOCKED</code> is a related tool for job queues: each worker grabs rows nobody else has locked.</p>
+
+<h3 id="optimistic">Optimistic concurrency with a version column</h3>
+<p>Instead of locking, detect the conflict at write time. Each row carries a <code>version</code> number. Read it with the data, and make the update conditional on it not having changed. If the update affects zero rows, someone else got there first: re-read and retry, or report a conflict to the user. This is <dfn>compare-and-set</dfn>, and it is how ORMs implement optimistic locking (JPA's <code>@Version</code>, Rails' <code>lock_version</code>) and how HTTP APIs do it with <code>ETag</code> and <code>If-Match</code>.</p>
+<pre><code class="language-sql">SELECT balance, version FROM accounts WHERE id = 7;      -- 100, version 41
+UPDATE accounts SET balance = 110, version = version + 1
+ WHERE id = 7 AND version = 41;                          -- 1 row: success, 0 rows: retry</code></pre>
+<p>A small simulation shows the difference. Two deposits of 10 and 5 run concurrently against a balance of 100. A barrier forces the bad interleaving: both read before either writes.</p>
+<pre><code class="language-python">import threading
+
+
+class Row:
+    """One database row with a version column, guarded like a real row latch."""
+
+    def __init__(self, balance):
+        self.balance, self.version = balance, 0
+        self._latch = threading.Lock()
+
+    def read(self):
+        with self._latch:
+            return self.balance, self.version
+
+    def write(self, balance):                      # blind write: UPDATE ... SET balance = ?
+        with self._latch:
+            self.balance, self.version = balance, self.version + 1
+
+    def compare_and_set(self, balance, expected_version):
+        # UPDATE accounts SET balance = ?, version = version + 1
+        #  WHERE id = ? AND version = ?        -- then check the row count
+        with self._latch:
+            if self.version != expected_version:
+                return False
+            self.balance, self.version = balance, self.version + 1
+            return True
+
+
+def deposit_naive(row, amount, both_read):
+    balance, _ = row.read()
+    both_read.wait()                               # force the bad interleaving: both read first
+    row.write(balance + amount)
+
+
+def deposit_cas(row, amount, both_read, retries):
+    first = True
+    while True:
+        balance, version = row.read()
+        if first:
+            both_read.wait()
+            first = False
+        if row.compare_and_set(balance + amount, version):
+            return
+        retries.append(amount)                     # someone else won: re-read and retry
+
+
+def run(worker, *extra):
+    row, barrier = Row(100), threading.Barrier(2)
+    threads = [threading.Thread(target=worker, args=(row, amt, barrier, *extra)) for amt in (10, 5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return row.balance
+
+
+print("naive read-modify-write:", run(deposit_naive))
+retries = []
+print("compare-and-set:        ", run(deposit_cas, retries), "after", len(retries), "retry")
+# naive read-modify-write: 110        (or 105, whichever write lands last; never 115)
+# compare-and-set:         115 after 1 retry</code></pre>
+<p>Optimistic concurrency shines when conflicts are rare: no locks held across user think-time, no deadlocks, works across HTTP requests. Under heavy contention on one row it degrades into retry storms, where pessimistic locking or an atomic update queues requests more efficiently.</p>
+
+<h2 id="worked-example">Worked example: the last seats of a flash sale</h2>
+<p>An event has 5,000 seats and 50,000 people trying to buy in the first minute. Every purchase touches one hot row, <code>events.sold</code>. The question is how many purchases per second each approach can push through that row. Throughput on one row is bounded by how long each transaction holds its lock: at most <code>1 / hold_time</code> commits per second.</p>
+<div class="calc">FOR UPDATE, then app logic, then payment call inside the txn
+    hold ≈ 5 ms DB + 300 ms payment API      → 1 / 0.305 s  ≈ <span class="r">3 purchases/s</span>
+FOR UPDATE, payment moved outside the txn
+    hold ≈ 5 ms (round trips between statements) → 1 / 0.005 s ≈ <span class="r">200 purchases/s</span>
+Single conditional UPDATE ... WHERE sold &lt; capacity
+    hold ≈ 0.2 ms + one commit flush        → <span class="r">roughly 1,000 to 5,000/s</span>, set by flush latency
+    (the row lock is held until the commit is durable, so group commit cannot batch updates to one row)
+5,000 seats at 200/s  ≈ 25 s      at 3/s ≈ 28 minutes</div>
+<div class="table-wrap"><table>
+<thead><tr><td>Approach</td><th>Correct?</th><th>Behaviour under the rush</th></tr></thead>
+<tbody>
+<tr><td>Read <code>sold</code>, check in app, write <code>sold + 1</code> at read committed</td><td class="no">No: lost updates oversell</td><td>Fast and wrong</td></tr>
+<tr><td>Same, at SERIALIZABLE (PostgreSQL SSI)</td><td class="yes">Yes</td><td>Most transactions abort with 40001 and retry; wasted work grows with contention</td></tr>
+<tr><td>Version column, retry on conflict</td><td class="yes">Yes</td><td>Same retry storm: one winner per version, the rest re-read</td></tr>
+<tr><td><code>SELECT ... FOR UPDATE</code>, short transaction</td><td class="yes">Yes</td><td>Requests queue on the lock; about 200/s if nothing slow happens inside</td></tr>
+<tr><td>One conditional <code>UPDATE</code></td><td class="yes">Yes</td><td class="yes">Shortest lock hold; the best single-row option</td></tr>
+<tr><td>Split the counter into 10 rows (seat blocks), pick one at random</td><td class="yes">Yes</td><td class="yes">Ten independent locks, about ten times the throughput</td></tr>
+</tbody></table></div>
+<p>The lessons generalise. Never hold a lock across a network call to another service. Prefer a single statement that the database can execute atomically. When one row is the bottleneck, split it. And when you do need a multi-statement check-then-write, either lock the rows the check depends on or run at <code>SERIALIZABLE</code> and retry.</p>
+
+<h2 id="durability">Durability and the write-ahead log</h2>
+<p>Atomicity and durability both come from the <dfn>write-ahead log</dfn> (WAL; InnoDB calls it the redo log). The rule: before a change to a data page reaches disk, a log record describing it must already be on disk. At commit, the database appends a commit record and forces the log with <code>fsync</code>. Only then does it tell the client "committed".</p>
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 290" role="img" aria-label="Write-ahead logging: a commit appends to the WAL buffer and fsyncs the WAL file before acknowledging; dirty data pages are flushed later, and the WAL is replayed after a crash">
+<rect class="n client" x="20" y="110" width="100" height="50" rx="8"/><text class="t b mid" x="70.0" y="131">Client</text><text class="t xs mute mid" x="70.0" y="147">COMMIT</text>
+<rect class="n svc" x="170" y="110" width="120" height="50" rx="8"/><text class="t b mid" x="230.0" y="131">DB backend</text><text class="t xs mute mid" x="230.0" y="147">applies changes</text>
+<rect class="n cache" x="350" y="30" width="140" height="50" rx="8"/><text class="t b mid" x="420.0" y="51">WAL buffer</text><text class="t xs mute mid" x="420.0" y="67">memory</text>
+<rect class="n db" x="550" y="30" width="150" height="50" rx="8"/><text class="t b mid" x="625.0" y="51">WAL on disk</text><text class="t xs mute mid" x="625.0" y="67">sequential, fsync</text>
+<rect class="n cache" x="350" y="190" width="140" height="50" rx="8"/><text class="t b mid" x="420.0" y="211">Buffer pool</text><text class="t xs mute mid" x="420.0" y="227">dirty pages, memory</text>
+<rect class="n db" x="550" y="190" width="150" height="50" rx="8"/><text class="t b mid" x="625.0" y="211">Data files</text><text class="t xs mute mid" x="625.0" y="227">random writes</text>
+<path class="e" d="M120,128 H166"/>
+<path class="e green" d="M170,146 H124"/>
+<path class="e" d="M290,124 C320,124 320,55 346,55"/>
+<path class="e" d="M490,55 H546"/>
+<path class="e" d="M290,146 C320,146 320,215 346,215"/>
+<path class="e dash" d="M490,215 H546"/>
+<path class="e dash" d="M625,80 V186"/>
+<path class="flow" d="M120,128 H166"/><path class="flow" d="M290,124 C320,124 320,55 346,55"/><path class="flow" d="M490,55 H546"/>
+<text class="t xs mute" x="326" y="98">1 append</text>
+<text class="t xs mute mid" x="518" y="48">2 fsync</text>
+<text class="t xs green mid" x="145" y="176">3 ack</text>
+<text class="t xs mute" x="326" y="178">modify page</text>
+<text class="t xs mute mid" x="518" y="208">later</text>
+<text class="t xs mute" x="633" y="128">replay after</text><text class="t xs mute" x="633" y="142">a crash</text>
+<text class="t sm" x="20" y="276">The commit waits only for a sequential append to the log. Data pages are written later by the checkpointer.</text>
+</svg>
+</div>
+<figcaption><b>The commit path.</b> The animated path is all a commit waits for: an append to the log and one fsync. Updating the actual table pages is deferred, which turns random writes into one sequential write per commit.</figcaption>
+</figure>
+<ul>
+<li><strong>Why it is fast.</strong> The log is append-only, so a commit costs one sequential write. Data pages change in memory and are flushed later in bulk by a <dfn>checkpoint</dfn>. <dfn>Group commit</dfn> lets many concurrent transactions share one fsync, which is how a database commits tens of thousands of transactions per second on a device that completes far fewer flushes.</li>
+<li><strong>Crash recovery.</strong> After a crash, the database replays the log from the last checkpoint, redoing committed changes whose pages never reached disk. Engines that update pages in place also need undo information to roll back changes from transactions that never committed (the ARIES algorithm describes both). PostgreSQL mostly avoids undo because MVCC leaves uncommitted versions invisible.</li>
+<li><strong>Torn pages.</strong> A crash in the middle of writing an 8 KB page can leave half old and half new. PostgreSQL writes a full page image to the WAL the first time a page changes after each checkpoint; InnoDB uses a doublewrite buffer.</li>
+<li><strong>Knobs that trade durability for speed.</strong> PostgreSQL's <code>synchronous_commit = off</code> and MySQL's <code>innodb_flush_log_at_trx_commit = 2</code> acknowledge before the fsync, risking roughly the last second of commits on a crash, without corrupting anything. Fine for click counts, not for payments.</li>
+<li><strong>Beyond one machine.</strong> fsync protects against a process or OS crash, not a dead disk or a lost data centre. For that the WAL is shipped to replicas, and synchronous replication waits for a replica to confirm before acknowledging. See <a href="replication.html">Replication</a>.</li>
+</ul>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+<li><strong>PostgreSQL</strong> shipped SSI in 9.1 (2011), the first production implementation; its <code>SERIALIZABLE READ ONLY DEFERRABLE</code> mode lets long reports run without any risk of serialization failure.</li>
+<li><strong>MySQL</strong> keeps repeatable read as its default partly for historical replication reasons: statement-based binary logging needed it to replay correctly. Many large deployments switch to read committed with row-based logging to reduce gap-lock contention.</li>
+<li><strong>Google Spanner</strong> and <strong>CockroachDB</strong> run serializable by default across machines and tell clients to wrap transactions in retry loops; the client libraries do it automatically.</li>
+<li><strong>Stripe and most payment systems</strong> combine database transactions with <a href="idempotency.html">idempotency keys</a>, because a transaction cannot protect against a client retrying a request whose response it never received.</li>
+<li><strong>Jepsen</strong> analyses have repeatedly found databases whose isolation was weaker than documented, which is why "test your actual guarantees" is real advice and not paranoia.</li>
+</ul>
+<p>Transactions that span several databases or services are a different problem with different tools (two-phase commit, sagas, outboxes), covered in <a href="distributed-transactions.html">Distributed Transactions</a>.</p>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>Whenever money, inventory, bookings or unique usernames appear. Name the anomaly and the fix in one breath: "Two buyers can both see one seat left, which is a lost update; I'll make the decrement a single conditional UPDATE and check the row count." For booking systems, mention phantoms and an exclusion or unique constraint.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>What does READ COMMITTED not protect against? (Non-repeatable reads, lost updates, read skew, write skew, phantoms.)</li>
+<li>Explain write skew and why snapshot isolation allows it.</li>
+<li>Optimistic or pessimistic locking here? (Depends on contention and whether a user's think-time sits between read and write.)</li>
+<li>How does MVCC let readers avoid blocking writers, and what does it cost? (Old versions, vacuum, long-transaction bloat.)</li>
+<li>What exactly happens on COMMIT, and what is lost if the machine loses power?</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>"The database is ACID, so concurrency is handled." The default level is not serializable anywhere except a few distributed SQL databases.</li>
+<li>Assuming REPEATABLE READ means the same thing on PostgreSQL and MySQL.</li>
+<li>Using SERIALIZABLE without a retry loop.</li>
+<li>Holding a row lock while calling a payment provider.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://arxiv.org/abs/cs/0701157" target="_blank" rel="noopener">A Critique of ANSI SQL Isolation Levels</a><span>Berenson, Bernstein, Gray, Melton, O'Neil and O'Neil, SIGMOD 1995. Defines the anomalies precisely and introduces snapshot isolation.</span></li>
+<li><a href="https://www.postgresql.org/docs/current/transaction-iso.html" target="_blank" rel="noopener">PostgreSQL documentation: Transaction Isolation</a><span>Exactly what each level does in PostgreSQL, with the serialization failure rules.</span></li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-transaction-isolation-levels.html" target="_blank" rel="noopener">MySQL documentation: InnoDB Transaction Isolation Levels</a><span>Consistent reads, locking reads and next-key locks in InnoDB.</span></li>
+<li><a href="https://arxiv.org/abs/1208.4179" target="_blank" rel="noopener">Serializable Snapshot Isolation in PostgreSQL</a><span>Ports and Grittner, VLDB 2012. How SSI was built into a production database.</span></li>
+<li><a href="https://github.com/ept/hermitage" target="_blank" rel="noopener">Hermitage: testing transaction isolation levels</a><span>Martin Kleppmann. Test cases showing which anomalies each database really allows at each level.</span></li>
+</ul>

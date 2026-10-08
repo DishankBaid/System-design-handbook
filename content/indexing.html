@@ -1,0 +1,380 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">A <code>users</code> table holds one billion rows of about 200 bytes each. Without an index, <code>SELECT * FROM users WHERE id = 4217</code> reads all 200 GB to find one row. With a B-tree index the same query reads five pages (four index levels plus the row), 40 KB in total, and usually finds three of them already in memory.</p>
+<div class="calc">Full scan    1,000,000,000 rows × 200 B          = 200 GB
+             at 2 GB/s sequential read (fast NVMe)  ≈ <span class="r">100 s</span>, and the whole cache is evicted
+Index        5 page reads × 8 KB                    = 40 KB
+             top 3 levels cached, 1 to 2 SSD reads at ~100 µs ≈ <span class="r">0.1 to 0.2 ms</span></div>
+<p>That is a factor of roughly half a million. An <dfn>index</dfn> is a separate data structure, kept in sync with the table on every write, that maps column values to row locations so the database can jump to matching rows instead of scanning. Every index makes some reads dramatically cheaper and every write somewhat more expensive. The two engine families in this chapter, B-trees and LSM trees, sit at different points on that trade-off, and choosing between them is choosing a database.</p>
+
+<h2 id="btree">B-trees</h2>
+<p>The <dfn>B-tree</dfn> (Bayer and McCreight, 1972) is the default index in PostgreSQL, MySQL, Oracle, SQL Server and SQLite, and the storage structure of MongoDB's WiredTiger engine. Databases actually use the <dfn>B+tree</dfn> variant: all entries live in the leaves, inner pages hold only separator keys and child pointers, and leaves are linked to their neighbours so range scans can walk sideways.</p>
+
+<h3 id="btree-structure">Pages and fanout</h3>
+<p>Everything is organised in fixed-size <dfn>pages</dfn>, the unit the database reads and writes: 8 KB in PostgreSQL, 16 KB in InnoDB. An inner page holds hundreds of separator keys, each with a pointer to the child page covering the range between it and the next key. The number of children per page is the <dfn>fanout</dfn>. Because fanout is in the hundreds, the tree is extremely shallow: each extra level multiplies capacity by a few hundred.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 330" role="img" aria-label="B-tree lookup of key 4217: root, inner page, leaf, then the heap row; and a range scan along linked leaves">
+<rect class="n svc" x="270" y="20" width="180" height="40" rx="6"/>
+<text class="t mono mid" x="330" y="44.0">1000</text>
+<text class="t mono mid" x="390" y="44.0">5000</text>
+<rect class="n svc" x="30" y="110" width="170" height="40" rx="6"/>
+<text class="t mono mid" x="72" y="134.0">250</text>
+<text class="t mono mid" x="115" y="134.0">500</text>
+<text class="t mono mid" x="158" y="134.0">750</text>
+<rect class="n svc" x="270" y="110" width="180" height="40" rx="6"/>
+<text class="t mono mid" x="315" y="134.0">2000</text>
+<text class="t mono mid" x="360" y="134.0">3000</text>
+<text class="t mono mid" x="405" y="134.0">4000</text>
+<rect class="n svc" x="520" y="110" width="170" height="40" rx="6"/>
+<text class="t mono mid" x="562" y="134.0">6000</text>
+<text class="t mono mid" x="605" y="134.0">7500</text>
+<text class="t mono mid" x="648" y="134.0">9000</text>
+<rect class="n db" x="40" y="200" width="120" height="36" rx="6"/>
+<text class="t mono mid" x="70" y="222.0">1000</text>
+<text class="t mono mid" x="100" y="222.0">1450</text>
+<text class="t mono mid" x="130" y="222.0">1800</text>
+<rect class="n db" x="200" y="200" width="120" height="36" rx="6"/>
+<text class="t mono mid" x="230" y="222.0">2000</text>
+<text class="t mono mid" x="260" y="222.0">2410</text>
+<text class="t mono mid" x="290" y="222.0">2990</text>
+<rect class="n db" x="360" y="200" width="120" height="36" rx="6"/>
+<text class="t mono mid" x="390" y="222.0">3000</text>
+<text class="t mono mid" x="420" y="222.0">3300</text>
+<text class="t mono mid" x="450" y="222.0">3720</text>
+<rect class="n db" x="520" y="200" width="120" height="36" rx="6"/>
+<text class="t mono mid" x="550" y="222.0">4105</text>
+<text class="t mono mid" x="580" y="222.0">4217</text>
+<text class="t mono mid" x="610" y="222.0">4380</text>
+<path class="e" d="M160,218 H196"/>
+<path class="e" d="M320,218 H356"/>
+<path class="e" d="M480,218 H516"/>
+<text class="t xs mute" x="652" y="222">→ next leaf</text>
+<path class="e" d="M282,60 L115,106"/>
+<path class="e" d="M438,60 L605,106"/>
+<path class="e" d="M360,60 L360,106" data-show="5"/>
+<path class="e" d="M360,60 L360,106" data-show="4"/>
+<path class="e" d="M360,60 L360,106" data-show="1"/>
+<path class="e accent" d="M360,60 L360,106" data-show="2 3"/>
+<path class="e" d="M278,150 L100,196"/>
+<path class="e" d="M318,150 L260,196"/>
+<path class="e" d="M402,150 L420,196"/>
+<path class="e" d="M442,150 L580,196" data-show="1 2 5"/><path class="e accent" d="M442,150 L580,196" data-show="3 4"/>
+<path class="line faint" d="M60,150 L50,175 M115,150 V175 M170,150 L180,175 M550,150 L540,175 M605,150 V175 M660,150 L670,175" style="stroke-dasharray:3 3"/>
+<rect class="n ext" x="440" y="276" width="260" height="40" rx="6"/><text class="t mono mid" x="570" y="300">heap page 812, item 7: the row</text>
+<path class="e" d="M580,236 V272" data-show="1 2 3 5"/><path class="e accent" d="M580,236 V272" data-show="4"/>
+<rect x="266" y="16" width="188" height="48" rx="8" style="fill:none;stroke:var(--accent);stroke-width:3" data-show="1"/>
+<rect x="266" y="106" width="188" height="48" rx="8" style="fill:none;stroke:var(--accent);stroke-width:3" data-show="2"/>
+<rect x="516" y="196" width="128" height="44" rx="8" style="fill:none;stroke:var(--accent);stroke-width:3" data-show="3"/>
+<rect x="436" y="272" width="268" height="48" rx="8" style="fill:none;stroke:var(--accent);stroke-width:3" data-show="4"/>
+<rect x="196" y="196" width="288" height="44" rx="8" style="fill:none;stroke:var(--accent);stroke-width:3" data-show="5"/>
+<g data-show="1"><text class="t sm" x="20" y="290">Read 1, root: 1000 ≤ 4217 &lt; 5000,</text><text class="t sm" x="20" y="308">so follow the middle pointer.</text></g>
+<g data-show="2"><text class="t sm" x="20" y="290">Read 2, inner page: 4217 ≥ 4000,</text><text class="t sm" x="20" y="308">so follow the last pointer.</text></g>
+<g data-show="3"><text class="t sm" x="20" y="290">Read 3, leaf: binary search inside the page</text><text class="t sm" x="20" y="308">finds 4217 → (page 812, item 7).</text></g>
+<g data-show="4"><text class="t sm" x="20" y="290">Read 4: fetch the row itself. Only the leaf and</text><text class="t sm" x="20" y="308">heap reads usually miss the cache.</text></g>
+<g data-show="5"><text class="t sm" x="20" y="290">Range 2410 to 3300: descend once to 2410,</text><text class="t sm" x="20" y="308">then follow leaf links until past 3300.</text></g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Root</button><button type="button" data-step="2" aria-pressed="false">Inner page</button><button type="button" data-step="3" aria-pressed="false">Leaf</button><button type="button" data-step="4" aria-pressed="false">Fetch row</button><button type="button" data-step="5" aria-pressed="false">Range scan</button></div>
+</div>
+<figcaption><b>Looking up id 4217.</b> Each step is one page read. A point lookup reads one page per level plus the row; a range scan descends once and then follows the linked leaves, reading only pages that contain matching keys.</figcaption>
+</figure>
+
+<h3 id="btree-height">How tall is the tree for a billion rows?</h3>
+<p>Assume each index entry costs about 24 bytes for a <code>bigint</code> key (key, pointer and per-entry overhead) and pages are 90% full. This snippet computes the height for different key types:</p>
+<pre><code class="language-python">import math
+
+
+def btree_levels(rows, page_bytes=8192, key_bytes=8, ptr_bytes=8, overhead=8, fill=0.9):
+    """Levels of a B+tree: leaves hold one entry per row, inner pages one per child."""
+    per_page = int(page_bytes * fill // (key_bytes + ptr_bytes + overhead))
+    pages, levels = math.ceil(rows / per_page), 1          # leaf level
+    sizes = [pages]
+    while pages &gt; 1:
+        pages = math.ceil(pages / per_page)
+        sizes.append(pages)
+        levels += 1
+    return per_page, levels, sizes[::-1]                   # root first
+
+
+for key, label in [(8, "bigint"), (16, "uuid"), (40, "email ~40 B")]:
+    fanout, levels, sizes = btree_levels(1_000_000_000, key_bytes=key)
+    print(f"{label:12} fanout {fanout:3}  levels {levels}  pages per level {sizes}")
+
+# bigint       fanout 307  levels 4  pages per level [1, 35, 10611, 3257329]
+# uuid         fanout 230  levels 4  pages per level [1, 83, 18904, 4347827]
+# email ~40 B  fanout 131  levels 5  pages per level [1, 4, 445, 58272, 7633588]</code></pre>
+<p>Two things follow. First, <strong>a billion rows is four levels</strong>; even ten billion would add only one more. Second, all the inner pages for the <code>bigint</code> index together are 1 + 35 + 10,611 pages, about 87 MB, which stays in the buffer cache. In practice a lookup costs one disk read for the leaf and one for the row. Wider keys lower the fanout, which is one reason to keep primary keys compact.</p>
+
+<h3 id="btree-writes">Writes: in-place updates and page splits</h3>
+<p>A B-tree updates pages in place. Inserting a key means descending to the right leaf, writing the entry into it, and logging the change to the write-ahead log first (see <a href="transactions.html#durability">durability</a>). When the leaf is full it <dfn>splits</dfn>: half its entries move to a new page and a separator is added to the parent, which can split in turn. The root splitting is the only way the tree grows taller, which is why it stays balanced.</p>
+<p>Where inserts land matters. Sequential keys (an auto-increment id, a timestamp) always go to the rightmost leaf, which stays hot in cache and fills completely. Random keys such as UUIDv4 land on a random leaf each time: every insert may read a cold page, splits happen all over the tree, and pages end up around 70% full on average. On large tables that difference shows up as several times more I/O per insert. <a href="data-modeling.html">Data Modeling</a> covers time-ordered ids that avoid it.</p>
+
+<h2 id="clustered">Clustered and secondary indexes</h2>
+<p>Where does the row itself live? Engines answer this in two ways, and the answer changes the cost of every secondary index.</p>
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 286" role="img" aria-label="InnoDB secondary index maps email to primary key, then the clustered primary key index holds the row; PostgreSQL indexes all point to a row address in an unordered heap">
+<text class="t b" x="20" y="24">InnoDB: the table is the primary key index</text>
+<path class="n svc" d="M95.0,44 L160,134 L30,134 Z"/><text class="t sm b mid" x="95.0" y="152">Secondary index</text><text class="t xs mute mid" x="95.0" y="166">on email</text>
+<path class="n db" d="M265.0,44 L330,134 L200,134 Z"/><text class="t sm b mid" x="265.0" y="152">Clustered index</text><text class="t xs mute mid" x="265.0" y="166">on id (primary key)</text>
+<rect class="n svc" x="20" y="186" width="150" height="40" rx="6"/><text class="t mono mid" x="95" y="203">asha@example.com</text><text class="t mono mid" x="95" y="218">→ id 42</text>
+<rect class="n db" x="190" y="186" width="150" height="40" rx="6"/><text class="t mono mid" x="265" y="203">id 42 →</text><text class="t mono mid" x="265" y="218">whole row</text>
+<path class="e accent" d="M170,206 H186"/>
+<text class="t xs mute" x="20" y="250">Two descents: email → id, then id → row.</text>
+<text class="t xs mute" x="20" y="266">Rows are stored in id order.</text>
+<path class="line faint" d="M362,14 V270" style="stroke-dasharray:4 4"/>
+<text class="t b" x="384" y="24">PostgreSQL: indexes point into a heap</text>
+<path class="n svc" d="M459.0,44 L524,134 L394,134 Z"/><text class="t sm b mid" x="459.0" y="152">Index</text><text class="t xs mute mid" x="459.0" y="166">on email</text>
+<path class="n svc" d="M629.0,44 L694,134 L564,134 Z"/><text class="t sm b mid" x="629.0" y="152">Index</text><text class="t xs mute mid" x="629.0" y="166">on id (primary key)</text>
+<rect class="n ext" x="420" y="206" width="250" height="40" rx="6"/><text class="t mono mid" x="545" y="223">heap page 812, item 7</text><text class="t xs mute mid" x="545" y="238">rows in insertion order</text>
+<path class="e accent" d="M459,176 L505,202"/><path class="e accent" d="M629,176 L585,202"/>
+<text class="t xs mute" x="384" y="262">Every index stores the row's physical address.</text>
+<text class="t xs mute" x="384" y="276">One descent, then one heap read.</text>
+</svg>
+</div>
+<figcaption><b>Two ways to store the row.</b> InnoDB stores rows inside the primary key B-tree, so a secondary index lookup needs a second descent. PostgreSQL stores rows in an unordered heap, so every index points straight at the row, but updates may need to touch every index.</figcaption>
+</figure>
+<ul>
+<li>A <dfn>clustered index</dfn> stores the full rows in its leaves, sorted by the index key. InnoDB always clusters on the primary key; SQL Server lets you choose one clustered index per table. Range scans on the primary key read rows that are physically adjacent, which is excellent for queries like "orders for customer 42" when the primary key is (customer_id, order_id). Every <dfn>secondary index</dfn> stores the primary key as its pointer, so a lookup by email does two tree descents. A long primary key bloats every secondary index.</li>
+<li>In a <dfn>heap-organised</dfn> table (PostgreSQL, also Oracle by default) rows sit wherever there was space, and every index, including the primary key, stores the row's physical address (<code>ctid</code>). One descent and one heap read. The cost moves to updates: a new row version at a new address must be added to every index, unless PostgreSQL can do a <dfn>HOT update</dfn> (no indexed column changed and the new version fits on the same page).</li>
+</ul>
+
+<h2 id="composite">Composite indexes and the leftmost prefix</h2>
+<p>A <dfn>composite index</dfn> on several columns sorts entries by the first column, then by the second within equal first values, and so on, exactly like a phone book sorted by last name, then first name. That ordering determines which queries it can serve. An index on <code>(user_id, status, created_at)</code>:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Query predicate</th><th>Uses the index?</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td><code>user_id = 42</code></td><td class="yes">Yes</td><td>Leftmost column: one contiguous range of entries</td></tr>
+<tr><td><code>user_id = 42 AND status = 'shipped'</code></td><td class="yes">Yes</td><td>Leftmost two columns: a narrower contiguous range</td></tr>
+<tr><td><code>user_id = 42 AND status = 'shipped' AND created_at &gt; '2026-09-01'</code></td><td class="yes">Yes, fully</td><td>Equalities first, one range last: still one contiguous range</td></tr>
+<tr><td><code>user_id = 42 ORDER BY status, created_at</code></td><td class="yes">Yes, no sort step</td><td>Entries are already in that order</td></tr>
+<tr><td><code>user_id = 42 AND created_at &gt; '2026-09-01'</code></td><td class="meh">Partly</td><td>Finds user 42's range, then must filter <code>created_at</code> across every status</td></tr>
+<tr><td><code>status = 'shipped'</code></td><td class="no">Usually not</td><td>Matching entries are scattered under every <code>user_id</code></td></tr>
+<tr><td><code>created_at &gt; '2026-09-01'</code></td><td class="no">Usually not</td><td>Third column alone, same problem</td></tr>
+</tbody></table></div>
+<p>This is the <dfn>leftmost prefix rule</dfn>. Some optimisers can <dfn>skip scan</dfn> an index whose first column has few distinct values (Oracle, MySQL 8.0, PostgreSQL 18), but do not design around it. The practical recipe for ordering columns: <strong>equality predicates first, then the column you sort by or filter with a range, last</strong>. Selectivity matters less than that rule; a range in the middle stops the following columns from narrowing the search.</p>
+
+<h3 id="covering">Covering indexes</h3>
+<p>If an index contains every column a query needs, the database answers from the index alone and never touches the table: an <dfn>index-only scan</dfn>, and the index is <dfn>covering</dfn> for that query. <code>CREATE INDEX ON orders (user_id, created_at) INCLUDE (total, status)</code> (PostgreSQL 11+, SQL Server) stores <code>total</code> and <code>status</code> in the leaves without making them part of the sort key. A query listing a user's recent orders with their totals then reads a handful of adjacent leaf entries instead of one random table page per order. PostgreSQL also needs the page to be marked all-visible in its visibility map to skip the heap check, which a recent <code>VACUUM</code> provides.</p>
+
+<h3 id="index-costs">What every index costs</h3>
+<ul>
+<li><strong>Writes.</strong> Every insert, and every update of an indexed column, modifies every index on the table. A table with eight indexes does roughly nine B-tree modifications per insert.</li>
+<li><strong>Space and memory.</strong> Indexes compete with data for the buffer cache. An unused index is pure cost; PostgreSQL's <code>pg_stat_user_indexes</code> shows indexes with zero scans.</li>
+<li><strong>Low selectivity.</strong> An index on a boolean column that is true for 40% of rows is rarely used: fetching 40% of rows via random lookups is slower than one sequential scan, and the planner knows it. A <dfn>partial index</dfn> (<code>WHERE status = 'pending'</code>) indexes only the rare, interesting rows.</li>
+</ul>
+
+<h2 id="lsm">LSM trees</h2>
+<p>A B-tree writes wherever the key belongs. With random keys and a table much larger than memory, that means random I/O and rewriting a whole 8 KB page to change 100 bytes. The <dfn>log-structured merge tree</dfn> (O'Neil et al., 1996), used by RocksDB, LevelDB, Cassandra, ScyllaDB, HBase and Bigtable, never modifies anything on disk. It buffers writes in memory and writes sorted, immutable files sequentially, then merges them in the background.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 386" role="img" aria-label="LSM tree: writes go to a WAL and a memtable, memtables flush to L0 SSTables, reads check memtable then each level using bloom filters, compaction merges levels">
+<rect class="n client" x="20" y="40" width="100" height="48" rx="8"/><text class="t b mid" x="70" y="61" data-show="1 2 4">put(k, v)</text><text class="t b mid" x="70" y="61" data-show="3">get(kiran)</text><text class="t xs mute mid" x="70" y="78">client</text>
+<rect class="zone" x="170" y="18" width="340" height="88" rx="10"/><text class="t xs mute" x="182" y="34">memory</text>
+<rect class="n cache" x="186" y="44" width="148" height="48" rx="6"/><text class="t b mid" x="260" y="65">memtable</text><text class="t xs mute mid" x="260" y="81">sorted, ~64 MB</text>
+<rect class="n ghost" x="348" y="44" width="148" height="48" rx="6" data-show="1 3 4"/>
+<g data-show="2"><rect class="n cache" x="348" y="44" width="148" height="48" rx="6" style="stroke:var(--accent);stroke-width:2.5"/><text class="t b mid" x="422" y="65">immutable</text><text class="t xs mute mid" x="422" y="81">full, being flushed</text></g>
+<rect class="n queue" x="560" y="44" width="140" height="48" rx="6"/><text class="t b mid" x="630" y="65">WAL</text><text class="t xs mute mid" x="630" y="81">append-only, disk</text>
+<rect class="zone" x="20" y="122" width="690" height="212" rx="10"/><text class="t xs mute" x="32" y="140">disk: immutable SSTables, each with a sparse index and a bloom filter</text>
+<text class="t b" x="40" y="176">L0</text><text class="t b" x="40" y="236">L1</text><text class="t b" x="40" y="296">L2</text>
+<rect class="n db" x="90" y="154" width="96" height="34" rx="5"/><text class="t mono mid" x="138.0" y="175">c to x</text>
+<rect class="n db" x="196" y="154" width="96" height="34" rx="5"/><text class="t mono mid" x="244.0" y="175">a to q</text>
+<rect class="n db" x="302" y="154" width="96" height="34" rx="5"/><text class="t mono mid" x="350.0" y="175">b to y</text>
+<rect class="n db" x="90" y="214" width="102" height="34" rx="5"/><text class="t mono mid" x="141.0" y="235">a to f</text>
+<rect class="n db" x="202" y="214" width="102" height="34" rx="5"/><text class="t mono mid" x="253.0" y="235">g to m</text>
+<rect class="n db" x="314" y="214" width="102" height="34" rx="5"/><text class="t mono mid" x="365.0" y="235">n to s</text>
+<rect class="n db" x="426" y="214" width="102" height="34" rx="5"/><text class="t mono mid" x="477.0" y="235">t to z</text>
+<rect class="n db" x="90" y="274" width="68" height="34" rx="5"/><text class="t mono mid" x="124.0" y="295">a-c</text>
+<rect class="n db" x="166" y="274" width="68" height="34" rx="5"/><text class="t mono mid" x="200.0" y="295">d-f</text>
+<rect class="n db" x="242" y="274" width="68" height="34" rx="5"/><text class="t mono mid" x="276.0" y="295">g-i</text>
+<rect class="n db" x="318" y="274" width="68" height="34" rx="5"/><text class="t mono mid" x="352.0" y="295">j-l</text>
+<rect class="n db" x="394" y="274" width="68" height="34" rx="5"/><text class="t mono mid" x="428.0" y="295">m-o</text>
+<rect class="n db" x="470" y="274" width="68" height="34" rx="5"/><text class="t mono mid" x="504.0" y="295">p-r</text>
+<rect class="n db" x="546" y="274" width="68" height="34" rx="5"/><text class="t mono mid" x="580.0" y="295">s-u</text>
+<rect class="n db" x="622" y="274" width="68" height="34" rx="5"/><text class="t mono mid" x="656.0" y="295">v-z</text>
+<text class="t xs mute" x="548" y="176">overlapping ranges</text>
+<text class="t xs mute" x="548" y="236">no overlap, ~10× L0</text>
+<g data-show="1"><path class="e accent" d="M120,56 C330,8 470,8 556,56"/><text class="t xs accent mid" x="350" y="14">1 append</text><path class="e accent" d="M120,72 H182"/><text class="t xs accent mid" x="148" y="66">2 insert</text><text class="t sm" x="20" y="356">A write is a sequential append to the WAL plus an insert into a sorted in-memory table.</text><text class="t sm" x="20" y="374">Nothing on disk is modified in place, so writes never wait for a random seek.</text></g>
+<g data-show="2"><rect class="n db" x="408" y="154" width="96" height="34" rx="5" style="stroke:var(--accent);stroke-width:2.5"/><text class="t mono mid" x="456.0" y="175">f to t</text><path class="e accent" d="M440,92 V150"/><text class="t xs accent" x="448" y="117">sequential write</text><text class="t sm" x="20" y="356">When the memtable fills, it is frozen and written out as a new sorted file in L0.</text><text class="t sm" x="20" y="374">A fresh memtable takes new writes meanwhile; the WAL segment can then be deleted.</text></g>
+<g data-show="3">
+<rect x="186" y="44" width="148" height="48" rx="6" style="fill:none;stroke:var(--d-red);stroke-width:2"/>
+<rect x="90" y="154" width="96" height="34" rx="5" style="fill:none;stroke:var(--d-red);stroke-width:2"/>
+<rect x="196" y="154" width="96" height="34" rx="5" style="fill:none;stroke:var(--d-red);stroke-width:2"/>
+<rect x="302" y="154" width="96" height="34" rx="5" style="fill:none;stroke:var(--d-red);stroke-width:2"/>
+<rect x="202" y="214" width="102" height="34" rx="5" style="fill:none;stroke:var(--d-red);stroke-width:2"/>
+<rect x="318" y="274" width="68" height="34" rx="5" style="fill:none;stroke:var(--d-green);stroke-width:2.5"/>
+<circle cx="190" cy="48" r="8" class="fill-accent"/><text class="t xs mid" x="190" y="51.5" style="fill:var(--surface)">1</text>
+<circle cx="94" cy="158" r="8" class="fill-accent"/><text class="t xs mid" x="94" y="161.5" style="fill:var(--surface)">2</text>
+<circle cx="200" cy="158" r="8" class="fill-accent"/><text class="t xs mid" x="200" y="161.5" style="fill:var(--surface)">3</text>
+<circle cx="306" cy="158" r="8" class="fill-accent"/><text class="t xs mid" x="306" y="161.5" style="fill:var(--surface)">4</text>
+<circle cx="206" cy="218" r="8" class="fill-accent"/><text class="t xs mid" x="206" y="221.5" style="fill:var(--surface)">5</text>
+<circle cx="322" cy="278" r="8" class="fill-accent"/><text class="t xs mid" x="322" y="281.5" style="fill:var(--surface)">6</text>
+<text class="t sm" x="20" y="356">Check the memtable, then every L0 file newest first, then one file per level. Bloom filters say</text>
+<text class="t sm" x="20" y="374">"definitely not here" for files 2 to 5 (red) without touching their data; file 6 has kiran.</text></g>
+<g data-show="4">
+<rect x="90" y="154" width="96" height="34" rx="5" style="fill:none;stroke:var(--accent);stroke-width:2.5"/>
+<rect x="196" y="154" width="96" height="34" rx="5" style="fill:none;stroke:var(--accent);stroke-width:2.5"/>
+<rect x="302" y="154" width="96" height="34" rx="5" style="fill:none;stroke:var(--accent);stroke-width:2.5"/>
+<rect x="90" y="214" width="102" height="34" rx="5" style="fill:none;stroke:var(--accent);stroke-width:2.5"/>
+<rect x="202" y="214" width="102" height="34" rx="5" style="fill:none;stroke:var(--accent);stroke-width:2.5"/>
+<rect x="314" y="214" width="102" height="34" rx="5" style="fill:none;stroke:var(--accent);stroke-width:2.5"/>
+<rect x="426" y="214" width="102" height="34" rx="5" style="fill:none;stroke:var(--accent);stroke-width:2.5"/>
+<path class="e accent" d="M410,171 C560,171 560,231 532,231"/><text class="t xs accent" x="558" y="200">merge sort</text>
+<text class="t sm" x="20" y="356">Compaction merge-sorts all of L0 with the overlapping L1 files into new L1 files, keeping only</text>
+<text class="t sm" x="20" y="374">the newest version of each key. Old files are deleted. Tombstones vanish at the last level.</text></g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Write</button><button type="button" data-step="2" aria-pressed="false">Flush</button><button type="button" data-step="3" aria-pressed="false">Read</button><button type="button" data-step="4" aria-pressed="false">Compaction</button></div>
+</div>
+<figcaption><b>The LSM write and read paths.</b> Writes touch memory and an append-only log. Reads may have to look in several places, which is what bloom filters and compaction exist to limit.</figcaption>
+</figure>
+
+<ol class="steps">
+<li><strong>Write.</strong> Append the change to the write-ahead log for durability, then insert it into the <dfn>memtable</dfn>, a sorted in-memory structure (usually a skip list). An update is just a newer entry for the same key; a delete writes a marker called a <dfn>tombstone</dfn>.</li>
+<li><strong>Flush.</strong> When the memtable reaches its size limit (64 MB by default in RocksDB), it becomes immutable and is written out in key order as an <dfn>SSTable</dfn> (sorted string table): data blocks, a sparse index of the first key in each block, and a bloom filter of all its keys.</li>
+<li><strong>Read.</strong> Look in the memtable, then in SSTables from newest to oldest; the first version found wins. For each file, the bloom filter answers "definitely not here" or "maybe here" from memory. Only on "maybe" does the engine read the sparse index and one data block.</li>
+<li><strong>Compact.</strong> Background threads merge SSTables, keeping only the newest version of each key and discarding overwritten values. Tombstones can only be dropped when the merge reaches the oldest data, otherwise an older value would reappear.</li>
+</ol>
+
+<h3 id="bloom">Bloom filters make LSM reads affordable</h3>
+<p>Without filters, reading a key that does not exist would open every SSTable. A <a href="probabilistic.html">bloom filter</a> per file costs about 10 bits per key and gives roughly a 1% false-positive rate: with 10 bits per key and 7 hash functions the rate is (1 - e<sup>-7/10</sup>)<sup>7</sup> ≈ 0.82%. So a point lookup typically does one real disk read for the file that has the key, and a lookup for a missing key usually does none. Range scans get no help from bloom filters and must merge iterators over every level, which is the weakest spot of LSM engines.</p>
+
+<h3 id="compaction">Compaction strategies</h3>
+<p>How files are merged decides the engine's character.</p>
+<div class="defs">
+<div><h4>Leveled (LevelDB, RocksDB default)</h4><p>Each level is about 10 times larger than the one above, and within a level (from L1 down) files have non-overlapping key ranges. A read checks every L0 file, then at most one file per level below. Each byte gets rewritten roughly 10 times per level it passes through, so write amplification is high, but space overhead stays near 10%.</p></div>
+<div><h4>Size-tiered (Cassandra default)</h4><p>When several files of similar size accumulate (4 by default), merge them into one bigger file. Each byte is rewritten only a few times, so writes are cheap. But a key may live in many overlapping files, so reads check more of them, and a big merge temporarily needs as much free disk as its inputs.</p></div>
+<div><h4>Time-window</h4><p>For time-series data with TTLs, group files by time window and never merge across windows. Expired windows are dropped as whole files. Cassandra's TWCS is the standard example.</p></div>
+</div>
+
+<h3 id="tiny-lsm">A tiny LSM tree</h3>
+<p>The whole idea fits in a few dozen lines. This version leaves out the WAL, bloom filters and levels, but shows memtable flushes, newest-first reads, tombstones and compaction:</p>
+<pre><code class="language-python">import bisect
+
+TOMBSTONE = object()
+
+
+class TinyLSM:
+    """Memtable + immutable sorted runs (SSTables) + full compaction. No WAL, no bloom filters."""
+
+    def __init__(self, memtable_limit=4):
+        self.memtable = {}            # real engines use a skip list; we sort at flush time
+        self.sstables = []            # newest first; each is a sorted list of (key, value)
+        self.limit = memtable_limit
+
+    def put(self, key, value):
+        self.memtable[key] = value
+        if len(self.memtable) &gt;= self.limit:
+            self.flush()
+
+    def delete(self, key):
+        self.put(key, TOMBSTONE)      # deletes are writes too
+
+    def flush(self):
+        self.sstables.insert(0, sorted(self.memtable.items()))
+        self.memtable = {}
+
+    def get(self, key):
+        if key in self.memtable:
+            value = self.memtable[key]
+            return None if value is TOMBSTONE else value
+        for run in self.sstables:     # newest first: the first hit wins
+            i = bisect.bisect_left(run, (key,))
+            if i &lt; len(run) and run[i][0] == key:
+                return None if run[i][1] is TOMBSTONE else run[i][1]
+        return None
+
+    def compact(self):
+        # merging everything into one bottom run is the only time tombstones can be dropped
+        merged = {}
+        for run in reversed(self.sstables):   # oldest first, newer values overwrite
+            merged.update(run)
+        live = sorted((k, v) for k, v in merged.items() if v is not TOMBSTONE)
+        self.sstables = [live]
+
+
+db = TinyLSM()
+for i, user in enumerate(["asha", "ben", "kiran", "mei", "omar", "zoe", "asha", "ben"]):
+    db.put(user, f"v{i}")
+db.delete("kiran")
+db.put("lena", "v9")
+print(len(db.sstables), "sstables", db.get("asha"), db.get("kiran"), db.get("mei"))
+db.flush()
+rows = sum(len(r) for r in db.sstables)
+db.compact()
+print(rows, "rows on disk before compaction,", len(db.sstables[0]), "after")
+# 2 sstables v6 None v3
+# 10 rows on disk before compaction, 6 after</code></pre>
+<p>Ten rows were on disk because <code>asha</code> and <code>ben</code> were written twice and <code>kiran</code> has both a value and a tombstone. Compaction leaves six live keys. That gap between data written and data live is the space amplification a real engine keeps in check.</p>
+
+<h2 id="amplification">Read, write and space amplification</h2>
+<p>Three ratios describe any storage engine. <dfn>Write amplification</dfn>: bytes written to disk per byte the application wrote. <dfn>Read amplification</dfn>: disk reads per query. <dfn>Space amplification</dfn>: bytes on disk per byte of live data. The RUM conjecture states that you can optimise for two at the expense of the third, and the engines bear that out.</p>
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>B-tree</th><th>LSM, leveled</th><th>LSM, size-tiered</th></tr></thead>
+<tbody>
+<tr><th>Write amplification</th><td class="meh">High for small random writes: a whole page (8 to 16 KB) per changed row, plus WAL</td><td class="meh">Up to ~10 per level in theory; measured totals are often 10 to 30, all sequential</td><td class="yes">Low: a few rewrites per byte</td></tr>
+<tr><th>Point read</th><td class="yes">One path, ~1 to 2 uncached pages</td><td class="yes">Bloom filters keep it near one data read</td><td class="meh">More files to check</td></tr>
+<tr><th>Range scan</th><td class="yes">Excellent: linked leaves</td><td class="meh">Merge across levels</td><td class="no">Merge across many files</td></tr>
+<tr><th>Space amplification</th><td class="meh">Pages 50 to 90% full, fragmentation</td><td class="yes">About 1.1×</td><td class="no">Up to 2× during big compactions</td></tr>
+<tr><th>Compression</th><td class="meh">Per page, partial</td><td class="yes">Excellent: immutable sorted blocks</td><td class="yes">Excellent</td></tr>
+<tr><th>Latency profile</th><td class="yes">Predictable</td><td class="meh">Compaction can cause stalls</td><td class="meh">Same, plus disk headroom planning</td></tr>
+<tr><th>Best for</th><td>Read-heavy, mixed OLTP, range queries</td><td>Write-heavy with point reads, space-sensitive</td><td>Very write-heavy, append-mostly data</td></tr>
+</tbody></table></div>
+<p>Facebook's MyRocks (MySQL on RocksDB) is the clearest real comparison: for its user database it used about half the storage of compressed InnoDB and wrote far less to flash, while InnoDB kept the edge on read-heavy range queries. Neither family wins outright; pick from the workload.</p>
+
+<h2 id="other-indexes">Other index types</h2>
+<div class="defs">
+<div><h4>Hash indexes</h4><p>A hash table from key to location: O(1) equality lookups, no ranges, no ordering, no prefix matching. Bitcask (Riak) keeps a hash of every key in memory pointing into append-only files. PostgreSQL has hash indexes, but a B-tree is almost always the better default.</p></div>
+<div><h4>Inverted indexes</h4><p>Map each word to the list of documents containing it. They power full-text search and PostgreSQL's GIN indexes on arrays and JSONB. Covered in depth in <a href="search.html">Search &amp; Inverted Indexes</a>.</p></div>
+<div><h4>Geospatial indexes</h4><p>Two-dimensional data does not sort well in one dimension. R-trees (PostGIS via GiST) group nearby rectangles; geohashes and S2 or H3 cells turn a location into a sortable id so an ordinary B-tree can answer "nearby" queries. See the <a href="ride-sharing.html">ride-sharing</a> case study.</p></div>
+<div><h4>Bitmap and columnar</h4><p>Analytical stores keep one bitmap per value of low-cardinality columns and combine them with fast bitwise AND/OR, or store each column separately with min/max statistics per block so whole blocks can be skipped.</p></div>
+</div>
+
+<h2 id="worked-example">Worked example: indexing an orders table</h2>
+<p>An <code>orders</code> table has 500 million rows. The three hot queries are listed below with the index each one needs.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Query</th><th>Rate</th><th>Index</th><th>Pages read</th></tr></thead>
+<tbody>
+<tr><td>Order by id: <code>WHERE id = ?</code></td><td class="num">8,000/s</td><td>Primary key</td><td>~4, two uncached</td></tr>
+<tr><td>A user's 20 latest orders with totals: <code>WHERE user_id = ? ORDER BY created_at DESC LIMIT 20</code></td><td class="num">3,000/s</td><td><code>(user_id, created_at) INCLUDE (total, status)</code></td><td>~4 to 5, index only</td></tr>
+<tr><td>Pending orders older than 1 hour: <code>WHERE status = 'pending' AND created_at &lt; now() - interval '1 hour'</code></td><td class="num">1/min</td><td>Partial: <code>(created_at) WHERE status = 'pending'</code></td><td>A few, index is tiny</td></tr>
+</tbody></table></div>
+<p>Without the second index, each user-history request would find the user's orders some other way or sort them: a user with 300 orders means 300 random row fetches and a sort, 3,000 times a second. With it, the 20 entries sit next to each other in one or two leaf pages and carry everything the page shows. The partial index contains only the few thousand pending orders instead of 500 million entries, so it costs almost nothing to maintain. What we deliberately did not add: an index on <code>status</code> alone (low selectivity) and one on <code>created_at</code> alone (no hot query needs it). Each would slow every insert for no benefit.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+<li><strong>PostgreSQL</strong> defaults to B-tree, deduplicates repeated keys in B-tree leaves since version 13, and offers GIN, GiST, BRIN (block range summaries for huge, naturally ordered tables) and hash indexes.</li>
+<li><strong>MySQL InnoDB</strong> clusters every table on its primary key; if you do not define one, it picks a unique non-null index or invents a hidden 6-byte row id.</li>
+<li><strong>RocksDB</strong> is the embedded LSM engine behind MyRocks, CockroachDB (until its Go rewrite, Pebble, which keeps the same design), TiKV, Kafka Streams state stores and many more.</li>
+<li><strong>Cassandra and ScyllaDB</strong> let you choose compaction per table: size-tiered, leveled or time-window, which is the most direct way to tune an LSM for its workload.</li>
+<li><strong>MongoDB's WiredTiger</strong> uses B-trees with prefix and block compression, showing that the line between the families is blurring in both directions.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>In the data model step, after listing queries: name the index each hot query needs ("a composite index on <code>(user_id, created_at)</code> makes the timeline query a single range scan"). Bring up LSM vs B-tree when the workload is extremely write-heavy (logs, events, messages, metrics), as the reason a Cassandra-style store fits.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>How many disk reads does a lookup in a billion-row table take? (Four levels, top ones cached, so one or two.)</li>
+<li>Will this composite index serve that query? (Leftmost prefix, equality first, range last.)</li>
+<li>Why are LSM writes faster, and what do reads pay for it? (Sequential writes; multiple files, bloom filters, compaction.)</li>
+<li>Why might adding an index make the system slower? (Write cost, cache pressure, a bad plan choice.)</li>
+<li>Why do random UUID primary keys hurt insert performance?</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>"Index every column." Every index taxes every write.</li>
+<li>Expecting an index on <code>(a, b)</code> to serve <code>WHERE b = ?</code>.</li>
+<li>Claiming LSM trees are simply faster: they trade read and space cost for write throughput.</li>
+<li>Forgetting that a B-tree index lookup still costs a table read unless the index covers the query.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://www.cs.umb.edu/~poneil/lsmtree.pdf" target="_blank" rel="noopener">The Log-Structured Merge-Tree (LSM-Tree)</a><span>O'Neil, Cheng, Gawlick and O'Neil, Acta Informatica, 1996. The original LSM design and its cost analysis.</span></li>
+<li><a href="https://github.com/facebook/rocksdb/wiki/Compaction" target="_blank" rel="noopener">RocksDB wiki: Compaction</a><span>Leveled, universal and FIFO compaction, with the amplification trade-offs of each.</span></li>
+<li><a href="https://www.postgresql.org/docs/current/indexes.html" target="_blank" rel="noopener">PostgreSQL documentation: Indexes</a><span>Index types, multicolumn indexes, index-only scans, partial and covering indexes.</span></li>
+<li><a href="https://use-the-index-luke.com/" target="_blank" rel="noopener">Use The Index, Luke</a><span>Markus Winand. A practical guide to SQL indexing for developers, especially composite index design.</span></li>
+</ul>

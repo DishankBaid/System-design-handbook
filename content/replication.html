@@ -1,0 +1,335 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">A database on one machine is one disk failure away from losing data and one kernel upgrade away from downtime. <dfn>Replication</dfn>, keeping a copy of the same data on several machines, is how every serious system answers that. It is also where some of the most confusing bugs in distributed systems come from: a user saves their profile, refreshes, and the old version comes back.</p>
+<p>Replication buys four things, and you should know which ones you are buying:</p>
+<ul>
+<li><strong>Durability.</strong> A committed write survives the loss of a disk, a machine or, with cross-region copies, a data centre.</li>
+<li><strong>Availability.</strong> When a node dies, another copy keeps serving.</li>
+<li><strong>Read throughput.</strong> Ten replicas can serve ten times the reads of one.</li>
+<li><strong>Latency.</strong> A copy in Frankfurt answers European users in 10 ms instead of 90 ms from Virginia.</li>
+</ul>
+<p>The difficulty is never copying the data once. It is keeping copies in agreement while data changes, machines fail and networks drop messages. There are three families of answers, distinguished by who accepts writes: one leader, several leaders, or nobody in particular.</p>
+
+<h2 id="single-leader">Single-leader replication</h2>
+<p>One replica is the <dfn>leader</dfn> (primary, master). All writes go to it. It applies each write locally and sends the change to the <dfn>followers</dfn> (replicas, secondaries, standbys), which apply changes in the same order. Reads can go to the leader or to any follower. PostgreSQL streaming replication, MySQL binlog replication, MongoDB replica sets, Redis replicas and Kafka partitions all work this way.</p>
+<p>What travels to the followers varies:</p>
+<div class="defs">
+<div><h4>Statement-based</h4><p>Ship the SQL text. Compact, but <code>NOW()</code>, <code>RAND()</code> and auto-increment ordering can produce different results on each replica. Largely abandoned.</p></div>
+<div><h4>Physical (WAL shipping)</h4><p>Ship the write-ahead log: byte-level page changes. Exact and cheap, but ties leader and followers to the same engine version. PostgreSQL streaming replication.</p></div>
+<div><h4>Logical (row-based)</h4><p>Ship "row with id 42 changed from X to Y". Version-independent, readable by other systems, and the basis of <dfn>change data capture</dfn>. MySQL row-based binlog, PostgreSQL logical replication.</p></div>
+</div>
+
+<h3 id="sync-async">Synchronous, asynchronous and semi-synchronous</h3>
+<p>The central choice is when the leader tells the client "committed".</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Mode</th><th>Commit waits for</th><th>Latency</th><th>Leader crash</th><th>Follower down</th></tr></thead>
+<tbody>
+<tr><th>Asynchronous</th><td>Leader's local WAL flush</td><td class="yes">Lowest</td><td class="no">Recent writes may be lost on failover</td><td class="yes">No effect</td></tr>
+<tr><th>Synchronous (all)</th><td>Every follower confirms</td><td class="no">Slowest follower's round trip</td><td class="yes">Nothing lost</td><td class="no">Writes stall</td></tr>
+<tr><th>Semi-synchronous</th><td>Leader plus one (or k) followers confirm</td><td class="meh">One extra round trip to the fastest follower</td><td class="yes">Nothing lost, if the right follower is promoted</td><td class="meh">Fine unless all sync followers fail</td></tr>
+</tbody></table></div>
+<p>In practice "synchronous" almost always means semi-synchronous. PostgreSQL's <code>synchronous_standby_names = 'ANY 1 (b, c)'</code> waits for any one of two standbys; <code>synchronous_commit</code> chooses whether that standby must have received, flushed or applied the record. MySQL's semi-sync plugin waits for one replica to acknowledge receipt, but silently falls back to asynchronous after a timeout (10 s by default). Within a region the extra round trip costs a millisecond or so, which is why most production setups use it for the data they cannot afford to lose. Across regions it costs 60 to 150 ms per commit, so cross-region replicas are usually asynchronous.</p>
+
+<h3 id="replication-lag">Replication lag</h3>
+<p>With asynchronous followers, a follower is always somewhat behind. Normally the <dfn>replication lag</dfn> is milliseconds. Under a write burst, a long-running query on the follower, a network hiccup or a replica rebuilding after a restart, it can grow to seconds or minutes. Any read served by a lagging follower returns data from the past.</p>
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 330" role="img" aria-label="Replication lag: a user updates her bio on the leader, then reads from a follower that is two seconds behind and sees the old value">
+<rect class="n client" x="20" y="125" width="110" height="54" rx="8"/>
+<text class="t b mid" x="75.0" y="149.0">Asha</text><text class="t xs mute mid" x="75.0" y="165.0">edits her bio</text>
+<rect class="n db" x="300" y="40" width="150" height="58" rx="8"/>
+<text class="t b mid" x="375.0" y="66.0">Leader</text><text class="t xs mute mid" x="375.0" y="82.0">bio = "Rust dev"</text>
+<rect class="n db" x="560" y="40" width="150" height="58" rx="8"/>
+<text class="t b mid" x="635.0" y="66.0">Follower 1</text><text class="t xs mute mid" x="635.0" y="82.0">bio = "Rust dev"</text>
+<rect class="n db" x="560" y="206" width="150" height="58" rx="8" style="stroke:var(--d-red);stroke-width:2"/>
+<text class="t b mid" x="635.0" y="232.0">Follower 2</text><text class="t xs mute mid" x="635.0" y="248.0">bio = "Go dev"</text>
+<path class="e" d="M130,140 C200,140 220,69 296,69"/><text class="t xs mute" x="170" y="92">1 UPDATE</text>
+<path class="e" d="M450,62 H556"/><path class="flow" d="M450,62 H556"/><text class="t xs mute mid" x="503" y="54">WAL stream, 5 ms</text>
+<path class="e dash" d="M450,84 C520,84 500,235 556,235"/><path class="flow" d="M450,84 C520,84 500,235 556,235" style="animation-duration:3.2s"/>
+<text class="t xs red" x="514" y="166">lag 2 s</text>
+<path class="e" d="M130,168 H190 L220,250 H556"/><text class="t xs mute" x="250" y="242">2 GET /profile, 300 ms later</text>
+<path class="e red" d="M556,222 H250 L220,154 H134"/><text class="t xs red" x="270" y="214">3 "Go dev": her edit is gone</text>
+<text class="t sm" x="20" y="300">Every write commits on the leader first and reaches followers later. A follower that is</text>
+<text class="t sm" x="20" y="318">busy, far away or catching up after a restart serves data from the past.</text>
+</svg>
+</div>
+<figcaption><b>Replication lag in action.</b> The animated streams show the change flowing to both followers; the second one is two seconds behind. Asha's read lands on it 300 ms after her write and returns her old bio, so to her the save looks broken.</figcaption>
+</figure>
+<p>This is <dfn>eventual consistency</dfn>: stop writing and all followers converge. It says nothing about how long that takes or what a client sees meanwhile. Three specific anomalies matter in practice, and each has a targeted fix that is much cheaper than making every read go to the leader.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Guarantee</th><th>Anomaly without it</th><th>Common fixes</th></tr></thead>
+<tbody>
+<tr><th>Read-your-writes</th><td>You save a change, reload, and it is gone</td><td>Read your own recently changed data from the leader (e.g. for 10 s after a write); or remember the log position of your last write and read only from a follower that has replayed past it</td></tr>
+<tr><th>Monotonic reads</th><td>A comment appears, you refresh, it disappears, it reappears: consecutive reads hit followers with different lag</td><td>Pin each user to one follower (hash the user id); fail over to another only if it dies</td></tr>
+<tr><th>Consistent prefix</th><td>You see an answer before the question it replies to, because they live on different partitions with different lag</td><td>Keep causally related writes in the same partition, or track causal dependencies</td></tr>
+</tbody></table></div>
+<p>The log-position approach is precise and cheap. After committing, the client reads the leader's WAL position (<code>pg_current_wal_lsn()</code>); a follower reports how far it has replayed (<code>pg_last_wal_replay_lsn()</code>). MySQL offers the same with GTIDs and <code>WAIT_FOR_EXECUTED_GTID_SET</code>. The client sends its last-seen position as a token, and the routing layer picks a follower that has caught up, or waits briefly. These session guarantees are defined in <a href="consistency-models.html">Consistency Models</a>.</p>
+
+<h3 id="failover">Failover, split brain and fencing</h3>
+<p>Follower failure is easy: it reconnects and catches up from the position it last applied. Leader failure needs <dfn>failover</dfn>: detect the failure, choose a new leader, and redirect clients and the remaining followers to it. Each step has a sharp edge.</p>
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 348" role="img" aria-label="Failover: leader db-a pauses, the coordinator promotes db-b with a higher epoch, and a late write from db-a is rejected by its epoch number">
+<rect class="n client" x="290" y="16" width="140" height="40" rx="8"/><text class="t b mid" x="360" y="41">App servers</text>
+<g data-show="1"><rect class="n db" x="40" y="120" width="150" height="56" rx="8"/><text class="t b mid" x="115" y="143">db-a</text><text class="t xs mute mid" x="115" y="160">leader, epoch 7</text></g>
+<g data-show="2 3"><rect class="n bad" x="40" y="120" width="150" height="56" rx="8"/><text class="t b mid" x="115" y="143">db-a</text><text class="t xs mute mid" x="115" y="160">leader? epoch 7, paused</text></g>
+<g data-show="4"><rect class="n bad" x="40" y="120" width="150" height="56" rx="8"/><text class="t b mid" x="115" y="143">db-a</text><text class="t xs mute mid" x="115" y="160">stale leader, epoch 7</text></g>
+<g data-show="1 2"><rect class="n db" x="285" y="120" width="150" height="56" rx="8"/><text class="t b mid" x="360" y="143">db-b</text><text class="t xs mute mid" x="360" y="160">follower</text></g>
+<g data-show="3 4"><rect class="n good" x="285" y="120" width="150" height="56" rx="8"/><text class="t b mid" x="360" y="143">db-b</text><text class="t xs mute mid" x="360" y="160">leader, epoch 8</text></g>
+<g data-show="1 2 3 4"><rect class="n db" x="530" y="120" width="150" height="56" rx="8"/><text class="t b mid" x="605" y="143">db-c</text><text class="t xs mute mid" x="605" y="160">follower</text></g>
+<rect class="n ext" x="250" y="236" width="220" height="48" rx="8"/><text class="t b mid" x="360" y="257">Coordinator</text><text class="t xs mute mid" x="360" y="273">etcd / ZooKeeper / Orchestrator</text>
+<g data-show="1"><path class="e accent" d="M300,56 L190,116"/><path class="flow" d="M300,56 L190,116"/><path class="e dash" d="M190,140 H281"/><path class="e dash" d="M190,160 C300,200 450,200 526,160"/><text class="t xs mute" x="200" y="76">writes</text></g>
+<g data-show="2"><path class="e dash red" d="M115,176 C115,240 180,260 246,260"/><text class="t xs red end" x="106" y="226">heartbeats stop</text></g>
+<g data-show="3"><path class="e accent" d="M360,232 V180"/><text class="t xs accent" x="368" y="214">promote, epoch 8</text><path class="e accent" d="M380,56 L370,116"/><path class="flow" d="M380,56 L370,116"/><text class="t xs mute" x="384" y="90">writes</text><path class="e dash" d="M435,148 H526"/></g>
+<g data-show="4"><path class="e accent" d="M380,56 L370,116"/><path class="flow" d="M380,56 L370,116"/><path class="e dash red" d="M190,148 H281"/><text class="t xs red mid" x="236" y="140">epoch 7</text><path class="line" d="M226,152 l20,16 m0,-16 l-20,16" style="stroke:var(--d-red);stroke-width:2"/><path class="e dash" d="M435,148 H526"/></g>
+<g data-show="1"><text class="t sm" x="20" y="318">Normal: db-a is leader for epoch 7 and streams its log to db-b and db-c.</text><text class="t sm" x="20" y="336"></text></g>
+<g data-show="2"><text class="t sm" x="20" y="318">db-a freezes. The coordinator sees no heartbeat for 10 s and suspects it is dead.</text><text class="t sm" x="20" y="336">It cannot tell a slow node from a dead one.</text></g>
+<g data-show="3"><text class="t sm" x="20" y="318">The most up-to-date follower, db-b, is promoted with a higher epoch, 8.</text><text class="t sm" x="20" y="336">App servers are told to write to db-b. Unreplicated writes on db-a are lost.</text></g>
+<g data-show="4"><text class="t sm" x="20" y="318">db-a wakes up still believing it is leader and tries to replicate a write stamped epoch 7.</text><text class="t sm" x="20" y="336">db-b and db-c have seen epoch 8 and reject it: the epoch acts as a fencing token.</text></g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Normal</button><button type="button" data-step="2" aria-pressed="false">Leader stalls</button><button type="button" data-step="3" aria-pressed="false">Promote db-b</button><button type="button" data-step="4" aria-pressed="false">Old leader returns</button></div>
+</div>
+<figcaption><b>Failover with fencing.</b> The dangerous moment is step 4: two nodes both believe they are leader. The epoch check stops db-a's stale writes from reaching the replicas, but db-a can still acknowledge writes from clients that reach it. Real fencing also needs db-a to stop accepting writes (its leader lease expires before db-b is promoted, or STONITH), otherwise the data diverges, which is called split brain.</figcaption>
+</figure>
+<ul>
+<li><strong>Detection is a guess.</strong> A node that does not answer may be dead, overloaded, in a 30-second garbage collection pause or on the wrong side of a network partition. A short timeout causes needless failovers under load (which add load); a long one means minutes of downtime. Values of 10 to 30 seconds are common.</li>
+<li><strong>Lost writes.</strong> With asynchronous replication, writes the old leader committed but had not yet shipped disappear when a follower is promoted. Worse, if the old leader comes back and those writes are replayed, they conflict with new ones. In GitHub's 2012 incident, a promoted MySQL follower that was behind reused auto-increment ids that were also used as keys in Redis, so some users saw other users' private data.</li>
+<li><strong>Split brain.</strong> If the old leader was only paused, it may resume and keep accepting writes. The standard defence is a <dfn>fencing token</dfn>: a number that increases with every leadership change (an epoch, term or generation), issued by a consensus service such as etcd or ZooKeeper. Every write carries it, and storage or replicas reject any token lower than the highest they have seen. Some systems also use STONITH ("shoot the other node in the head"), powering off the old leader through its management interface before promoting the new one.</li>
+<li><strong>Choosing the new leader</strong> is a consensus problem: nodes must agree on one winner even with failures. Use a proven implementation (Patroni with etcd for PostgreSQL, Orchestrator for MySQL, Raft in MongoDB and Kafka's KRaft). See <a href="consensus.html">Consensus &amp; Leader Election</a>.</li>
+</ul>
+
+<h2 id="multi-leader">Multi-leader replication</h2>
+<p>With <dfn>multi-leader</dfn> (active-active) replication, several nodes accept writes and replicate to each other asynchronously. The typical setup is one leader per region: users write locally with low latency, and a region can keep working while cut off from the others. Offline-capable clients are the same pattern at a smaller scale: a phone's calendar is a leader that syncs later. Collaborative editors are the extreme case, with every keystroke a write on a different leader.</p>
+<p>The cost is <dfn>write conflicts</dfn>. If a user changes a title to "Q3 plan" in Europe while a colleague changes it to "Q3 roadmap" in the US, both writes succeed locally, and when they replicate the database has two values and no single order to decide between them. Options, in order of preference:</p>
+<ol class="steps">
+<li><strong>Avoid conflicts.</strong> Give each record a home region and route all its writes there (a user's data lives in their home region). Conflicts then only arise during failover of a region. Most production multi-region systems do this.</li>
+<li><strong>Last write wins (LWW).</strong> Attach a timestamp to each write and keep the highest. Simple and convergent, but it silently discards the other write, and with clock skew between regions it can discard the <em>later</em> one. Acceptable for caches and "last seen" fields, not for anything a user typed.</li>
+<li><strong>Merge in the application.</strong> Keep both versions ("siblings") and resolve on read or with custom logic: union two shopping carts, ask the user. Amazon's Dynamo cart did exactly this.</li>
+<li><strong>CRDTs.</strong> <dfn>Conflict-free replicated data types</dfn> are counters, sets, maps and text sequences designed so that concurrent updates always merge to the same result regardless of order. Riak, Redis Enterprise's active-active mode and collaborative editing libraries such as Automerge and Yjs use them.</li>
+</ol>
+<p>Multi-leader also breaks database features that assume one order of writes: auto-increment ids, uniqueness constraints and foreign keys cannot be checked across leaders at write time. Treat it as a tool for specific needs (multi-region writes, offline clients), not as a default.</p>
+
+<h2 id="leaderless">Leaderless replication</h2>
+<p>Amazon's Dynamo paper (2007) popularised a design with no leader at all; Cassandra, ScyllaDB, Riak and Voldemort follow it. The client (or a coordinator node acting for it) sends each write to all <code>N</code> replicas of the key and considers it successful when <code>W</code> of them acknowledge. A read asks <code>N</code> replicas, waits for <code>R</code> answers, and returns the value with the newest version. The replicas for a key are chosen by walking the hash ring, as described in <a href="consistent-hashing.html#replication">Consistent Hashing</a>.</p>
+
+<h3 id="quorums">Quorums: R + W &gt; N</h3>
+<p>If <code>R + W &gt; N</code>, every read set overlaps every write set in at least one node, so at least one of the replies carries the latest acknowledged write. That is the <dfn>quorum condition</dfn>. With <code>N = 3</code>, the usual choice is <code>W = 2, R = 2</code>: one node can be down for both reads and writes.</p>
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 286" role="img" aria-label="Quorum overlap: with N=5, W=3, R=3 read and write sets always share a node; with W=2, R=2 they can miss; a sloppy quorum can miss even when R plus W exceeds N">
+<text class="t b" x="20" y="34" data-show="1">N = 5, W = 3, R = 3: R + W = 6 &gt; 5</text>
+<text class="t b" x="20" y="34" data-show="2">N = 5, W = 2, R = 2: R + W = 4, not &gt; 5</text>
+<text class="t b" x="20" y="34" data-show="3">Sloppy quorum: home replicas n1 to n3, N = 3, W = 2, R = 2</text>
+<g data-show="1">
+<circle class="n good" cx="120" cy="150" r="28"/><text class="t b mid" x="120" y="147">n1</text><text class="t mono mid" x="120" y="163">v2</text>
+<circle class="n good" cx="240" cy="150" r="28"/><text class="t b mid" x="240" y="147">n2</text><text class="t mono mid" x="240" y="163">v2</text>
+<circle class="n good" cx="360" cy="150" r="28"/><text class="t b mid" x="360" y="147">n3</text><text class="t mono mid" x="360" y="163">v2</text>
+<circle class="n db" cx="480" cy="150" r="28"/><text class="t b mid" x="480" y="147">n4</text><text class="t mono mid" x="480" y="163">v1</text>
+<circle class="n db" cx="600" cy="150" r="28"/><text class="t b mid" x="600" y="147">n5</text><text class="t mono mid" x="600" y="163">v1</text>
+</g>
+<g data-show="1"><path d="M86,112 V102 H394 V112" style="fill:none;stroke:var(--accent);stroke-width:2"/><text class="t sm b mid accent" x="240.0" y="92">write acked by 3</text></g>
+<g data-show="1"><path d="M326,188 V198 H634 V188" style="fill:none;stroke:var(--accent);stroke-width:2"/><text class="t sm b mid accent" x="480.0" y="216">read asks 3</text></g>
+<circle cx="360" cy="150" r="35" data-show="1" style="fill:none;stroke:var(--accent);stroke-width:2;stroke-dasharray:4 3"/>
+<g data-show="2">
+<circle class="n good" cx="120" cy="150" r="28"/><text class="t b mid" x="120" y="147">n1</text><text class="t mono mid" x="120" y="163">v2</text>
+<circle class="n good" cx="240" cy="150" r="28"/><text class="t b mid" x="240" y="147">n2</text><text class="t mono mid" x="240" y="163">v2</text>
+<circle class="n db" cx="360" cy="150" r="28"/><text class="t b mid" x="360" y="147">n3</text><text class="t mono mid" x="360" y="163">v1</text>
+<circle class="n db" cx="480" cy="150" r="28"/><text class="t b mid" x="480" y="147">n4</text><text class="t mono mid" x="480" y="163">v1</text>
+<circle class="n db" cx="600" cy="150" r="28"/><text class="t b mid" x="600" y="147">n5</text><text class="t mono mid" x="600" y="163">v1</text>
+</g>
+<g data-show="2"><path d="M86,112 V102 H274 V112" style="fill:none;stroke:var(--accent);stroke-width:2"/><text class="t sm b mid accent" x="180.0" y="92">write acked by 2</text></g>
+<g data-show="2"><path d="M446,188 V198 H634 V188" style="fill:none;stroke:var(--d-red);stroke-width:2"/><text class="t sm b mid red" x="540.0" y="216">read asks 2: both v1</text></g>
+<g data-show="3">
+<circle class="n db" cx="120" cy="150" r="28"/><text class="t b mid" x="120" y="147">n1</text><text class="t mono mid" x="120" y="163">v1</text>
+<circle class="n db" cx="240" cy="150" r="28"/><text class="t b mid" x="240" y="147">n2</text><text class="t mono mid" x="240" y="163">v1</text>
+<circle class="n good" cx="360" cy="150" r="28"/><text class="t b mid" x="360" y="147">n3</text><text class="t mono mid" x="360" y="163">v2</text>
+<circle class="n good" cx="480" cy="150" r="28"/><text class="t b mid" x="480" y="147">n4</text><text class="t mono mid" x="480" y="163">v2</text>
+<circle class="n db" cx="600" cy="150" r="28"/><text class="t b mid" x="600" y="147">n5</text><text class="t mono mid" x="600" y="163">v1</text>
+</g>
+<g data-show="3"><rect class="zone" x="72" y="56" width="336" height="26" rx="6"/><text class="t xs mute mid" x="240" y="73">home replicas for this key</text></g>
+<g data-show="3"><path d="M326,112 V102 H514 V112" style="fill:none;stroke:var(--accent);stroke-width:2"/><text class="t sm b mid accent" x="420.0" y="92"></text></g>
+<text class="t sm b accent mid" x="420" y="92" data-show="3">n4 holds a hint for n1</text>
+<g data-show="3"><path d="M86,188 V198 H274 V188" style="fill:none;stroke:var(--d-red);stroke-width:2"/><text class="t sm b mid red" x="180.0" y="216">read asks n1, n2: both v1</text></g>
+<g data-show="1"><text class="t sm" x="20" y="256">Any 3 nodes and any other 3 nodes out of 5 share at least one node. The read sees v1 and v2</text><text class="t sm" x="20" y="274">with their versions and returns v2 (and can repair the stale replicas it saw).</text></g>
+<g data-show="2"><text class="t sm" x="20" y="256">Two of five wrote, two of five read: 30% of random read sets miss the new value entirely.</text><text class="t sm" x="20" y="274">Low latency and high availability, bought with stale reads.</text></g>
+<g data-show="3"><text class="t sm" x="20" y="256">During a partition, n1 and n2 were unreachable, so the write landed on n3 and the stand-in n4.</text><text class="t sm" x="20" y="274">R + W &gt; N on paper, but the read and write sets do not overlap until the hint is handed back.</text></g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Overlap</button><button type="button" data-step="2" aria-pressed="false">No overlap</button><button type="button" data-step="3" aria-pressed="false">Sloppy quorum</button></div>
+</div>
+<figcaption><b>Quorum overlap.</b> The overlap guarantee is pure counting, and it only holds if writes and reads go to the same set of N nodes. A sloppy quorum trades that guarantee for write availability during partitions.</figcaption>
+</figure>
+<p>The counting argument is easy to check by brute force, and the same script gives the chance of a stale read when the condition does not hold. It assumes the worst moment: the write has reached exactly <code>W</code> replicas and nothing else yet.</p>
+<pre><code class="language-python">import itertools
+import random
+from math import comb
+
+
+def p_stale_exact(n, w, r):
+    """Chance a read of r random replicas misses all w replicas that acked the write
+    (assumes the write reached exactly those w nodes and nothing else yet)."""
+    return comb(n - w, r) / comb(n, r)
+
+
+def p_stale_simulated(n, w, r, trials=100_000, seed=7):
+    rng = random.Random(seed)
+    nodes = range(n)
+    stale = 0
+    for _ in range(trials):
+        has_new = set(rng.sample(nodes, w))
+        read_set = rng.sample(nodes, r)
+        stale += not has_new.intersection(read_set)
+    return stale / trials
+
+
+print(" N  W  R  R+W&gt;N  exact   simulated")
+for n, w, r in [(3, 1, 1), (3, 2, 1), (3, 2, 2), (5, 2, 2), (5, 3, 2), (5, 3, 3)]:
+    print(f"{n:2} {w:2} {r:2}  {str(r + w &gt; n):5}  {p_stale_exact(n, w, r):.3f}   {p_stale_simulated(n, w, r):.3f}")
+
+# Exhaustive check: every possible write set and read set overlap iff R + W &gt; N.
+for n in range(1, 8):
+    for w, r in itertools.product(range(1, n + 1), repeat=2):
+        always = all(set(ws) &amp; set(rs) for ws in itertools.combinations(range(n), w)
+                     for rs in itertools.combinations(range(n), r))
+        assert always == (r + w &gt; n)
+print("overlap guaranteed exactly when R + W &gt; N, checked for N = 1..7")
+
+#  N  W  R  R+W&gt;N  exact   simulated
+#  3  1  1  False  0.667   0.667
+#  3  2  1  False  0.333   0.334
+#  3  2  2  True   0.000   0.000
+#  5  2  2  False  0.300   0.300
+#  5  3  2  False  0.100   0.101
+#  5  3  3  True   0.000   0.000
+# overlap guaranteed exactly when R + W &gt; N, checked for N = 1..7</code></pre>
+<p>Real stale-read rates are far lower than the worst case, because replicas that were not in the write quorum usually receive the write milliseconds later anyway. Studies of Dynamo-style systems (the Probabilistically Bounded Staleness work from Berkeley) found that even <code>R = W = 1</code> reads usually return the latest write once a fraction of a second has passed. "Usually" is the point: it is a probability, not a guarantee.</p>
+
+<h3 id="quorum-limits">What quorums do not give you</h3>
+<p><code>R + W &gt; N</code> guarantees overlap, not linearizability. Several edge cases return stale or inconsistent data even with strict quorums:</p>
+<ul>
+<li><strong>Writes in flight.</strong> While a write has reached one of three replicas, one quorum read may see the new value and a later quorum read may not. To prevent that, the reader must write the newest value back to a quorum before returning (the ABD algorithm), which costs a second round trip.</li>
+<li><strong>Partial failures are not rolled back.</strong> If a write reaches one replica and then fails to reach <code>W</code>, the client gets an error, but the value stays on that replica and may later spread through repair. The "failed" write can win.</li>
+<li><strong>Concurrent writes with last-write-wins.</strong> Cassandra resolves conflicts per column by timestamp; with clock skew, a write that happened later can lose.</li>
+<li><strong>Sloppy quorums.</strong> If the write was accepted by stand-in nodes, the overlap argument no longer applies (step 3 above).</li>
+<li><strong>A replica restored from an old backup</strong> or rebuilt from a stale copy can drop below the latest value and break the count.</li>
+</ul>
+<p>Leaderless stores are a good fit for high-availability, write-heavy workloads that tolerate eventual consistency. When you need compare-and-set, Cassandra offers lightweight transactions that run Paxos per partition, at several times the latency.</p>
+
+<h3 id="sloppy-quorum">Sloppy quorums and hinted handoff</h3>
+<p>When some of a key's home replicas are unreachable, a strict quorum fails the write. A <dfn>sloppy quorum</dfn> instead accepts the write on other healthy nodes, which store it with a <dfn>hint</dfn> naming the intended owner. When the owner comes back, <dfn>hinted handoff</dfn> delivers the write to it. Dynamo used this so a shopping cart would always accept items. Cassandra stores hints for a bounded window (three hours by default) but does not count them towards the consistency level (except the weakest level, <code>ANY</code>), so its quorums stay strict.</p>
+
+<h3 id="repair">Read repair and anti-entropy</h3>
+<p>Replicas drift apart: missed writes during outages, hints that expired, dropped messages. Two mechanisms pull them back together.</p>
+<ul>
+<li><dfn>Read repair</dfn>: when a read sees different versions from different replicas, it writes the newest version back to the stale ones. Cheap, but only repairs keys that are read.</li>
+<li><dfn>Anti-entropy</dfn>: a background process compares replicas and copies missing data. Comparing every key would mean shipping the whole dataset, so replicas compare <dfn>Merkle trees</dfn> instead: hash trees where each leaf hashes a range of keys and each parent hashes its children. Equal roots mean equal data. Unequal roots send the comparison down only the branches that differ.</li>
+</ul>
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 278" role="img" aria-label="Two Merkle trees over the same key ranges; the roots differ, comparison descends only into differing branches and finds the n to s range">
+<text class="t b mid" x="175" y="22">Replica A</text>
+<path class="line" d="M175,70 L85,104"/>
+<path class="line" d="M175,70 L265,104"/>
+<path class="line" d="M85,134 L40,168"/>
+<path class="line" d="M85,134 L130,168"/>
+<path class="line" d="M265,134 L220,168"/>
+<path class="line" d="M265,134 L310,168"/>
+<rect class="n db" x="141" y="40" width="68" height="30" rx="5" style="stroke:var(--d-red);stroke-width:2.5"/><text class="t mono mid" x="175" y="59">7a1e</text>
+<rect class="n db" x="51" y="104" width="68" height="30" rx="5"/><text class="t mono mid" x="85" y="123">c41b</text>
+<rect class="n db" x="231" y="104" width="68" height="30" rx="5" style="stroke:var(--d-red);stroke-width:2.5"/><text class="t mono mid" x="265" y="123">e09d</text>
+<rect class="n db" x="6" y="168" width="68" height="30" rx="5"/><text class="t mono mid" x="40" y="187">51aa</text>
+<rect class="n db" x="96" y="168" width="68" height="30" rx="5"/><text class="t mono mid" x="130" y="187">0b7c</text>
+<rect class="n db" x="186" y="168" width="68" height="30" rx="5" style="stroke:var(--d-red);stroke-width:2.5"/><text class="t mono mid" x="220" y="187">93f0</text>
+<rect class="n db" x="276" y="168" width="68" height="30" rx="5"/><text class="t mono mid" x="310" y="187">d2e8</text>
+<text class="t xs mute mid" x="40" y="214">keys a-f</text>
+<text class="t xs mute mid" x="130" y="214">keys g-m</text>
+<text class="t xs mute mid" x="220" y="214">keys n-s</text>
+<text class="t xs mute mid" x="310" y="214">keys t-z</text>
+<text class="t b mid" x="545" y="22">Replica B</text>
+<path class="line" d="M545,70 L455,104"/>
+<path class="line" d="M545,70 L635,104"/>
+<path class="line" d="M455,134 L410,168"/>
+<path class="line" d="M455,134 L500,168"/>
+<path class="line" d="M635,134 L590,168"/>
+<path class="line" d="M635,134 L680,168"/>
+<rect class="n db" x="511" y="40" width="68" height="30" rx="5" style="stroke:var(--d-red);stroke-width:2.5"/><text class="t mono mid" x="545" y="59">b3c5</text>
+<rect class="n db" x="421" y="104" width="68" height="30" rx="5"/><text class="t mono mid" x="455" y="123">c41b</text>
+<rect class="n db" x="601" y="104" width="68" height="30" rx="5" style="stroke:var(--d-red);stroke-width:2.5"/><text class="t mono mid" x="635" y="123">6f27</text>
+<rect class="n db" x="376" y="168" width="68" height="30" rx="5"/><text class="t mono mid" x="410" y="187">51aa</text>
+<rect class="n db" x="466" y="168" width="68" height="30" rx="5"/><text class="t mono mid" x="500" y="187">0b7c</text>
+<rect class="n db" x="556" y="168" width="68" height="30" rx="5" style="stroke:var(--d-red);stroke-width:2.5"/><text class="t mono mid" x="590" y="187">1d4a</text>
+<rect class="n db" x="646" y="168" width="68" height="30" rx="5"/><text class="t mono mid" x="680" y="187">d2e8</text>
+<text class="t xs mute mid" x="410" y="214">keys a-f</text>
+<text class="t xs mute mid" x="500" y="214">keys g-m</text>
+<text class="t xs mute mid" x="590" y="214">keys n-s</text>
+<text class="t xs mute mid" x="680" y="214">keys t-z</text>
+<path class="line faint" d="M360,30 V220" style="stroke-dasharray:4 4"/>
+<text class="t sm" x="20" y="248">Roots differ, so compare children: the left subtrees match and are skipped, the right ones differ.</text>
+<text class="t sm" x="20" y="266">Five hash comparisons (root, two children, two leaves) narrow the difference to keys n-s; only that range is exchanged.</text>
+</svg>
+</div>
+<figcaption><b>Merkle tree comparison.</b> Red nodes differ. With a million key ranges, a tree of depth 20 locates a single differing range with about 20 levels of comparisons instead of a million hashes. Cassandra's <code>nodetool repair</code> builds these trees per token range.</figcaption>
+</figure>
+
+<h2 id="choosing">Choosing a replication strategy</h2>
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Single-leader</th><th>Multi-leader</th><th>Leaderless</th></tr></thead>
+<tbody>
+<tr><th>Who accepts writes</th><td>One node</td><td>One per region or device</td><td>Any replica (W of N)</td></tr>
+<tr><th>Write conflicts</th><td class="yes">None: one order</td><td class="no">Yes: need resolution</td><td class="no">Yes: versions, LWW or siblings</td></tr>
+<tr><th>Strong consistency possible</th><td class="yes">Yes: read from leader, sync replicas</td><td class="no">Not across leaders</td><td class="meh">Not by default</td></tr>
+<tr><th>Write availability on failure</th><td class="meh">Pause during failover</td><td class="yes">Each region independent</td><td class="yes">Survives N - W node failures</td></tr>
+<tr><th>Multi-region write latency</th><td class="no">Remote writes cross regions</td><td class="yes">Local</td><td class="meh">Local with LOCAL_QUORUM</td></tr>
+<tr><th>Operational complexity</th><td class="yes">Lowest</td><td class="no">Highest</td><td class="meh">Repair, tombstones, tuning</td></tr>
+<tr><th>Examples</th><td>PostgreSQL, MySQL, MongoDB, Kafka</td><td>EDB Postgres Distributed (BDR), CouchDB, Redis active-active</td><td>Cassandra, ScyllaDB, Riak</td></tr>
+</tbody></table></div>
+
+<h2 id="worked-example">Worked example: tuning N, W and R</h2>
+<p>A user-profile store runs Cassandra with <code>N = 3</code>, one replica in each of three availability zones. Profile reads run at 50,000 per second, writes at 2,000 per second. The latency of a request is roughly the latency of the slowest replica you wait for, so waiting for 2 of 3 is cheap (the second-fastest of three), and waiting for 3 of 3 means every slow replica hurts the tail. In the table, Stale is the worst-case stale-read chance from the script above, and Writes and Reads show how many failed nodes each operation survives.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>W, R</th><th>Overlap</th><th>Stale</th><th>Writes</th><th>Reads</th><th>Use when</th></tr></thead>
+<tbody>
+<tr><th>1, 1</th><td class="no">No</td><td class="num">66.7%</td><td>2 nodes down</td><td>2 nodes down</td><td>Metrics, caches, "last seen"</td></tr>
+<tr><th>2, 1</th><td class="no">No</td><td class="num">33.3%</td><td>1 node down</td><td>2 nodes down</td><td>Durable writes, fast reads that tolerate lag</td></tr>
+<tr><th>2, 2 (QUORUM)</th><td class="yes">Yes</td><td class="num">0%</td><td>1 node down</td><td>1 node down</td><td>The balanced default</td></tr>
+<tr><th>3, 1</th><td class="yes">Yes</td><td class="num">0%</td><td class="no">Any node down blocks writes</td><td>2 nodes down</td><td>Rarely written, very hot reads</td></tr>
+<tr><th>1, 3</th><td class="yes">Yes</td><td class="num">0%</td><td>2 nodes down</td><td class="no">Any node down blocks reads</td><td>Write-heavy, rarely read</td></tr>
+</tbody></table></div>
+<p>For profiles, <code>QUORUM</code> reads and writes are the right default: users edit their own profile and expect to see the change. Each profile read touches two replicas, so the cluster serves 100,000 replica reads per second plus 6,000 replica writes (every write goes to all three; the client waits for two). Across regions, use <code>LOCAL_QUORUM</code> so a request waits only for replicas in its own region and the other regions receive the write asynchronously.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+<li><strong>PostgreSQL</strong> ships WAL to hot standbys; Patroni with etcd handles leader election and fencing for most self-managed deployments. Logical replication feeds change data capture tools such as Debezium.</li>
+<li><strong>Amazon Aurora</strong> replicates the storage layer, not the database: six copies across three availability zones, with writes needing 4 of 6 and reads 3 of 6, so it survives losing a whole zone plus one more node for reads.</li>
+<li><strong>MongoDB</strong> replica sets elect a primary with a Raft-like protocol; <code>writeConcern: "majority"</code> makes a write survive failover, and <code>readConcern</code> controls whether reads can see writes that might still be rolled back.</li>
+<li><strong>Kafka</strong> keeps an in-sync replica set per partition; with <code>acks=all</code> and <code>min.insync.replicas=2</code>, a produce succeeds only once every in-sync replica has it, and is rejected if fewer than two replicas are in sync.</li>
+<li><strong>Cassandra</strong> exposes the quorum knobs per query (<code>ONE</code>, <code>QUORUM</code>, <code>LOCAL_QUORUM</code>, <code>ALL</code>), which makes it the clearest place to see these trade-offs in production.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>Whenever you draw a database box, say how it is replicated in one sentence: "PostgreSQL primary with one synchronous standby in another zone and async read replicas; reads that must see the user's own writes go to the primary." In a <a href="key-value-store.html">key-value store</a> design, leaderless replication with quorums is the core of the answer.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>What happens to writes in flight when the leader dies? (Async: lost; semi-sync: safe if the right follower is promoted.)</li>
+<li>A user updates their profile and sees the old one. Why, and how do you fix it cheaply?</li>
+<li>How do you prevent split brain? (Consensus-based election plus fencing tokens.)</li>
+<li>With N = 3, which W and R give strong reads, and is that linearizable? (W = R = 2 overlap; not linearizable on its own.)</li>
+<li>How do replicas that missed writes catch up? (Hinted handoff, read repair, Merkle-tree anti-entropy.)</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>Adding read replicas without mentioning lag or read-your-writes.</li>
+<li>Claiming R + W &gt; N makes the system strongly consistent.</li>
+<li>Automatic failover with no fencing.</li>
+<li>Multi-leader replication for data with uniqueness constraints, without a conflict strategy.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf" target="_blank" rel="noopener">Dynamo: Amazon's Highly Available Key-value Store</a><span>DeCandia et al., SOSP 2007. Leaderless quorums, sloppy quorums, hinted handoff and Merkle-tree anti-entropy.</span></li>
+<li><a href="https://www.postgresql.org/docs/current/high-availability.html" target="_blank" rel="noopener">PostgreSQL documentation: High Availability, Load Balancing, and Replication</a><span>Streaming replication, synchronous standbys and failover in a widely used single-leader system.</span></li>
+<li><a href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html" target="_blank" rel="noopener">How to do distributed locking</a><span>Martin Kleppmann, 2016. The clearest explanation of why fencing tokens are needed when a process pauses.</span></li>
+<li><a href="https://dl.acm.org/doi/10.1145/3035918.3056101" target="_blank" rel="noopener">Amazon Aurora: Design Considerations for High Throughput Cloud-Native Relational Databases</a><span>Verbitski et al., SIGMOD 2017. The 4-of-6 storage quorum across three zones.</span></li>
+<li><a href="https://dataintensive.net/" target="_blank" rel="noopener">Designing Data-Intensive Applications</a><span>Martin Kleppmann, O'Reilly, 2017. Chapter 5 is the best single treatment of replication lag, conflicts and quorums.</span></li>
+</ul>

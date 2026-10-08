@@ -1,0 +1,357 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">A shopper types <em>waterproof running shoes</em>. The catalog has 20 million products. <code>WHERE title LIKE '%running%'</code> cannot use a B-tree index, so it scans every row; it would not match "Run" or "shoe"; it cannot say which match is best; and it would take seconds. Search engines answer the same question in tens of milliseconds, tolerate plurals and typos, and rank the best results first. They do it with one data structure, the <dfn>inverted index</dfn>, plus a scoring function and a lot of engineering around keeping both fresh at scale.</p>
+<p>Search shows up in interviews in two ways: as a feature (product search, message search, log search) where you are expected to put a search engine next to the primary database and keep it in sync, and as a deep dive into how the index works. This chapter covers both. Prefix suggestions while typing are a different problem with different data structures, covered in the <a href="autocomplete.html">autocomplete</a> case study.</p>
+
+<h2 id="analysis">From text to terms</h2>
+<p>Before anything is indexed, text goes through an <dfn>analyzer</dfn>: a pipeline that turns a string into a list of <dfn>terms</dfn>. The same analyzer runs on documents at index time and on queries at search time, which is what makes "Running-Shoes" in a title match "running shoe" in a query.</p>
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 298" role="img" aria-label="Text analysis pipeline: tokenize, lowercase, remove stop words, stem, turning a product title into index terms">
+<text class="t sm b" x="20" y="39">Input</text>
+<rect class="n client" x="120" y="20" width="326" height="28" rx="5"/><text class="t mono" x="128" y="38">Waterproof Running-Shoes for TRAIL running!</text>
+<path class="e" d="M70,50 V66"/>
+<text class="t sm b" x="20" y="91">Tokenize</text>
+<rect class="n svc" x="120" y="72" width="88" height="28" rx="5"/><text class="t mono mid" x="164" y="90">Waterproof</text>
+<rect class="n svc" x="216.0" y="72" width="66" height="28" rx="5"/><text class="t mono mid" x="249" y="90">Running</text>
+<rect class="n svc" x="290.4" y="72" width="52" height="28" rx="5"/><text class="t mono mid" x="316" y="90">Shoes</text>
+<rect class="n svc" x="350.4" y="72" width="44" height="28" rx="5"/><text class="t mono mid" x="372" y="90">for</text>
+<rect class="n svc" x="402.4" y="72" width="52" height="28" rx="5"/><text class="t mono mid" x="428" y="90">TRAIL</text>
+<rect class="n svc" x="462.4" y="72" width="66" height="28" rx="5"/><text class="t mono mid" x="496" y="90">running</text>
+<path class="e" d="M70,102 V118"/>
+<text class="t sm b" x="20" y="143">Lowercase</text>
+<rect class="n svc" x="120" y="124" width="88" height="28" rx="5"/><text class="t mono mid" x="164" y="142">waterproof</text>
+<rect class="n svc" x="216.0" y="124" width="66" height="28" rx="5"/><text class="t mono mid" x="249" y="142">running</text>
+<rect class="n svc" x="290.4" y="124" width="52" height="28" rx="5"/><text class="t mono mid" x="316" y="142">shoes</text>
+<rect class="n svc" x="350.4" y="124" width="44" height="28" rx="5"/><text class="t mono mid" x="372" y="142">for</text>
+<rect class="n svc" x="402.4" y="124" width="52" height="28" rx="5"/><text class="t mono mid" x="428" y="142">trail</text>
+<rect class="n svc" x="462.4" y="124" width="66" height="28" rx="5"/><text class="t mono mid" x="496" y="142">running</text>
+<path class="e" d="M70,154 V170"/>
+<text class="t sm b" x="20" y="195">Stop words</text>
+<rect class="n svc" x="120" y="176" width="88" height="28" rx="5"/><text class="t mono mid" x="164" y="194">waterproof</text>
+<rect class="n svc" x="216.0" y="176" width="66" height="28" rx="5"/><text class="t mono mid" x="249" y="194">running</text>
+<rect class="n svc" x="290.4" y="176" width="52" height="28" rx="5"/><text class="t mono mid" x="316" y="194">shoes</text>
+<rect class="n ghost" x="350.4" y="176" width="44" height="28" rx="5"/><text class="t mono mute" x="372" y="194" style="text-decoration:line-through">for</text>
+<rect class="n svc" x="402.4" y="176" width="52" height="28" rx="5"/><text class="t mono mid" x="428" y="194">trail</text>
+<rect class="n svc" x="462.4" y="176" width="66" height="28" rx="5"/><text class="t mono mid" x="496" y="194">running</text>
+<path class="e" d="M70,206 V222"/>
+<text class="t sm b" x="20" y="247">Stem</text>
+<rect class="n db" x="120" y="228" width="88" height="28" rx="5"/><text class="t mono mid" x="164" y="246">waterproof</text>
+<rect class="n db" x="216.0" y="228" width="44" height="28" rx="5"/><text class="t mono mid" x="238" y="246">run</text>
+<rect class="n db" x="268.0" y="228" width="45" height="28" rx="5"/><text class="t mono mid" x="290" y="246">shoe</text>
+<rect class="n db" x="320.8" y="228" width="52" height="28" rx="5"/><text class="t mono mid" x="347" y="246">trail</text>
+<rect class="n db" x="380.8" y="228" width="44" height="28" rx="5"/><text class="t mono mid" x="403" y="246">run</text>
+<text class="t xs mute" x="120" y="286">positions are kept (run at 1 and 5; the removed "for" still counts), so phrase queries work</text>
+</svg>
+</div>
+<figcaption><b>An analysis chain.</b> Each stage throws away a distinction the user does not care about: case, punctuation, filler words, inflection. What remains are the terms that go into the index.</figcaption>
+</figure>
+<ul>
+<li><strong>Tokenization</strong> splits text into tokens on whitespace and punctuation. Languages without spaces (Chinese, Japanese, Thai) need dictionary or statistical segmenters, and the Unicode text segmentation rules handle most of the rest.</li>
+<li><strong>Normalization</strong> lowercases, applies Unicode normalization (so that the precomposed and combining forms of "é" match), and often folds accents ("café" to "cafe").</li>
+<li><strong>Stop words</strong> such as "the" and "for" carry little meaning and appear everywhere. Removing them shrinks the index; modern engines often keep them because BM25 already gives them almost no weight and phrases like "to be or not to be" need them.</li>
+<li><strong>Stemming</strong> strips suffixes by rule (Porter and Snowball stemmers: "running" to "run", "boots" to "boot"). <strong>Lemmatization</strong> uses a dictionary to find the base form ("mice" to "mouse"). Both trade precision for recall: "university" and "universe" stem to the same term in Porter.</li>
+<li><strong>Synonyms</strong> map "sneakers" and "trainers" to the same terms, either at index time or query time.</li>
+</ul>
+
+<h2 id="inverted-index">The inverted index</h2>
+<p>A normal index maps a document to its contents. An inverted index maps each term to the list of documents that contain it, called its <dfn>postings list</dfn>. Step through it with three product titles:</p>
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 330" role="img" aria-label="Three product titles turned into an inverted index of terms and postings lists, and a boolean AND query answered by intersecting two postings lists">
+<text class="t sm b" x="20" y="24">Documents</text>
+<rect class="n client" x="20" y="40" width="306" height="40" rx="6"/><text class="t b" x="32" y="65">D1</text><text class="t sm" x="62" y="65">Waterproof running shoes for trail running</text>
+<rect class="n client" x="20" y="92" width="306" height="40" rx="6"/><text class="t b" x="32" y="117">D2</text><text class="t sm" x="62" y="117">Lightweight road running shoes</text>
+<rect class="n client" x="20" y="144" width="306" height="40" rx="6"/><text class="t b" x="32" y="169">D3</text><text class="t sm" x="62" y="169">Waterproof hiking boots</text>
+<g data-show="2 3"><text class="t sm b" x="350" y="24">Term dictionary</text><text class="t sm b" x="490" y="24">Postings: doc (tf)</text>
+<rect class="n cache" x="350" y="36" width="110" height="24" rx="4"/><text class="t mono" x="360" y="52">boot</text>
+<path class="e" d="M460,48 H486"/>
+<rect class="n db" x="490" y="36" width="58" height="24" rx="4"/><text class="t mono mid" x="519" y="52">3</text>
+<rect class="n cache" x="350" y="66" width="110" height="24" rx="4"/><text class="t mono" x="360" y="82">hike</text>
+<path class="e" d="M460,78 H486"/>
+<rect class="n db" x="490" y="66" width="58" height="24" rx="4"/><text class="t mono mid" x="519" y="82">3</text>
+<rect class="n cache" x="350" y="96" width="110" height="24" rx="4"/><text class="t mono" x="360" y="112">lightweight</text>
+<path class="e" d="M460,108 H486"/>
+<rect class="n db" x="490" y="96" width="58" height="24" rx="4"/><text class="t mono mid" x="519" y="112">2</text>
+<rect class="n cache" x="350" y="126" width="110" height="24" rx="4"/><text class="t mono" x="360" y="142">road</text>
+<path class="e" d="M460,138 H486"/>
+<rect class="n db" x="490" y="126" width="58" height="24" rx="4"/><text class="t mono mid" x="519" y="142">2</text>
+<rect class="n cache" x="350" y="156" width="110" height="24" rx="4"/><text class="t mono" x="360" y="172">run</text>
+<path class="e" d="M460,168 H486"/>
+<rect class="n db" x="490" y="156" width="58" height="24" rx="4"/><text class="t mono mid" x="519" y="172">1 (2)</text>
+<rect class="n db" x="556" y="156" width="58" height="24" rx="4"/><text class="t mono mid" x="585" y="172">2</text>
+<rect class="n cache" x="350" y="186" width="110" height="24" rx="4"/><text class="t mono" x="360" y="202">shoe</text>
+<path class="e" d="M460,198 H486"/>
+<rect class="n db" x="490" y="186" width="58" height="24" rx="4"/><text class="t mono mid" x="519" y="202">1</text>
+<rect class="n db" x="556" y="186" width="58" height="24" rx="4"/><text class="t mono mid" x="585" y="202">2</text>
+<g data-show="3"><rect x="348" y="184" width="274" height="28" rx="6" style="fill:none;stroke:var(--accent);stroke-width:2"/></g>
+<rect class="n cache" x="350" y="216" width="110" height="24" rx="4"/><text class="t mono" x="360" y="232">trail</text>
+<path class="e" d="M460,228 H486"/>
+<rect class="n db" x="490" y="216" width="58" height="24" rx="4"/><text class="t mono mid" x="519" y="232">1</text>
+<rect class="n cache" x="350" y="246" width="110" height="24" rx="4"/><text class="t mono" x="360" y="262">waterproof</text>
+<path class="e" d="M460,258 H486"/>
+<rect class="n db" x="490" y="246" width="58" height="24" rx="4"/><text class="t mono mid" x="519" y="262">1</text>
+<rect class="n db" x="556" y="246" width="58" height="24" rx="4"/><text class="t mono mid" x="585" y="262">3</text>
+<g data-show="3"><rect x="348" y="244" width="274" height="28" rx="6" style="fill:none;stroke:var(--accent);stroke-width:2"/></g>
+</g>
+<g data-show="3"><rect x="488" y="184" width="62" height="28" rx="6" style="fill:none;stroke:var(--d-green);stroke-width:2.5"/></g>
+<g data-show="3"><rect x="488" y="244" width="62" height="28" rx="6" style="fill:none;stroke:var(--d-green);stroke-width:2.5"/></g>
+<g data-show="1"><text class="t sm" x="20" y="300">Each document is analysed into terms. "for" is dropped, "running" becomes run, "hiking" becomes hike.</text><text class="t sm mute" x="20" y="318">Documents get small integer ids in the order they are added.</text></g>
+<g data-show="2"><text class="t sm" x="20" y="300">The index flips the relation: for every term, a sorted list of the documents that contain it.</text><text class="t sm mute" x="20" y="318">Postings also store term frequency and positions; run appears twice in D1.</text></g>
+<g data-show="3"><text class="t sm" x="20" y="300">waterproof AND shoe: walk both sorted lists with two pointers. [1, 3] and [1, 2] meet at 1, so D1 matches.</text><text class="t sm mute" x="20" y="318">Cost is proportional to the list lengths, never to the number of documents.</text></g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Documents</button><button type="button" data-step="2" aria-pressed="false">Build index</button><button type="button" data-step="3" aria-pressed="false">AND query</button></div>
+</div>
+<figcaption><b>Building and querying an inverted index.</b> The term dictionary is sorted, so finding a term is a binary search (or an automaton lookup); postings are sorted by document id, so combining them is a linear merge.</figcaption>
+</figure>
+<p>Real postings lists hold more than document ids:</p>
+<ul>
+<li><strong>Term frequency</strong> per document, for scoring.</li>
+<li><strong>Positions</strong> of each occurrence, for phrase queries: <code>"running shoes"</code> matches only where <code>shoe</code> appears at the position right after <code>run</code>.</li>
+<li><strong>Compression.</strong> Document ids are stored as gaps between consecutive ids (1000, 1003, 1010 becomes 1000, 3, 7), and the small gaps are bit-packed in blocks. Lucene packs blocks of 128 gaps, so a postings list costs a few bits per entry.</li>
+<li><strong>Skip data</strong>, so an intersection can jump ahead in a long list instead of reading every entry.</li>
+</ul>
+<p>The term dictionary itself is stored compactly: Lucene uses a finite state transducer (FST), which shares prefixes and suffixes between terms and fits in memory even for hundreds of millions of terms. The same automaton machinery makes fuzzy queries ("shoos" within edit distance 1 of "shoes") fast.</p>
+
+<h3 id="boolean-queries">Boolean queries</h3>
+<p>Because postings are sorted by document id, boolean operators are merges:</p>
+<ul>
+<li><strong>AND</strong>: intersect. Walk both lists with a pointer each and advance the one with the smaller id; output ids present in both. Start from the shortest list and use skip data to leap through the longest, so <code>waterproof AND shoe</code> costs roughly the length of the rarer term's list.</li>
+<li><strong>OR</strong>: union, merging lists with a heap.</li>
+<li><strong>NOT</strong>: difference, skipping ids that appear in the excluded list.</li>
+</ul>
+<p>Most real queries are not strict booleans. A search box query is usually "OR the terms, then rank", with a minimum number of terms that must match, so a document matching two of three words can still appear below documents matching all three.</p>
+
+<h2 id="ranking">Ranking: TF-IDF and BM25</h2>
+<p>Matching finds candidates; <dfn>ranking</dfn> orders them. Classic relevance scoring rests on two observations:</p>
+<ul>
+<li><strong>Term frequency (tf).</strong> A document that mentions "waterproof" several times is probably more about waterproofing than one that mentions it once.</li>
+<li><strong>Inverse document frequency (idf).</strong> A term that appears in few documents is more informative. Matching "gore-tex" says more than matching "shoe" in a shoe shop. With <code>N</code> documents and <code>n</code> containing the term, idf grows as <code>n</code> shrinks, roughly <code>log(N / n)</code>.</li>
+</ul>
+<p><dfn>TF-IDF</dfn> multiplies the two and sums over query terms. It has two flaws. Raw term frequency grows without limit, so a page repeating "running" fifty times beats a better page that says it twice. And long documents contain more of every term, so they win by sheer size. <dfn>BM25</dfn>, the default in Lucene, Elasticsearch, OpenSearch and Solr, fixes both:</p>
+<div class="calc">score(D, Q) = Σ over terms q in Q of
+              IDF(q) × f(q, D) × (k1 + 1) / ( f(q, D) + k1 × (1 - b + b × |D| / avgdl) )
+
+IDF(q)      = ln( 1 + (N - n(q) + 0.5) / (n(q) + 0.5) )      Lucene's form, always positive
+f(q, D)     = occurrences of q in D           |D| = length of D in terms
+avgdl       = average document length         N = documents, n(q) = documents containing q
+k1 = 1.2    controls how fast term frequency saturates (Lucene default)
+b  = 0.75   controls how strongly long documents are penalised (Lucene default)</div>
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 680 300" role="img" aria-label="BM25 term-frequency saturation: raw term frequency grows linearly, BM25 flattens toward k1 plus 1, and a longer document scores lower for the same count">
+<path class="line faint" d="M70,250.0 H630"/><text class="t xs mute end" x="62" y="254.0">0</text>
+<path class="line faint" d="M70,183.3 H630"/><text class="t xs mute end" x="62" y="187.3">1</text>
+<path class="line faint" d="M70,116.7 H630"/><text class="t xs mute end" x="62" y="120.7">2</text>
+<path class="line faint" d="M70,50.0 H630"/><text class="t xs mute end" x="62" y="54.0">3</text>
+<text class="t xs mute mid" x="70.0" y="268">0</text>
+<text class="t xs mute mid" x="182.0" y="268">2</text>
+<text class="t xs mute mid" x="294.0" y="268">4</text>
+<text class="t xs mute mid" x="406.0" y="268">6</text>
+<text class="t xs mute mid" x="518.0" y="268">8</text>
+<text class="t xs mute mid" x="630.0" y="268">10</text>
+<text class="t xs mute mid" x="350.0" y="286">term frequency in the document</text>
+<text class="t xs mute" x="20" y="16">score contribution (× idf)</text>
+<path d="M70.0,250.0 L630.0,50.0" style="fill:none;stroke:var(--d-stroke);stroke-width:2;stroke-dasharray:5 4"/>
+<path d="M70.0,250.0 L75.6,238.7 L81.2,229.0 L86.8,220.7 L92.4,213.3 L98.0,206.9 L103.6,201.1 L109.2,196.0 L114.8,191.3 L120.4,187.1 L126.0,183.3 L131.6,179.9 L137.2,176.7 L142.8,173.7 L148.4,171.0 L154.0,168.5 L159.6,166.2 L165.2,164.0 L170.8,162.0 L176.4,160.1 L182.0,158.3 L187.6,156.7 L193.2,155.1 L198.8,153.6 L204.4,152.2 L210.0,150.9 L215.6,149.6 L221.2,148.5 L226.8,147.3 L232.4,146.3 L238.0,145.2 L243.6,144.3 L249.2,143.3 L254.8,142.4 L260.4,141.6 L266.0,140.8 L271.6,140.0 L277.2,139.3 L282.8,138.5 L288.4,137.8 L294.0,137.2 L299.6,136.5 L305.2,135.9 L310.8,135.3 L316.4,134.8 L322.0,134.2 L327.6,133.7 L333.2,133.2 L338.8,132.7 L344.4,132.2 L350.0,131.7 L355.6,131.3 L361.2,130.8 L366.8,130.4 L372.4,130.0 L378.0,129.6 L383.6,129.2 L389.2,128.8 L394.8,128.5 L400.4,128.1 L406.0,127.8 L411.6,127.4 L417.2,127.1 L422.8,126.8 L428.4,126.5 L434.0,126.2 L439.6,125.9 L445.2,125.6 L450.8,125.3 L456.4,125.1 L462.0,124.8 L467.6,124.5 L473.2,124.3 L478.8,124.0 L484.4,123.8 L490.0,123.6 L495.6,123.3 L501.2,123.1 L506.8,122.9 L512.4,122.7 L518.0,122.5 L523.6,122.3 L529.2,122.1 L534.8,121.9 L540.4,121.7 L546.0,121.5 L551.6,121.3 L557.2,121.1 L562.8,120.9 L568.4,120.8 L574.0,120.6 L579.6,120.4 L585.2,120.3 L590.8,120.1 L596.4,119.9 L602.0,119.8 L607.6,119.6 L613.2,119.5 L618.8,119.3 L624.4,119.2 L630.0,119.0" style="fill:none;stroke:var(--accent);stroke-width:2.5"/>
+<path d="M70.0,250.0 L75.6,243.3 L81.2,237.2 L86.8,231.7 L92.4,226.5 L98.0,221.8 L103.6,217.4 L109.2,213.3 L114.8,209.5 L120.4,206.0 L126.0,202.7 L131.6,199.6 L137.2,196.7 L142.8,193.9 L148.4,191.3 L154.0,188.9 L159.6,186.6 L165.2,184.4 L170.8,182.3 L176.4,180.3 L182.0,178.5 L187.6,176.7 L193.2,175.0 L198.8,173.3 L204.4,171.8 L210.0,170.3 L215.6,168.9 L221.2,167.5 L226.8,166.2 L232.4,164.9 L238.0,163.7 L243.6,162.6 L249.2,161.4 L254.8,160.4 L260.4,159.3 L266.0,158.3 L271.6,157.4 L277.2,156.4 L282.8,155.5 L288.4,154.7 L294.0,153.8 L299.6,153.0 L305.2,152.2 L310.8,151.5 L316.4,150.7 L322.0,150.0 L327.6,149.3 L333.2,148.6 L338.8,148.0 L344.4,147.3 L350.0,146.7 L355.6,146.1 L361.2,145.5 L366.8,145.0 L372.4,144.4 L378.0,143.9 L383.6,143.3 L389.2,142.8 L394.8,142.3 L400.4,141.8 L406.0,141.4 L411.6,140.9 L417.2,140.4 L422.8,140.0 L428.4,139.6 L434.0,139.1 L439.6,138.7 L445.2,138.3 L450.8,137.9 L456.4,137.6 L462.0,137.2 L467.6,136.8 L473.2,136.5 L478.8,136.1 L484.4,135.8 L490.0,135.4 L495.6,135.1 L501.2,134.8 L506.8,134.4 L512.4,134.1 L518.0,133.8 L523.6,133.5 L529.2,133.2 L534.8,132.9 L540.4,132.7 L546.0,132.4 L551.6,132.1 L557.2,131.9 L562.8,131.6 L568.4,131.3 L574.0,131.1 L579.6,130.8 L585.2,130.6 L590.8,130.4 L596.4,130.1 L602.0,129.9 L607.6,129.7 L613.2,129.4 L618.8,129.2 L624.4,129.0 L630.0,128.8" style="fill:none;stroke:var(--d-queue-s);stroke-width:2.5"/>
+<path d="M70,103.3 H630" style="fill:none;stroke:var(--accent);stroke-width:1;stroke-dasharray:2 4"/>
+<text class="t xs accent end" x="630" y="97.3">limit k1 + 1 = 2.2</text>
+<text class="t xs accent" x="484.4" y="116">BM25, average-length doc</text>
+<text class="t xs" x="417.2" y="158.4" style="fill:var(--d-queue-s)">BM25, doc twice as long</text>
+<text class="t xs mute end" x="327.6" y="123.3">raw tf (scaled)</text>
+</svg>
+</div>
+<figcaption><b>Term frequency saturation in BM25.</b> The first few occurrences of a term matter a lot, the tenth hardly at all, and the curve can never exceed <code>k1 + 1</code>. A document twice the average length needs more occurrences to earn the same score. Plotted for <code>k1 = 1.2</code> and <code>b = 0.75</code>.</figcaption>
+</figure>
+
+<h3 id="mini-engine">A small search engine</h3>
+<p>The whole pipeline (analyze, index, score with BM25) fits in about 50 lines. The fourth document stuffs "running" four times into a long title, to show saturation and length normalisation at work:</p>
+<pre><code class="language-python">import math
+import re
+from collections import Counter, defaultdict
+
+STOP = {"a", "an", "and", "for", "the", "of", "with"}
+
+
+def stem(word):
+    """A deliberately tiny stemmer: real engines use Porter/Snowball or dictionaries."""
+    for suffix, repl in (("ning", ""), ("ing", ""), ("es", "e"), ("s", "")):
+        if word.endswith(suffix) and len(word) - len(suffix) &gt;= 3:
+            return word[: len(word) - len(suffix)] + repl
+    return word
+
+
+def analyze(text):
+    return [stem(t) for t in re.findall(r"[a-z0-9]+", text.lower()) if t not in STOP]
+
+
+class Index:
+    def __init__(self, k1=1.2, b=0.75):              # Lucene / Elasticsearch defaults
+        self.k1, self.b = k1, b
+        self.postings = defaultdict(dict)             # term -&gt; {doc_id: term frequency}
+        self.length = {}                              # doc_id -&gt; number of terms
+
+    def add(self, doc_id, text):
+        terms = analyze(text)
+        self.length[doc_id] = len(terms)
+        for term, tf in Counter(terms).items():
+            self.postings[term][doc_id] = tf
+
+    def idf(self, term):
+        n, df = len(self.length), len(self.postings.get(term, {}))
+        return math.log(1 + (n - df + 0.5) / (df + 0.5))   # Lucene's BM25 idf, never negative
+
+    def search(self, query, require_all=False):
+        terms = analyze(query)
+        docs = [set(self.postings.get(t, {})) for t in terms]
+        candidates = set.intersection(*docs) if require_all else set.union(*docs)
+        avgdl = sum(self.length.values()) / len(self.length)
+        scores = {}
+        for d in candidates:
+            norm = self.k1 * (1 - self.b + self.b * self.length[d] / avgdl)
+            scores[d] = sum(self.idf(t) * tf * (self.k1 + 1) / (tf + norm)
+                            for t in terms if (tf := self.postings[t].get(d)))
+        return sorted(scores.items(), key=lambda kv: -kv[1])
+
+
+idx = Index()
+idx.add(1, "Waterproof running shoes for trail running")
+idx.add(2, "Lightweight road running shoes")
+idx.add(3, "Waterproof hiking boots")
+idx.add(4, "Running socks, running shorts and running shoes for running clubs")
+print(dict(idx.postings["run"]), dict(idx.postings["waterproof"]))
+for doc, score in idx.search("waterproof running shoes"):
+    print(doc, round(score, 3))
+print("AND:", [d for d, _ in idx.search("waterproof running shoes", require_all=True)])
+
+# {1: 2, 2: 1, 4: 4} {1: 1, 3: 1}
+# 1 1.54
+# 4 0.833
+# 3 0.829
+# 2 0.777
+# AND: [1]</code></pre>
+<p>Three things are worth reading off the output. D1 wins clearly: it matches all three terms. D4 mentions "running" four times but gains little over a single mention, because term frequency saturates and its length is penalised. And D3, which matches only "waterproof", nearly ties with D4 and beats D2, which matches two terms: "waterproof" appears in 2 of 4 documents while "run" and "shoe" appear in 3, so it carries more weight. The tiny stemmer here turns "hiking" into "hik"; real engines use Snowball stemmers or dictionaries.</p>
+<p>Production ranking layers more on top: field boosts (a match in the title counts more than in the description), recency and popularity signals, personalisation, and increasingly a second-stage learning-to-rank or neural re-ranker that rescores the top few hundred BM25 results. Vector search (approximate nearest neighbour indexes such as HNSW, built into Lucene since version 9) adds semantic matching, and hybrid systems combine both scores.</p>
+
+<h2 id="architecture">Scaling the index</h2>
+<h3 id="index-sharding">Document vs term partitioning</h3>
+<p>An index too big or too busy for one machine is split into shards. There are two ways to cut it:</p>
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 310" role="img" aria-label="Document-partitioned index queried on every shard versus term-partitioned index queried only on the shards owning the query terms">
+<rect class="n svc" x="280" y="14" width="160" height="44" rx="8"/><text class="t b mid" x="360" y="34">Query node</text><text class="t xs mute mid" x="360" y="49">waterproof shoe</text>
+<rect class="zone" x="40" y="110" width="180" height="140" rx="10"/><text class="t sm b mid" x="130" y="130">shard 1</text>
+<rect class="zone" x="270" y="110" width="180" height="140" rx="10"/><text class="t sm b mid" x="360" y="130">shard 2</text>
+<rect class="zone" x="500" y="110" width="180" height="140" rx="10"/><text class="t sm b mid" x="590" y="130">shard 3</text>
+<g data-show="1">
+<text class="t xs mute mid" x="130" y="146">docs 0M to 1M</text>
+<text class="t sm mid" x="130" y="176">all terms,</text>
+<text class="t sm mid" x="130" y="194">local postings</text>
+<path class="e accent" d="M330,58 L130,106"/>
+<text class="t xs mute mid" x="130" y="236">top 10 + scores</text>
+<text class="t xs mute mid" x="360" y="146">docs 1M to 2M</text>
+<text class="t sm mid" x="360" y="176">all terms,</text>
+<text class="t sm mid" x="360" y="194">local postings</text>
+<path class="e accent" d="M360,58 L360,106"/>
+<text class="t xs mute mid" x="360" y="236">top 10 + scores</text>
+<text class="t xs mute mid" x="590" y="146">docs 2M to 3M</text>
+<text class="t sm mid" x="590" y="176">all terms,</text>
+<text class="t sm mid" x="590" y="194">local postings</text>
+<path class="e accent" d="M390,58 L590,106"/>
+<text class="t xs mute mid" x="590" y="236">top 10 + scores</text>
+<text class="t sm" x="20" y="280">Document partitioning: every shard holds a complete index over a slice of the documents. A query goes</text>
+<text class="t sm" x="20" y="298">to every shard, each returns its top k, and the query node merges. Writes touch one shard. The default.</text></g>
+<g data-show="2">
+<text class="t xs mute mid" x="130" y="146">terms a to h</text>
+<text class="t sm mid" x="130" y="176">full postings</text><text class="t sm mid" x="130" y="194">for its terms</text>
+<text class="t xs mute mid" x="360" y="146">terms i to r</text>
+<text class="t sm mid" x="360" y="176">full postings</text><text class="t sm mid" x="360" y="194">for its terms</text>
+<text class="t xs mute mid" x="590" y="146">terms s to z</text>
+<text class="t sm mid" x="590" y="176">full postings</text><text class="t sm mid" x="590" y="194">for its terms</text>
+<path class="e accent" d="M440,40 C520,40 590,60 590,106"/><text class="t xs accent" x="530" y="40">shoe, waterproof</text>
+<text class="t xs mute mid" x="590" y="236">both terms live here</text>
+<text class="t xs mute mid" x="130" y="236">idle</text><text class="t xs mute mid" x="360" y="236">idle</text>
+<text class="t sm" x="20" y="280">Term partitioning: each shard owns whole postings lists for some terms. A query touches only the shards of its</text>
+<text class="t sm" x="20" y="298">terms, but long lists must be shipped to intersect, hot terms make hot shards, and one write updates many shards.</text></g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Document partitioning</button><button type="button" data-step="2" aria-pressed="false">Term partitioning</button></div>
+</div>
+<figcaption><b>Two ways to shard an index.</b> Document partitioning is what Elasticsearch, OpenSearch, Solr and web search engines use in practice; term partitioning is mostly of theoretical interest because of its load and write problems.</figcaption>
+</figure>
+<p>With document partitioning, a search runs in two phases. In the <dfn>query phase</dfn>, every shard scores its own documents and returns the ids and scores of its top <code>k</code>; the coordinating node merges them into a global top <code>k</code>. In the <dfn>fetch phase</dfn> it retrieves the full documents for just those <code>k</code> ids. Deep pagination is expensive because page 500 needs the top 5,000 from every shard; use search-after cursors instead of offsets. Each shard computes idf from its own documents, which can skew scores when shards are small or unevenly filled; Elasticsearch's <code>dfs_query_then_fetch</code> mode gathers global term statistics first, at the cost of an extra round trip.</p>
+<p>The tail-latency arithmetic from <a href="sharding.html#cross-shard">Sharding</a> applies directly: a query fans out to every shard and waits for the slowest. Fewer, larger shards (Elasticsearch suggests roughly 10 to 50 GB each) keep fan-out down.</p>
+
+<h3 id="replicas">Replicas</h3>
+<p>Each shard has replicas on other nodes. They serve two purposes: availability (a node failure promotes a replica to primary) and read throughput (a query can use any copy of each shard). Search clusters scale reads by adding replicas and writes by adding shards, and the number of primary shards is fixed when an index is created, so plan for growth or use index aliases to roll over to new indexes. See <a href="replication.html">Replication</a>.</p>
+
+<h3 id="near-real-time">Near-real-time indexing: segments and refresh</h3>
+<p>Updating a compressed, sorted postings list in place for every new document would be ruinously expensive. Lucene borrows the <a href="indexing.html#lsm">LSM</a> idea instead:</p>
+<ol class="steps">
+<li><strong>Buffer.</strong> New documents are analysed and held in an in-memory buffer, and appended to a <dfn>translog</dfn> (Elasticsearch's write-ahead log) for durability.</li>
+<li><strong>Refresh.</strong> Periodically (every 1 second by default) the buffer is written as a new, small, immutable <dfn>segment</dfn>: a complete mini inverted index. Only now are those documents searchable. This is why Elasticsearch is called <dfn>near-real-time</dfn>: a write is visible within about a second, not immediately.</li>
+<li><strong>Search.</strong> A query runs over every segment and merges the results.</li>
+<li><strong>Merge.</strong> Background merges combine small segments into larger ones, as compaction does in an LSM tree. Deletes and updates mark the old document as deleted in a bitmap; the space is reclaimed when its segment is merged.</li>
+<li><strong>Flush.</strong> Less often, a Lucene commit fsyncs the segments and the translog can be trimmed.</li>
+</ol>
+<p>The refresh interval is a throughput knob. During a bulk reindex, set it to 30 seconds or disable it entirely, then restore it: fewer, bigger segments mean far less merge work.</p>
+
+<h2 id="syncing">Keeping the index in sync with the database</h2>
+<p>A search engine is almost never the system of record. Products, messages or tickets live in the primary database; the search index is a <strong>derived view</strong> that must follow it. How you feed it decides how often they disagree.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Approach</th><th>How</th><th>Problem</th></tr></thead>
+<tbody>
+<tr><th>Dual write</th><td>The service writes the database, then the index</td><td class="no">A crash between the two, or two concurrent updates arriving out of order, leaves them permanently different</td></tr>
+<tr><th>Periodic batch</th><td>Every N minutes, reindex rows changed since the last run</td><td class="meh">Minutes of lag; deletes are easy to miss</td></tr>
+<tr><th>Change data capture</th><td>Tail the database's replication log (Debezium to Kafka), an indexer consumes and upserts</td><td class="yes">Seconds of lag, nothing missed, ordered per row</td></tr>
+</tbody></table></div>
+<p>With CDC, the indexer must still cope with retries and reordering: use the row's version or the log position as an <strong>external version</strong> on each index request (Elasticsearch's <code>version_type=external</code>), so an older update arriving late is rejected rather than overwriting a newer one. Keep a full reindex path for mapping changes and disasters: build a new index from a snapshot of the database while CDC keeps the old one current, replay the changes since the snapshot, then switch an <dfn>index alias</dfn> from old to new in one atomic step. See <a href="event-streaming.html">Event Streaming</a> and <a href="cqrs-event-sourcing.html">CQRS</a> for the general pattern.</p>
+
+<h2 id="worked-example">Worked example: product search</h2>
+<p>A marketplace has 20 million products, 3,000 searches per second at peak, and about 300 product updates per second (prices and stock), with a target of p99 under 200 ms.</p>
+<div class="calc">Source size     20M products × ~4 KB JSON                 ≈ 80 GB
+Index size      ~1.2 × source (postings, stored fields, doc values) ≈ <span class="r">~100 GB</span>
+Primary shards  100 GB / ~25 GB per shard                 = <span class="r">4 primaries</span>
+Query load      3,000 searches/s × 4 shards               = 12,000 shard-searches/s
+Per node        16 cores, ~10 ms CPU per shard-search     ≈ 1,600 shard-searches/s
+Nodes           12,000 / 1,600 ≈ 7.5 nodes fully busy  →  <span class="r">12 nodes</span> at ~63% CPU
+Copies          4 primaries × 3 copies (1 primary + 2 replicas) = 12 shard copies, one per node
+Writes          300 updates/s × 3 copies                  ≈ 900 indexing ops/s, refresh every 1 s</div>
+<p>Notes on the design. Products are indexed with a title field (heavily boosted), brand, category, description, and facet fields (price, size, colour) stored as doc values for aggregations. The catalog database feeds the index through CDC, so a price change is searchable in about two seconds. Stock is filtered at query time from a frequently refreshed field rather than hiding out-of-stock items at index time. Facet counts and aggregations for popular queries are cached per shard (Elasticsearch's shard request cache, which by default caches only size=0 results, not hits), and the top suggestions come from the separate <a href="autocomplete.html">autocomplete</a> service.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+<li><strong>Apache Lucene</strong> is the library underneath Elasticsearch, OpenSearch and Solr: analyzers, FST term dictionaries, block-compressed postings, segments and BM25.</li>
+<li><strong>Elasticsearch</strong> adds distribution: shards, replicas, the query and fetch phases, and a JSON API. <strong>OpenSearch</strong> is the Apache-licensed fork of Elasticsearch 7.10.2 created by AWS in 2021 after Elastic changed its licence.</li>
+<li><strong>Web search engines</strong> use document-partitioned indexes at enormous scale; Google's 2003 paper "Web Search for a Planet" describes index shards each served by a pool of replicas, with a query fanned out to every shard.</li>
+<li><strong>Log search</strong> (Elasticsearch for logs, Splunk, Loki) stretches the model: time-based indexes rolled over daily and dropped whole, which is cheaper than deleting documents. Loki indexes only labels, not log text, and scans chunks instead.</li>
+<li><strong>Slack and GitHub</strong> run large search clusters over messages and code; GitHub built its own code search engine because general-purpose analyzers handle source code poorly.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>Whenever users search free text: products, posts, messages, documents, logs. Say: "The database stays the source of truth; I'll stream changes through CDC into an Elasticsearch index sharded by document, with replicas for query throughput. Results are near-real-time, about a second behind." Be ready to go one level deeper into the inverted index and BM25.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>How does the inverted index answer a two-word query? (Look up both postings lists, intersect or union, score.)</li>
+<li>Why does a just-written document not show up in search? (Refresh interval, segments.)</li>
+<li>How do you keep the index consistent with the database? (CDC, external versions, alias swap for reindexing.)</li>
+<li>Why BM25 instead of raw term counts? (Saturation and length normalisation.)</li>
+<li>How would you shard a 2 TB index, and what happens to tail latency?</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>Using <code>LIKE '%term%'</code> on the primary database for user-facing search.</li>
+<li>Treating the search index as the system of record.</li>
+<li>Dual writes from the application to the database and the index.</li>
+<li>Expecting read-your-writes from a search engine without discussing refresh.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://nlp.stanford.edu/IR-book/" target="_blank" rel="noopener">Introduction to Information Retrieval</a><span>Manning, Raghavan and Schütze, Cambridge University Press, 2008, free online. Inverted indexes, postings compression, tf-idf and distributed indexing.</span></li>
+<li><a href="https://doi.org/10.1561/1500000019" target="_blank" rel="noopener">The Probabilistic Relevance Framework: BM25 and Beyond</a><span>Robertson and Zaragoza, Foundations and Trends in Information Retrieval, 2009. Where BM25 comes from, by its authors.</span></li>
+<li><a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/near-real-time.html" target="_blank" rel="noopener">Elasticsearch: near real-time search</a><span>Segments, refresh and why new documents become searchable after about a second.</span></li>
+<li><a href="https://lucene.apache.org/core/" target="_blank" rel="noopener">Apache Lucene</a><span>The search library under Elasticsearch, OpenSearch and Solr; its documentation covers analyzers, codecs and similarity.</span></li>
+</ul>

@@ -1,0 +1,401 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">Two teams build the same order history page. One models entities first, normalizes them nicely, and discovers the page needs five joins across 400 million rows. The other starts from the page: "show a user's 20 most recent orders with their totals", and stores exactly that shape under exactly that key. Both schemas are "correct". Only one serves the page in 5 ms. <dfn>Data modeling</dfn> is deciding how data is shaped, keyed and duplicated so the operations that matter are cheap, the invariants that matter are easy to keep, and the model can still change next year.</p>
+<p>In an interview, the data model is where design meets reality. A good one makes the rest of the design obvious; a bad one forces scatter-gather queries, distributed transactions and caches to paper over it. This chapter covers the working method (access patterns first), normalization and when to break it, relationships in each kind of store, DynamoDB's single-table design, time-series models, primary keys, and changing a schema without downtime.</p>
+
+<h2 id="access-patterns">Start from access patterns</h2>
+<p>Before drawing tables, list what the system must do, with rough rates. For the online store used throughout this chapter:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Access pattern</th><th class="num">Rate</th><th>Shape of the answer</th></tr></thead>
+<tbody>
+<tr><td class="num">1</td><td>Get a user's profile and addresses</td><td class="num">2,000/s</td><td>One user, a few addresses</td></tr>
+<tr><td class="num">2</td><td>List a user's recent orders, newest first</td><td class="num">4,000/s</td><td>20 order summaries</td></tr>
+<tr><td class="num">3</td><td>Get one order with its line items</td><td class="num">6,000/s</td><td>One order, 1 to 50 items</td></tr>
+<tr><td class="num">4</td><td>Place an order, decrement stock</td><td class="num">350/s peak</td><td>Atomic multi-row write</td></tr>
+<tr><td class="num">5</td><td>Find pending orders older than an hour</td><td class="num">1/min</td><td>A few hundred rows</td></tr>
+<tr><td class="num">6</td><td>Revenue by category per week</td><td class="num">Daily</td><td>Aggregate over everything</td></tr>
+</tbody></table></div>
+<p>This list does most of the modeling work. Patterns 1 to 3 are key lookups that must be fast. Pattern 4 needs a transaction. Pattern 5 needs an index that only covers a small subset. Pattern 6 is analytics and belongs in a warehouse, not in the serving model at all. A relational database can serve all of this from a normalized schema plus the right <a href="indexing.html">indexes</a>; a key-value store needs the data pre-arranged per pattern. Either way you design from the list.</p>
+
+<h2 id="normalization">Normalization in practice</h2>
+<p><dfn>Normalization</dfn> organises tables so each fact is stored once. The textbook defines a series of normal forms; in practice the first three cover nearly every real mistake.</p>
+<div class="defs">
+<div><h4>1NF: atomic values</h4><p>Each column holds one value, no repeating groups. Violation: <code>tags = 'red,blue,xl'</code> in one column. You cannot index or join on a tag, and updating one means string surgery. Fix: a <code>product_tags</code> table (or a native array type, if the database can index it).</p></div>
+<div><h4>2NF: whole-key dependency</h4><p>In a table with a composite key, every column depends on the whole key. Violation: <code>order_items(order_id, line_no, order_date, ...)</code>, where <code>order_date</code> depends only on <code>order_id</code>. It repeats on every line and can disagree between lines.</p></div>
+<div><h4>3NF: nothing but the key</h4><p>No column depends on another non-key column. Violation: <code>orders(id, user_id, user_email)</code>: the email depends on <code>user_id</code>. When Asha changes her email, every order row must change, or some will show the old one.</p></div>
+</div>
+<p>The three failure modes normalization prevents are the <dfn>update anomaly</dfn> (one fact changed in some copies but not others), the <dfn>insert anomaly</dfn> (cannot record a product until someone orders it) and the <dfn>delete anomaly</dfn> (deleting the last order deletes the only record of a customer's address).</p>
+<div class="callout note">
+<div class="callout-title">A copy is not always a duplicate</div>
+<p><code>order_items.unit_price</code> looks like a copy of <code>products.price</code>. It is not: it records the price <em>paid at the time of purchase</em>, a different fact that must never change when the catalog price does. The same goes for the shipping address on an order. Ask "if the source changes, should this change too?" If the answer is no, it is its own fact and belongs in the normalized model.</p>
+</div>
+<figure class="fig wide">
+<div class="fig-frame">
+<svg viewBox="0 0 760 352" role="img" aria-label="Entity relationship diagram: users have many addresses and orders, orders have many order items, each item references a product, products and categories are many to many through a join table">
+<rect class="n db" x="10" y="20" width="170" height="112" rx="7"/>
+<text class="t b" x="20" y="40">users</text><path class="line faint" d="M10,48 H180"/>
+<text class="t mono" x="20" y="66">id</text>
+<text class="t xs mute end" x="172" y="66">PK</text>
+<text class="t mono" x="20" y="85">email</text>
+<text class="t xs mute end" x="172" y="85">UNIQUE</text>
+<text class="t mono" x="20" y="104">name</text>
+<text class="t mono" x="20" y="123">created_at</text>
+<rect class="n db" x="200" y="20" width="170" height="131" rx="7"/>
+<text class="t b" x="210" y="40">orders</text><path class="line faint" d="M200,48 H370"/>
+<text class="t mono" x="210" y="66">id</text>
+<text class="t xs mute end" x="362" y="66">PK</text>
+<text class="t mono" x="210" y="85">user_id</text>
+<text class="t xs mute end" x="362" y="85">FK</text>
+<text class="t mono" x="210" y="104">status</text>
+<text class="t mono" x="210" y="123">total</text>
+<text class="t mono" x="210" y="142">created_at</text>
+<rect class="n db" x="390" y="20" width="170" height="131" rx="7"/>
+<text class="t b" x="400" y="40">order_items</text><path class="line faint" d="M390,48 H560"/>
+<text class="t mono" x="400" y="66">order_id</text>
+<text class="t xs mute end" x="552" y="66">PK, FK</text>
+<text class="t mono" x="400" y="85">line_no</text>
+<text class="t xs mute end" x="552" y="85">PK</text>
+<text class="t mono" x="400" y="104">product_id</text>
+<text class="t xs mute end" x="552" y="104">FK</text>
+<text class="t mono" x="400" y="123">qty</text>
+<text class="t mono" x="400" y="142">unit_price</text>
+<rect class="n db" x="580" y="20" width="170" height="93" rx="7"/>
+<text class="t b" x="590" y="40">products</text><path class="line faint" d="M580,48 H750"/>
+<text class="t mono" x="590" y="66">id</text>
+<text class="t xs mute end" x="742" y="66">PK</text>
+<text class="t mono" x="590" y="85">name</text>
+<text class="t mono" x="590" y="104">price</text>
+<rect class="n db" x="10" y="210" width="170" height="112" rx="7"/>
+<text class="t b" x="20" y="230">addresses</text><path class="line faint" d="M10,238 H180"/>
+<text class="t mono" x="20" y="256">id</text>
+<text class="t xs mute end" x="172" y="256">PK</text>
+<text class="t mono" x="20" y="275">user_id</text>
+<text class="t xs mute end" x="172" y="275">FK</text>
+<text class="t mono" x="20" y="294">label</text>
+<text class="t mono" x="20" y="313">city</text>
+<rect class="n db" x="390" y="230" width="170" height="74" rx="7"/>
+<text class="t b" x="400" y="250">categories</text><path class="line faint" d="M390,258 H560"/>
+<text class="t mono" x="400" y="276">id</text>
+<text class="t xs mute end" x="552" y="276">PK</text>
+<text class="t mono" x="400" y="295">name</text>
+<rect class="n ext" x="580" y="210" width="170" height="74" rx="7"/>
+<text class="t b" x="590" y="230">product_categories</text><path class="line faint" d="M580,238 H750"/>
+<text class="t mono" x="590" y="256">product_id</text>
+<text class="t xs mute end" x="742" y="256">PK, FK</text>
+<text class="t mono" x="590" y="275">category_id</text>
+<text class="t xs mute end" x="742" y="275">PK, FK</text>
+<path class="line" d="M180,66 H200"/>
+<text class="t xs b accent mid" x="186" y="60">1</text><text class="t xs b accent mid" x="195" y="60">N</text>
+<path class="line" d="M370,66 H390"/>
+<text class="t xs b accent mid" x="376" y="60">1</text><text class="t xs b accent mid" x="385" y="60">N</text>
+<path class="line" d="M560,85 H580"/>
+<text class="t xs b accent mid" x="566" y="79">N</text><text class="t xs b accent mid" x="575" y="79">1</text>
+<path class="line" d="M95,135 V210"/>
+<text class="t xs b accent mid" x="103" y="150">1</text><text class="t xs b accent mid" x="103" y="204">N</text>
+<path class="line" d="M665,122 V210"/>
+<text class="t xs b accent mid" x="673" y="140">1</text><text class="t xs b accent mid" x="673" y="204">N</text>
+<path class="line" d="M580,266 H560"/>
+<text class="t xs b accent mid" x="574" y="260">N</text><text class="t xs b accent mid" x="566" y="260">1</text>
+<text class="t xs mute" x="200" y="200">orders 1:N order_items: an order has many lines</text>
+<text class="t xs mute" x="200" y="342">products N:M categories, through a join table</text>
+<text class="t xs mute" x="10" y="342">users 1:N addresses and orders</text>
+</svg>
+</div>
+<figcaption><b>The store in third normal form.</b> Every fact lives in one place. One-to-many relationships are a foreign key on the "many" side; the many-to-many between products and categories needs a join table whose primary key is the pair.</figcaption>
+</figure>
+
+<h3 id="denormalization">Denormalization, deliberately</h3>
+<p><dfn>Denormalization</dfn> stores data redundantly to make reads cheaper: copying the author's name onto every post, keeping <code>orders_count</code> on the user row, materialising a "user's recent orders" list. It is the right call when a read is far more frequent than the write that would invalidate it, or when the join it replaces would cross shards.</p>
+<p>Every denormalized copy needs an owner and a sync mechanism, chosen explicitly:</p>
+<ul>
+<li><strong>Same transaction.</strong> Update the counter in the transaction that inserts the order. Always consistent; only works when both live in one database (or one partition).</li>
+<li><strong>Materialized view or trigger.</strong> The database maintains it. Convenient; refresh cost and locking need watching.</li>
+<li><strong>Change data capture.</strong> A consumer of the change stream updates the copies asynchronously. Scales across systems; copies lag by seconds. See <a href="cqrs-event-sourcing.html">CQRS</a>.</li>
+</ul>
+<p>Rule of thumb: normalize the system of record, denormalize the read paths, and be able to rebuild every denormalized copy from the source.</p>
+
+<h2 id="relationships">Relationships across data models</h2>
+<p>The same three relationship shapes appear everywhere, but each data model handles them differently.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Relationship</th><th>Relational</th><th>Document</th><th>Wide-column / key-value</th></tr></thead>
+<tbody>
+<tr><th>1:1 (user, settings)</th><td>Same table, or a second table sharing the primary key</td><td>Embed</td><td>Same item or same partition</td></tr>
+<tr><th>1:few (user, addresses)</th><td>Foreign key on the child</td><td class="yes">Embed an array</td><td>Rows in the parent's partition</td></tr>
+<tr><th>1:many, unbounded (user, orders)</th><td>Foreign key plus an index on it</td><td class="meh">Separate collection with a parent id; embedding grows without limit</td><td class="yes">Parent key as partition key, child sorted by clustering key</td></tr>
+<tr><th>N:M (products, categories)</th><td class="yes">Join table</td><td class="meh">Array of ids on one side; query the other side by index</td><td class="meh">Two tables or item sets, one per direction, kept in sync</td></tr>
+</tbody></table></div>
+<figure class="fig wide">
+<div class="fig-frame">
+<svg viewBox="0 0 760 276" role="img" aria-label="The same model as documents: users embed addresses, orders embed line items with a price snapshot and reference the user and products by id, products embed category names">
+<text class="t sm b" x="10" y="22">users</text>
+<rect class="n db" x="10" y="30" width="230" height="168" rx="6"/>
+<text class="t mono accent" x="20" y="52" xml:space="preserve">{ "_id": 42,</text>
+<text class="t mono" x="20" y="71" xml:space="preserve">  "name": "Asha Rao",</text>
+<text class="t mono" x="20" y="90" xml:space="preserve">  "email": "asha@…",</text>
+<text class="t mono" x="20" y="109" xml:space="preserve">  "addresses": [</text>
+<text class="t mono" x="20" y="128" xml:space="preserve">    { "label": "home",</text>
+<text class="t mono" x="20" y="147" xml:space="preserve">      "city": "Pune" },</text>
+<text class="t mono" x="20" y="166" xml:space="preserve">    { "label": "work",</text>
+<text class="t mono" x="20" y="185" xml:space="preserve">      "city": "Mumbai" } ] }</text>
+<text class="t sm b" x="262" y="22">orders</text>
+<rect class="n db" x="262" y="30" width="240" height="187" rx="6"/>
+<text class="t mono accent" x="272" y="52" xml:space="preserve">{ "_id": 9001,</text>
+<text class="t mono accent" x="272" y="71" xml:space="preserve">  "user_id": 42,</text>
+<text class="t mono" x="272" y="90" xml:space="preserve">  "status": "PENDING",</text>
+<text class="t mono" x="272" y="109" xml:space="preserve">  "items": [</text>
+<text class="t mono accent" x="272" y="128" xml:space="preserve">    { "sku": "BK-1031",</text>
+<text class="t mono" x="272" y="147" xml:space="preserve">      "name": "Field Notes",</text>
+<text class="t mono" x="272" y="166" xml:space="preserve">      "unit_price": 42.50,</text>
+<text class="t mono" x="272" y="185" xml:space="preserve">      "qty": 1 }, … ],</text>
+<text class="t mono" x="272" y="204" xml:space="preserve">  "total": 64.50 }</text>
+<text class="t sm b" x="524" y="22">products</text>
+<rect class="n db" x="524" y="30" width="226" height="111" rx="6"/>
+<text class="t mono accent" x="534" y="52" xml:space="preserve">{ "_id": "BK-1031",</text>
+<text class="t mono" x="534" y="71" xml:space="preserve">  "name": "Field Notes",</text>
+<text class="t mono" x="534" y="90" xml:space="preserve">  "price": 44.00,</text>
+<text class="t mono" x="534" y="109" xml:space="preserve">  "categories": [</text>
+<text class="t mono" x="534" y="128" xml:space="preserve">    "books", "stationery" ] }</text>
+<path class="e dash" d="M262,71 H244"/>
+<path class="e dash" d="M436,124 C480,124 490,60 520,60"/>
+<text class="t xs mute" x="10" y="232">1:few, owned by the user:</text><text class="t xs mute" x="10" y="246">embed</text>
+<text class="t xs mute" x="262" y="250">1:N, read with the order: embed, with a</text><text class="t xs mute" x="262" y="264">snapshot of name and price at purchase</text>
+<text class="t xs mute" x="524" y="168">N:M to categories: embed the</text><text class="t xs mute" x="524" y="182">small, stable side as an array</text>
+<text class="t xs mute" x="524" y="212">product is shared by many orders:</text><text class="t xs mute" x="524" y="226">reference it by id (dashed)</text>
+</svg>
+</div>
+<figcaption><b>The same model as documents.</b> Data that belongs to one owner and is read with it is embedded. Data shared by many owners (products) is referenced by id. The order carries a snapshot of name and price, as the relational model does.</figcaption>
+</figure>
+<p>The deciding questions for embed versus reference: Is the child read with the parent almost every time? Is it owned by exactly one parent? Is the number of children bounded and small? Three yeses mean embed. A child shared between parents, or one that grows without bound (comments on a viral post, events from a device), gets its own collection or partition.</p>
+
+<h2 id="single-table">Single-table design in DynamoDB</h2>
+<p>DynamoDB has no joins and charges per request, so the goal is to answer each access pattern with one request. Every item has a <dfn>partition key</dfn> (PK), hashed to choose its partition, and an optional <dfn>sort key</dfn> (SK) that orders items within the partition. All items sharing a PK form an <dfn>item collection</dfn>, which a single <code>Query</code> can read in sort order, filtered by a sort key condition such as <code>begins_with</code> or a range.</p>
+<p><dfn>Single-table design</dfn> exploits that: put different entity types that are read together into the same item collection by giving them the same PK, and use typed, prefixed sort keys to tell them apart. The keys are generic strings (<code>PK</code>, <code>SK</code>) overloaded per entity.</p>
+<figure class="fig wide">
+<div class="fig-frame">
+<svg viewBox="0 0 760 346" role="img" aria-label="DynamoDB single-table layout: a user item collection holding profile, address and order summaries, an order item collection holding order metadata and items, and a sparse GSI for pending orders">
+<text class="t xs b" x="54" y="40">PK</text>
+<text class="t xs b" x="154" y="40">SK</text>
+<text class="t xs b" x="342" y="40">attributes</text>
+<text class="t xs b" x="524" y="40">GSI1PK</text>
+<text class="t xs b" x="640" y="40">GSI1SK</text>
+<rect class="zone" x="42" y="48" width="714" height="116" rx="6"/>
+<rect class="zone" x="42" y="170" width="714" height="88" rx="6"/>
+<text class="t mono" x="54" y="68">USER#42</text>
+<text class="t mono" x="154" y="68">#PROFILE</text>
+<text class="t xs mute" x="342" y="68">name, email</text>
+<text class="t mono" x="524" y="68"></text>
+<text class="t mono" x="640" y="68"></text>
+<path class="line faint" d="M46,78 H752"/>
+<text class="t mono" x="54" y="96">USER#42</text>
+<text class="t mono" x="154" y="96">ADDR#home</text>
+<text class="t xs mute" x="342" y="96">city=Pune</text>
+<text class="t mono" x="524" y="96"></text>
+<text class="t mono" x="640" y="96"></text>
+<path class="line faint" d="M46,106 H752"/>
+<text class="t mono" x="54" y="124">USER#42</text>
+<text class="t mono" x="154" y="124">ORDER#2026-10-07#9002</text>
+<text class="t xs mute" x="342" y="124">total=18.00</text>
+<text class="t mono" x="524" y="124"></text>
+<text class="t mono" x="640" y="124"></text>
+<path class="line faint" d="M46,134 H752"/>
+<text class="t mono" x="54" y="152">USER#42</text>
+<text class="t mono" x="154" y="152">ORDER#2026-10-02#9001</text>
+<text class="t xs mute" x="342" y="152">total=64.50</text>
+<text class="t mono accent" x="524" y="152">STATUS#PENDING</text>
+<text class="t mono accent" x="640" y="152">2026-10-02T09:14</text>
+<text class="t mono" x="54" y="190">ORDER#9001</text>
+<text class="t mono" x="154" y="190">META</text>
+<text class="t xs mute" x="342" y="190">user=42, status</text>
+<text class="t mono" x="524" y="190"></text>
+<text class="t mono" x="640" y="190"></text>
+<path class="line faint" d="M46,200 H752"/>
+<text class="t mono" x="54" y="218">ORDER#9001</text>
+<text class="t mono" x="154" y="218">ITEM#BK-1031</text>
+<text class="t xs mute" x="342" y="218">qty=1, price=42.50</text>
+<text class="t mono" x="524" y="218"></text>
+<text class="t mono" x="640" y="218"></text>
+<path class="line faint" d="M46,228 H752"/>
+<text class="t mono" x="54" y="246">ORDER#9001</text>
+<text class="t mono" x="154" y="246">ITEM#MG-220</text>
+<text class="t xs mute" x="342" y="246">qty=2, price=11.00</text>
+<text class="t mono" x="524" y="246"></text>
+<text class="t mono" x="640" y="246"></text>
+<path d="M30,108 H24 V160 H30" style="fill:none;stroke:var(--accent);stroke-width:2"/>
+<circle cx="14" cy="134.0" r="9" class="fill-accent"/><text class="t xs b mid" x="14" y="137.5" style="fill:var(--surface)">1</text>
+<path d="M30,174 H24 V254 H30" style="fill:none;stroke:var(--accent);stroke-width:2"/>
+<circle cx="14" cy="214.0" r="9" class="fill-accent"/><text class="t xs b mid" x="14" y="217.5" style="fill:var(--surface)">2</text>
+<path d="M30,52 H24 V76 H30" style="fill:none;stroke:var(--accent);stroke-width:2"/>
+<circle cx="14" cy="64.0" r="9" class="fill-accent"/><text class="t xs b mid" x="14" y="67.5" style="fill:var(--surface)">3</text>
+<text class="t xs b accent" x="20" y="286">1</text><text class="t sm" x="36" y="286">Query PK = USER#42, SK begins_with ORDER#, newest first, Limit 20: a user's order history.</text>
+<text class="t xs b accent" x="20" y="306">2</text><text class="t sm" x="36" y="306">Query PK = ORDER#9001: the order and all its items in one request, already sorted.</text>
+<text class="t xs b accent" x="20" y="326">3</text><text class="t sm" x="36" y="326">Query PK = USER#42, SK &lt; "ORDER#": profile and addresses. GSI1 (accent) indexes only pending orders, by date.</text>
+</svg>
+</div>
+<figcaption><b>Two item collections in one table.</b> The user's collection holds the profile, addresses and order summaries, sorted so the newest orders come first in a reverse query. The order's collection holds the order and its items. Only pending orders carry GSI1 attributes, so the index stays tiny.</figcaption>
+</figure>
+<div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Access pattern</th><th>Request</th></tr></thead>
+<tbody>
+<tr><td class="num">1</td><td>Profile and addresses</td><td><code>Query PK = USER#42, SK &lt; "ORDER#"</code> (<code>#PROFILE</code> and <code>ADDR#</code> sort before <code>ORDER#</code>)</td></tr>
+<tr><td class="num">2</td><td>Recent orders</td><td><code>Query PK = USER#42, begins_with(SK, "ORDER#")</code>, <code>ScanIndexForward = false</code>, <code>Limit = 20</code></td></tr>
+<tr><td class="num">3</td><td>Order with items</td><td><code>Query PK = ORDER#9001</code></td></tr>
+<tr><td class="num">4</td><td>Place order</td><td><code>TransactWriteItems</code>: order META, items, user's summary item, conditional stock decrements</td></tr>
+<tr><td class="num">5</td><td>Old pending orders</td><td><code>Query GSI1 PK = STATUS#PENDING, GSI1SK &lt; now - 1 h</code>; remove the GSI attributes when the order ships</td></tr>
+<tr><td class="num">6</td><td>Revenue by category</td><td>Not here: export the table to S3 and query it in a warehouse</td></tr>
+</tbody></table></div>
+<p>The details that make it work, and the ones that bite:</p>
+<ul>
+<li><strong>Sort key design is query design.</strong> <code>ORDER#2026-10-07#9002</code> sorts by date, so a reverse query returns newest first. Put the date before the id, and use ISO 8601 so string order equals time order.</li>
+<li><strong>Sparse indexes.</strong> A <dfn>global secondary index</dfn> (GSI) only contains items that have its key attributes. Setting <code>GSI1PK</code> only on pending orders gives an index of the few hundred pending orders, not all of them.</li>
+<li><strong>Hot partitions.</strong> <code>STATUS#PENDING</code> is a single partition key. At high write rates, shard it: <code>STATUS#PENDING#0</code> to <code>#9</code>, and query all ten. Each partition supports up to 3,000 read capacity units and 1,000 write capacity units per second (roughly 3,000 strongly consistent 4 KB reads or 1,000 1 KB writes).</li>
+<li><strong>Item limits.</strong> Items cap at 400 KB, and an item collection in a table with a local secondary index caps at 10 GB, so unbounded children belong in their own partitions.</li>
+<li><strong>Cost of flexibility.</strong> A new access pattern may need a new GSI or a backfill that rewrites items. Single-table design pays off when access patterns are known and stable, which is why many teams use one table per bounded context or service rather than one per company.</li>
+</ul>
+
+<h2 id="time-series">Time-series and append-only models</h2>
+<p>Some data is never updated, only appended: sensor readings, clicks, messages, ledger entries. Modeling it as immutable rows keyed by entity and time makes writes trivially conflict-free and reads sequential. The trap is the partition that grows forever. A sensor reporting once per second produces 86,400 rows a day; keyed by <code>sensor_id</code> alone, one partition grows without bound and becomes both huge and hot. <dfn>Bucketing</dfn> adds a time component to the partition key:</p>
+<div class="calc">PRIMARY KEY ((sensor_id, day), ts)
+  rows per partition   86,400 readings/day × ~50 B ≈ <span class="r">4.3 MB</span> per partition, bounded
+  read last hour       one partition, one sequential slice
+  read last 30 days    30 partitions, fetched in parallel
+  retention            drop or TTL whole days, never row-by-row deletes</div>
+<p>Pick the bucket so a partition stays comfortably small (Cassandra guidance is to stay well under 100 MB) and common queries touch few buckets. Discord uses the same idea for messages: partition by channel and a ten-day time bucket.</p>
+<p>A <dfn>ledger</dfn> is the append-only model applied to money: never update a balance in place, append a signed entry (<code>+64.50 order 9001</code>, <code>-64.50 refund 77</code>) and derive the balance by summing, with periodic snapshots so reads do not sum years of history. Every past state can be reconstructed, auditors can see every change, and concurrent writers never overwrite each other. This is the core of <a href="cqrs-event-sourcing.html">event sourcing</a>.</p>
+
+<h2 id="primary-keys">Choosing primary keys</h2>
+<h3 id="natural-surrogate">Natural or surrogate</h3>
+<p>A <dfn>natural key</dfn> comes from the domain: an email, an ISBN, a country code. A <dfn>surrogate key</dfn> is generated and means nothing: an integer or a UUID. Prefer surrogate keys for entities. Natural keys change (people change emails), turn out not to be unique (two products share a barcode after a supplier error), or leak personal data into URLs and logs. Keep the natural key as a separate column with a unique constraint. Natural keys are fine for immutable codes from a standard (<code>currency = 'EUR'</code>) and for join tables, whose key is naturally the pair of foreign keys.</p>
+
+<h3 id="uuid-vs-sequential">Random UUIDs, sequential ids and B-tree locality</h3>
+<p>Auto-increment integers are compact (8 bytes) and always insert at the right edge of the index. But they need a central counter, reveal how many orders you take a day to anyone who places two, and cannot be generated by clients or across shards without coordination. Random UUIDv4 fixes all three, at a cost that only shows up at scale: inserts land at random places in every B-tree index on the key.</p>
+<pre><code class="language-python">import bisect
+import itertools
+import random
+
+PAGE = 100                                    # keys per leaf page
+
+
+def load(keys):
+    """Insert keys into B-tree-like leaf pages; report page count, fill and recent footprint."""
+    firsts, pages, ids = [], [], []           # first key, contents and a stable id per page
+    new_id = itertools.count()
+    touched = []                              # page id that received each insert
+    for k in keys:
+        if not pages:
+            firsts, pages, ids = [k], [[k]], [next(new_id)]
+            touched.append(ids[0])
+            continue
+        i = max(bisect.bisect_right(firsts, k) - 1, 0)
+        page = pages[i]
+        bisect.insort(page, k)
+        firsts[i] = page[0]
+        touched.append(ids[i])
+        if len(page) &gt; PAGE:
+            # appending at the far right: keep the old page 90% full (as PostgreSQL does);
+            # anywhere else: split in half
+            rightmost = i == len(pages) - 1 and page[-1] == k
+            cut = int(PAGE * 0.9) if rightmost else len(page) // 2
+            pages[i:i + 1] = [page[:cut], page[cut:]]
+            firsts[i:i + 1] = [page[0], page[cut]]
+            ids[i + 1:i + 1] = [next(new_id)]
+    fill = sum(map(len, pages)) / (len(pages) * PAGE)
+    return len(pages), fill, len(set(touched[-10_000:]))
+
+
+n = 300_000
+rng = random.Random(3)
+for name, keys in [("sequential ids", range(n)), ("random UUIDv4", [rng.getrandbits(122) for _ in range(n)])]:
+    pages, fill, recent = load(keys)
+    print(f"{name:15} {pages:5} leaf pages, {fill:.0%} full, last 10,000 inserts touched {recent:5} pages")
+# sequential ids   3334 leaf pages, 90% full, last 10,000 inserts touched   112 pages
+# random UUIDv4    4286 leaf pages, 70% full, last 10,000 inserts touched  3794 pages</code></pre>
+<p>Random keys make the index about 30% bigger (pages split in half and settle around 70% full) and, more importantly, spread recent inserts across nearly every leaf page. Sequential keys keep the hot set to about a hundred pages. Once the index is larger than memory, every random insert risks a disk read, and the write-ahead log fills with full-page images. <dfn>Time-ordered ids</dfn> get the best of both: globally unique without coordination, yet roughly increasing. <strong>UUIDv7</strong> (RFC 9562, 2024) puts a 48-bit millisecond timestamp first, ULIDs do the same in a different encoding, and Snowflake-style 64-bit ids pack time, a machine id and a sequence. Use them for new tables. They still reveal creation time, which matters if that is sensitive. See <a href="id-generation.html">Distributed ID Generation</a>.</p>
+
+<h2 id="schema-evolution">Schema evolution without downtime</h2>
+<p>A schema change and a code deploy cannot happen at the same instant, and during a rolling deploy old and new code run side by side for minutes. So every change must be compatible with the code before it and after it. The standard technique is <dfn>expand and contract</dfn> (also called parallel change): first add the new shape alongside the old, migrate, and only remove the old shape once nothing uses it.</p>
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 740 330" role="img" aria-label="Expand and contract migration renaming a column: add the new column, dual write, backfill, switch reads, then stop writing and drop the old column">
+<rect class="zone" x="330" y="20" width="250" height="232" rx="10"/><text class="t xs mute" x="342" y="38">table users</text>
+<g data-show="1 2 3 4"><rect class="n db" x="360" y="50" width="190" height="64" rx="7"/><text class="t mono b mid" x="455" y="78">name</text></g>
+<g data-show="5"><rect x="360" y="50" width="190" height="64" rx="7" style="fill:var(--surface);stroke:var(--d-stroke);stroke-dasharray:4 4"/><text class="t mono mute mid" x="455" y="78" style="text-decoration:line-through">name</text><text class="t xs mute mid" x="455" y="96">dropped later</text></g>
+<g data-show="1"><rect x="360" y="170" width="190" height="64" rx="7" class="n good"/><text class="t mono b mid" x="455" y="198">display_name</text><text class="t xs mute mid" x="455" y="216">added, NULL everywhere</text></g>
+<g data-show="2 3 4 5"><rect x="360" y="170" width="190" height="64" rx="7" class="n db"/><text class="t mono b mid" x="455" y="198">display_name</text></g>
+<g data-show="2"><text class="t xs mute mid" x="455" y="216">new rows filled</text></g>
+<g data-show="3 4 5"><text class="t xs mute mid" x="455" y="216">every row filled</text></g>
+<rect class="n svc" x="30" y="110" width="150" height="56" rx="8"/>
+<text class="t b mid" x="105" y="143" data-show="1">app v1</text>
+<text class="t b mid" x="105" y="143" data-show="2">app v2</text>
+<text class="t b mid" x="105" y="143" data-show="3">app v2</text>
+<text class="t b mid" x="105" y="143" data-show="4">app v3</text>
+<text class="t b mid" x="105" y="143" data-show="5">app v4</text>
+<g data-show="1"><path class="e accent" d="M180,122 C260,122 280,74 356,74"/><path class="e green dash" d="M360,92 C280,92 262,136 184,136"/></g>
+<g data-show="2 3"><path class="e accent" d="M180,122 C260,122 280,74 356,74"/><path class="e green dash" d="M360,92 C280,92 262,136 184,136"/><path class="e accent" d="M180,154 C260,154 280,192 356,192"/></g>
+<g data-show="4"><path class="e accent" d="M180,122 C260,122 280,74 356,74"/><path class="e accent" d="M180,154 C260,154 280,192 356,192"/><path class="e green dash" d="M360,212 C280,212 262,160 184,160"/></g>
+<g data-show="5"><path class="e accent" d="M180,154 C260,154 280,192 356,192"/><path class="e green dash" d="M360,212 C280,212 262,160 184,160"/></g>
+<g data-show="3"><rect class="n ext" x="610" y="112" width="110" height="52" rx="8"/><text class="t sm b mid" x="665" y="134">backfill job</text><text class="t xs mute mid" x="665" y="150">1,000 rows/batch</text><path class="e accent" d="M500,114 V166"/><path class="line" d="M610,138 H500" style="stroke-dasharray:3 3"/></g>
+<path class="e accent" d="M30,284 H52"/><text class="t xs mute" x="58" y="288">write</text><path class="e green dash" d="M100,284 H122"/><text class="t xs mute" x="128" y="288">read</text>
+<text class="t sm" x="20" y="318" data-show="1">Expand: add the new column as nullable, a metadata-only change. Nothing reads or writes it yet.</text>
+<text class="t sm" x="20" y="318" data-show="2">Dual write: deploy code that writes both columns on every insert and update. Reads still use name.</text>
+<text class="t sm" x="20" y="318" data-show="3">Backfill: copy old rows in small batches, throttled, so replicas and locks are never overwhelmed.</text>
+<text class="t sm" x="20" y="318" data-show="4">Switch reads: once every row is filled and verified, read display_name. Keep writing both for rollback.</text>
+<text class="t sm" x="20" y="318" data-show="5">Contract: stop writing name, wait until no deployed version reads it, then drop the column.</text>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Expand</button><button type="button" data-step="2" aria-pressed="false">Dual write</button><button type="button" data-step="3" aria-pressed="false">Backfill</button><button type="button" data-step="4" aria-pressed="false">Switch reads</button><button type="button" data-step="5" aria-pressed="false">Contract</button></div>
+</div>
+<figcaption><b>Renaming a column safely.</b> Five steps and at least three deploys instead of one <code>ALTER TABLE ... RENAME</code>. Every step can be rolled back, and at no point does running code see a schema it does not understand.</figcaption>
+</figure>
+<ul>
+<li><strong>Know which DDL is cheap.</strong> PostgreSQL 11+ adds a column with a constant default without rewriting the table; MySQL 8.0 has <code>ALGORITHM=INSTANT</code> for many column additions. Changing a column's type usually rewrites the table. Build indexes with <code>CREATE INDEX CONCURRENTLY</code> (PostgreSQL) or online DDL so writes are not blocked.</li>
+<li><strong>Use online schema change tools for big rewrites.</strong> GitHub's <code>gh-ost</code> and Percona's <code>pt-online-schema-change</code> build a shadow copy of the table, keep it in sync, and swap it in with a brief lock.</li>
+<li><strong>Set lock timeouts on migrations.</strong> An <code>ALTER</code> waiting behind a long transaction blocks every query queued behind it. A short <code>lock_timeout</code> and a retry are safer than an outage.</li>
+<li><strong>Document stores</strong> move the problem into code: store a <code>schema_version</code> in each document, have readers handle every version still on disk, and migrate lazily on write or with a background job.</li>
+<li><strong>Event and message schemas</strong> live forever in logs and queues. With Avro or Protobuf, only add optional fields, never reuse a field number, and enforce compatibility in a schema registry.</li>
+</ul>
+
+<h2 id="soft-deletes">Soft deletes</h2>
+<p>A <dfn>soft delete</dfn> marks a row as deleted (<code>deleted_at = now()</code>) instead of removing it, so it can be restored, audited or referenced by old orders. It is popular and has sharp edges:</p>
+<ul>
+<li><strong>Every query must filter it.</strong> One forgotten <code>WHERE deleted_at IS NULL</code> shows deleted data to users. Put the filter in a view or the ORM's default scope, and add partial indexes on the live rows.</li>
+<li><strong>Uniqueness breaks.</strong> A deleted user still holds their email, so they cannot sign up again. Use a partial unique index: <code>CREATE UNIQUE INDEX ON users (email) WHERE deleted_at IS NULL</code>.</li>
+<li><strong>Privacy law wins.</strong> GDPR erasure requests require really removing personal data. Soft-deleted rows must eventually be purged or anonymised.</li>
+<li><strong>Tables bloat</strong> with dead rows that every scan still reads.</li>
+</ul>
+<p>Alternatives: move deleted rows to an archive table in the same transaction, or rely on an audit log or event history for recovery, and hard-delete from the live table.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+<li><strong>Amazon</strong> teams popularised single-table DynamoDB design, and AWS's own guidance is to identify access patterns before designing tables, with as few tables as possible.</li>
+<li><strong>Discord</strong> stores messages partitioned by channel and time bucket, with Snowflake ids that sort by time, so "messages before this one" is a range scan.</li>
+<li><strong>GitHub</strong> built <code>gh-ost</code> to run schema migrations on large MySQL tables without triggers, using the binary log to keep the shadow table in sync.</li>
+<li><strong>Stripe and most payment systems</strong> model balances as append-only ledgers with derived balances, never as a mutable balance column alone.</li>
+<li><strong>PostgreSQL's JSONB</strong> lets relational schemas embed document-like attributes (a product's varying specs) while keeping core fields normalized, a common middle ground. See <a href="sql-vs-nosql.html">SQL vs NoSQL</a>.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>Right after requirements and estimation. Write the access patterns with rates first, then the tables or items with their keys, then name the index that serves each pattern. Point out which data is denormalized and how it stays in sync. Interviewers notice when the key design visibly follows from the queries.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>Why did you embed this and reference that?</li>
+<li>Show the query for "a user's last 20 orders". Which index serves it?</li>
+<li>Your NoSQL design needs a new query next quarter. What changes? (New GSI or table, backfill.)</li>
+<li>Auto-increment, UUIDv4 or something else for the primary key, and why?</li>
+<li>How would you rename a column on a 1-billion-row table with zero downtime?</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>Designing entities with no access patterns in mind, or access patterns with no rates.</li>
+<li>Denormalized copies with no owner and no sync path.</li>
+<li>Unbounded arrays inside documents or unbounded partitions in wide-column stores.</li>
+<li>A one-step <code>ALTER</code> that breaks the code still running during a deploy.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-general-nosql-design.html" target="_blank" rel="noopener">DynamoDB: NoSQL design best practices</a><span>AWS. Access-pattern-first design, item collections and why fewer tables is the goal.</span></li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9562" target="_blank" rel="noopener">RFC 9562: Universally Unique IDentifiers (UUIDs)</a><span>IETF, 2024. Defines UUIDv7 and explains the database locality problem with random UUIDs.</span></li>
+<li><a href="https://martinfowler.com/bliki/ParallelChange.html" target="_blank" rel="noopener">Parallel Change</a><span>Martin Fowler. The expand, migrate, contract pattern for changing interfaces and schemas safely.</span></li>
+<li><a href="https://github.com/github/gh-ost" target="_blank" rel="noopener">gh-ost: GitHub's online schema migration tool for MySQL</a><span>How large tables are migrated with a shadow table and binlog streaming instead of triggers.</span></li>
+</ul>

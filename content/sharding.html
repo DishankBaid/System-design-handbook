@@ -1,0 +1,434 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">Replication copies the same data to more machines. That helps reads and availability, but every replica still holds all the data and the leader still takes every write. When the dataset no longer fits on one machine, or the write rate exceeds what one machine can absorb, you have to split the data itself. <dfn>Sharding</dfn> (or <dfn>partitioning</dfn>) gives each machine a different subset of the rows, so capacity grows with the number of machines.</p>
+<p>The usual triggers, with rough numbers for a well-provisioned relational node:</p>
+<ul>
+<li><strong>Data size.</strong> Beyond a few tens of terabytes, backups, restores, index builds and replica rebuilds take many hours, and the working set no longer fits in memory.</li>
+<li><strong>Write throughput.</strong> Tens of thousands of writes per second is where a single primary's WAL, locks and disk start to saturate.</li>
+<li><strong>Blast radius.</strong> One giant database is one giant outage. Eight shards means a bad shard affects an eighth of users.</li>
+</ul>
+<p>Sharding is not free. Queries that span shards get slower, transactions across shards need special protocols, and moving data between shards while serving traffic is one of the harder operations in infrastructure. The whole game is choosing a partitioning scheme that keeps the common operations on a single shard. In practice each shard is itself replicated, so the two techniques combine: <a href="replication.html">Replication</a> for copies, sharding for capacity.</p>
+
+<h2 id="strategies">Partitioning strategies</h2>
+<p>Every scheme answers one question: given a key, which shard owns it? The three families differ in whether neighbouring keys stay together.</p>
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 328" role="img" aria-label="Range partitioning by username, range partitioning by date with a hot last shard, and hash partitioning that spreads writes evenly">
+<rect class="n client" x="285" y="16" width="150" height="40" rx="8"/><text class="t b mid" x="360" y="34">Writes</text><text class="t xs mute mid" x="360" y="48">5,000 inserts/s</text>
+<g data-show="1">
+<text class="t b" x="20" y="34">Range by username</text>
+<rect class="n db" x="30" y="120" width="150" height="120" rx="8"/>
+<text class="t sm b mid" x="105.0" y="140">shard 1: a to f</text>
+<path class="line faint" d="M40,148 H170"/>
+<text class="t mono mid" x="105.0" y="168">asha</text>
+<text class="t mono mid" x="105.0" y="186">ben</text>
+<text class="t mono mid" x="105.0" y="204">diego</text>
+<path class="e " d="M360,56 L105.0,116"/>
+<rect class="n db" x="200" y="120" width="150" height="120" rx="8"/>
+<text class="t sm b mid" x="275.0" y="140">shard 2: g to m</text>
+<path class="line faint" d="M210,148 H340"/>
+<text class="t mono mid" x="275.0" y="168">grace</text>
+<text class="t mono mid" x="275.0" y="186">kiran</text>
+<text class="t mono mid" x="275.0" y="204">lena</text>
+<text class="t mono mid" x="275.0" y="222">mei</text>
+<path class="e " d="M360,56 L275.0,116"/>
+<rect class="n db" x="370" y="120" width="150" height="120" rx="8"/>
+<text class="t sm b mid" x="445.0" y="140">shard 3: n to s</text>
+<path class="line faint" d="M380,148 H510"/>
+<text class="t mono mid" x="445.0" y="168">nora</text>
+<text class="t mono mid" x="445.0" y="186">omar</text>
+<text class="t mono mid" x="445.0" y="204">priya</text>
+<path class="e " d="M360,56 L445.0,116"/>
+<rect class="n db" x="540" y="120" width="150" height="120" rx="8"/>
+<text class="t sm b mid" x="615.0" y="140">shard 4: t to z</text>
+<path class="line faint" d="M550,148 H680"/>
+<text class="t mono mid" x="615.0" y="168">tariq</text>
+<text class="t mono mid" x="615.0" y="186">uma</text>
+<text class="t mono mid" x="615.0" y="204">zoe</text>
+<path class="e " d="M360,56 L615.0,116"/>
+<path class="e accent" d="M275,286 V244"/><text class="t sm accent" x="285" y="282">WHERE name BETWEEN 'g' AND 'h': one shard</text>
+<text class="t sm" x="20" y="316">Keys in sorted order: range scans stay on one shard, and split points can follow the data.</text>
+</g>
+<g data-show="2">
+<text class="t b" x="20" y="34">Range by order date</text>
+<rect class="n db" x="30" y="120" width="150" height="120" rx="8"/>
+<text class="t sm b mid" x="105.0" y="140">shard 1: Jan to Mar</text>
+<path class="line faint" d="M40,148 H170"/>
+<text class="t mono mid" x="105.0" y="168">#1003</text>
+<text class="t mono mid" x="105.0" y="186">#1871</text>
+<text class="t mono mid" x="105.0" y="204">#2410</text>
+<text class="t xs mute mid" x="105.0" y="230">no new writes</text>
+<rect class="n db" x="200" y="120" width="150" height="120" rx="8"/>
+<text class="t sm b mid" x="275.0" y="140">shard 2: Apr to Jun</text>
+<path class="line faint" d="M210,148 H340"/>
+<text class="t mono mid" x="275.0" y="168">#3388</text>
+<text class="t mono mid" x="275.0" y="186">#4102</text>
+<text class="t mono mid" x="275.0" y="204">#5020</text>
+<text class="t xs mute mid" x="275.0" y="230">no new writes</text>
+<rect class="n db" x="370" y="120" width="150" height="120" rx="8"/>
+<text class="t sm b mid" x="445.0" y="140">shard 3: Jul to Sep</text>
+<path class="line faint" d="M380,148 H510"/>
+<text class="t mono mid" x="445.0" y="168">#5893</text>
+<text class="t mono mid" x="445.0" y="186">#6631</text>
+<text class="t mono mid" x="445.0" y="204">#7208</text>
+<text class="t xs mute mid" x="445.0" y="230">no new writes</text>
+<rect class="n bad" x="540" y="120" width="150" height="120" rx="8"/>
+<text class="t sm b mid" x="615.0" y="140">shard 4: Oct to now</text>
+<path class="line faint" d="M550,148 H680"/>
+<text class="t mono mid" x="615.0" y="168">#7952</text>
+<text class="t mono mid" x="615.0" y="186">#8417</text>
+<text class="t mono mid" x="615.0" y="204">#9001</text>
+<path class="e red" d="M360,56 L615.0,116"/>
+<path class="flow" d="M360,56 L615.0,116"/>
+<text class="t sm red mid" x="615" y="262">100% of writes</text>
+<text class="t sm" x="20" y="316">Monotonic key: every new row lands in the last range. One shard melts, three sit idle.</text>
+</g>
+<g data-show="3">
+<text class="t b" x="20" y="34">Hash of order id</text>
+<rect class="n db" x="30" y="120" width="150" height="120" rx="8"/>
+<text class="t sm b mid" x="105.0" y="140">shard 1: 00-3f</text>
+<path class="line faint" d="M40,148 H170"/>
+<text class="t mono mid" x="105.0" y="168">#5020</text>
+<text class="t mono mid" x="105.0" y="186">#1871</text>
+<text class="t mono mid" x="105.0" y="204">#8417</text>
+<path class="e " d="M360,56 L105.0,116"/>
+<rect class="n db" x="200" y="120" width="150" height="120" rx="8"/>
+<text class="t sm b mid" x="275.0" y="140">shard 2: 40-7f</text>
+<path class="line faint" d="M210,148 H340"/>
+<text class="t mono mid" x="275.0" y="168">#9001</text>
+<text class="t mono mid" x="275.0" y="186">#3388</text>
+<text class="t mono mid" x="275.0" y="204">#6631</text>
+<path class="e " d="M360,56 L275.0,116"/>
+<rect class="n db" x="370" y="120" width="150" height="120" rx="8"/>
+<text class="t sm b mid" x="445.0" y="140">shard 3: 80-bf</text>
+<path class="line faint" d="M380,148 H510"/>
+<text class="t mono mid" x="445.0" y="168">#1003</text>
+<text class="t mono mid" x="445.0" y="186">#7952</text>
+<text class="t mono mid" x="445.0" y="204">#4102</text>
+<path class="e " d="M360,56 L445.0,116"/>
+<rect class="n db" x="540" y="120" width="150" height="120" rx="8"/>
+<text class="t sm b mid" x="615.0" y="140">shard 4: c0-ff</text>
+<path class="line faint" d="M550,148 H680"/>
+<text class="t mono mid" x="615.0" y="168">#2410</text>
+<text class="t mono mid" x="615.0" y="186">#5893</text>
+<text class="t mono mid" x="615.0" y="204">#7208</text>
+<path class="e " d="M360,56 L615.0,116"/>
+<text class="t sm accent mid" x="360" y="262">even writes; a range of order ids touches all four shards</text>
+<text class="t sm" x="20" y="316">Hashing scatters neighbours. Load is even, but range queries become scatter-gather.</text>
+</g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Range: username</button><button type="button" data-step="2" aria-pressed="false">Range: date</button><button type="button" data-step="3" aria-pressed="false">Hash</button></div>
+</div>
+<figcaption><b>Range vs hash partitioning.</b> Range partitioning preserves order, which is great for scans and terrible for monotonically increasing keys. Hash partitioning destroys order, which spreads load and makes range queries expensive.</figcaption>
+</figure>
+
+<h3 id="range">Range partitioning</h3>
+<p>Assign contiguous key ranges to shards: <code>a</code> to <code>f</code> on shard 1, <code>g</code> to <code>m</code> on shard 2, and so on, like volumes of an encyclopedia. A router keeps the table of split points. Range scans (<code>WHERE name BETWEEN 'g' AND 'h'</code>, "all events for sensor 17 in October") touch only the shards covering the range, often one. Split points can follow the data: when a range grows too big, split it in two. HBase regions, Bigtable tablets, CockroachDB and TiDB ranges, and MongoDB ranged sharding all work this way.</p>
+<p>The weakness is skew. If the key increases over time (a timestamp, an auto-increment id), every new write lands in the last range, so one shard takes all inserts while the others idle. The standard fix is to put something with spread in front: key by <code>(sensor_id, timestamp)</code> instead of <code>timestamp</code>, so writes spread across sensors and each sensor's history stays contiguous.</p>
+
+<h3 id="hash">Hash partitioning</h3>
+<p>Hash the key and partition by the hash: <code>shard = owner_of(hash(key))</code>. A good hash spreads even sequential keys uniformly, so load is balanced as long as no single key is hot. Cassandra (Murmur3 tokens), DynamoDB, Redis Cluster and MongoDB hashed sharding work this way. The cost is that neighbouring keys end up on different shards, so a range query on the key has to ask every shard.</p>
+<p>Never use <code>hash(key) % N</code> directly: changing <code>N</code> moves almost every key. Map hashes to a fixed set of slots or tokens instead, as described in <a href="consistent-hashing.html">Consistent Hashing</a>. A useful hybrid, popularised by Cassandra and DynamoDB, is a <strong>compound key</strong>: hash the first part to choose the shard, keep rows sorted by the second part within it. <code>PRIMARY KEY ((user_id), created_at)</code> spreads users across the cluster and keeps each user's timeline as one sorted range on one node.</p>
+
+<h3 id="directory">Directory-based partitioning</h3>
+<p>Keep an explicit lookup table from key (or tenant) to shard, stored in a small, replicated, heavily cached service. It is the most flexible scheme: you can place a large customer on dedicated hardware, move one tenant without touching others, or keep a country's data in its region. The cost is an extra lookup on every request (mitigated by caching), and a critical component that must never be wrong or unavailable. Multi-tenant SaaS systems often use it at the tenant level, with hash partitioning inside each shard.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Strategy</th><th>Range queries on the key</th><th>Load balance</th><th>Rebalancing</th><th>Typical use</th></tr></thead>
+<tbody>
+<tr><th>Range</th><td class="yes">One or few shards</td><td class="meh">Skews with monotonic or popular ranges</td><td class="yes">Split hot or large ranges</td><td>Time series per entity, ordered scans, HBase, CockroachDB</td></tr>
+<tr><th>Hash</th><td class="no">All shards</td><td class="yes">Even, unless one key is hot</td><td class="meh">Move slots or tokens</td><td>Key-value access, Cassandra, DynamoDB, Redis Cluster</td></tr>
+<tr><th>Directory</th><td class="meh">Depends on the layout</td><td class="yes">Whatever you assign</td><td class="yes">Move one entry at a time</td><td>Multi-tenant SaaS, data residency</td></tr>
+</tbody></table></div>
+
+<h2 id="shard-key">Choosing a shard key</h2>
+<p>The <dfn>shard key</dfn> (partition key) is the column that decides placement. It is the most consequential and least reversible decision in a sharded design, because changing it means rewriting every row. Judge candidates on four properties:</p>
+<ol class="steps">
+<li><strong>Cardinality.</strong> Many more distinct values than shards, so data can always be split further. <code>country</code> has about 200 values and one of them is the United States; it is a poor shard key on its own.</li>
+<li><strong>Even data and load.</strong> Not only rows but requests must spread. A key with uniform row counts can still concentrate traffic.</li>
+<li><strong>Query isolation.</strong> The hottest queries should include the shard key so they run on one shard. A design where the main query fans out to every shard has thrown away most of sharding's benefit.</li>
+<li><strong>Locality for transactions.</strong> Rows updated together should share a shard key, so the transaction stays on one node. Tenant id in a SaaS product is the classic winner: almost every query and transaction is within one tenant.</li>
+</ol>
+
+<h2 id="hotspots">Hotspots and celebrity keys</h2>
+<p>Hashing balances keys, not traffic. A celebrity with 100 million followers, a viral product, or one huge enterprise tenant can send a large fraction of all requests to one key, and therefore one shard. This simulation sends one million requests from 100,000 users with Zipf-like popularity to 16 hash-partitioned shards, then salts the ten hottest keys:</p>
+<pre><code class="language-python">import hashlib
+import random
+from collections import Counter
+
+SHARDS = 16
+
+
+def shard_of(key: str) -&gt; int:
+    return int.from_bytes(hashlib.md5(key.encode()).digest()[:8], "big") % SHARDS
+
+
+def load_per_shard(requests, hot_keys=frozenset(), salt_buckets=1, rng=None):
+    load = Counter()
+    for user in requests:
+        key = f"user:{user}"
+        if user in hot_keys:                       # spread a hot key over several sub-keys
+            key += f"#{rng.randrange(salt_buckets)}"
+        load[shard_of(key)] += 1
+    return [load[s] for s in range(SHARDS)]
+
+
+rng = random.Random(42)
+users = range(1, 100_001)
+weights = [1 / u ** 1.1 for u in users]           # Zipf-like popularity: user 1 is a celebrity
+requests = rng.choices(users, weights, k=1_000_000)
+
+plain = load_per_shard(requests)
+top = {u for u, _ in Counter(requests).most_common(10)}
+salted = load_per_shard(requests, top, salt_buckets=16, rng=rng)
+
+mean = len(requests) / SHARDS
+print(f"top user's share of all requests: {Counter(requests)[1] / len(requests):.1%}")
+print(f"busiest shard / mean, plain keys:   {max(plain) / mean:.2f}x")
+print(f"busiest shard / mean, top 10 salted: {max(salted) / mean:.2f}x")
+
+for fanout in (1, 4, 16, 64):                      # tail-latency amplification of scatter-gather
+    print(f"fan-out {fanout:2}: {1 - 0.99 ** fanout:5.1%} of queries wait on at least one shard's p99")
+# top user's share of all requests: 13.5%
+# busiest shard / mean, plain keys:   2.99x
+# busiest shard / mean, top 10 salted: 1.30x
+# fan-out  1:  1.0% of queries wait on at least one shard's p99
+# fan-out  4:  3.9% of queries wait on at least one shard's p99
+# fan-out 16: 14.9% of queries wait on at least one shard's p99
+# fan-out 64: 47.4% of queries wait on at least one shard's p99</code></pre>
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 258" role="img" aria-label="Bar charts of load per shard: with plain keys one shard carries 2.99 times the mean load; after salting the ten hottest keys the busiest shard carries 1.30 times the mean">
+<text class="t b" x="20" y="22">Plain user keys</text><text class="t xs mute" x="20" y="38">busiest shard 2.99× the mean</text>
+<path class="line faint" d="M44,232.0 H332"/>
+<text class="t xs mute end" x="38" y="236.0">0×</text>
+<path class="line faint" d="M44,175.3 H332"/>
+<text class="t xs mute end" x="38" y="179.3">1×</text>
+<path class="line faint" d="M44,118.7 H332"/>
+<text class="t xs mute end" x="38" y="122.7">2×</text>
+<path class="line faint" d="M44,62.0 H332"/>
+<text class="t xs mute end" x="38" y="66.0">3×</text>
+<rect x="48" y="196.9" width="12" height="35.1" rx="2" style="fill:var(--d-db-s);opacity:.85"/>
+<rect x="66" y="143.0" width="12" height="89.0" rx="2" style="fill:var(--d-db-s);opacity:.85"/>
+<rect x="84" y="194.0" width="12" height="38.0" rx="2" style="fill:var(--d-db-s);opacity:.85"/>
+<rect x="102" y="191.8" width="12" height="40.2" rx="2" style="fill:var(--d-db-s);opacity:.85"/>
+<rect x="120" y="180.4" width="12" height="51.6" rx="2" style="fill:var(--d-db-s);opacity:.85"/>
+<rect x="138" y="190.1" width="12" height="41.9" rx="2" style="fill:var(--d-db-s);opacity:.85"/>
+<rect x="156" y="160.6" width="12" height="71.4" rx="2" style="fill:var(--d-db-s);opacity:.85"/>
+<rect x="174" y="197.4" width="12" height="34.6" rx="2" style="fill:var(--d-db-s);opacity:.85"/>
+<rect x="192" y="195.7" width="12" height="36.3" rx="2" style="fill:var(--d-db-s);opacity:.85"/>
+<rect x="210" y="156.6" width="12" height="75.4" rx="2" style="fill:var(--d-db-s);opacity:.85"/>
+<rect x="228" y="182.1" width="12" height="49.9" rx="2" style="fill:var(--d-db-s);opacity:.85"/>
+<rect x="246" y="198.0" width="12" height="34.0" rx="2" style="fill:var(--d-db-s);opacity:.85"/>
+<rect x="264" y="62.6" width="12" height="169.4" rx="2" style="fill:var(--d-red);opacity:.85"/>
+<rect x="282" y="197.4" width="12" height="34.6" rx="2" style="fill:var(--d-db-s);opacity:.85"/>
+<rect x="300" y="164.6" width="12" height="67.4" rx="2" style="fill:var(--d-db-s);opacity:.85"/>
+<rect x="318" y="195.7" width="12" height="36.3" rx="2" style="fill:var(--d-db-s);opacity:.85"/>
+<path d="M44,175.3 H332" style="stroke:var(--accent);stroke-width:1.5;stroke-dasharray:5 4;fill:none"/>
+<text class="t xs mute mid" x="188" y="248">16 shards</text>
+<text class="t b" x="380" y="22">Top 10 keys salted 16 ways</text><text class="t xs mute" x="380" y="38">busiest shard 1.30× the mean</text>
+<path class="line faint" d="M404,232.0 H692"/>
+<text class="t xs mute end" x="398" y="236.0">0×</text>
+<path class="line faint" d="M404,175.3 H692"/>
+<text class="t xs mute end" x="398" y="179.3">1×</text>
+<path class="line faint" d="M404,118.7 H692"/>
+<text class="t xs mute end" x="398" y="122.7">2×</text>
+<path class="line faint" d="M404,62.0 H692"/>
+<text class="t xs mute end" x="398" y="66.0">3×</text>
+<rect x="408" y="158.3" width="12" height="73.7" rx="2" style="fill:var(--d-db-s);opacity:.85"/>
+<rect x="426" y="175.9" width="12" height="56.1" rx="2" style="fill:var(--d-db-s);opacity:.85"/>
+<rect x="444" y="184.4" width="12" height="47.6" rx="2" style="fill:var(--d-db-s);opacity:.85"/>
+<rect x="462" y="192.9" width="12" height="39.1" rx="2" style="fill:var(--d-db-s);opacity:.85"/>
+<rect x="480" y="159.5" width="12" height="72.5" rx="2" style="fill:var(--d-db-s);opacity:.85"/>
+<rect x="498" y="172.5" width="12" height="59.5" rx="2" style="fill:var(--d-db-s);opacity:.85"/>
+<rect x="516" y="183.3" width="12" height="48.7" rx="2" style="fill:var(--d-db-s);opacity:.85"/>
+<rect x="534" y="192.3" width="12" height="39.7" rx="2" style="fill:var(--d-db-s);opacity:.85"/>
+<rect x="552" y="193.5" width="12" height="38.5" rx="2" style="fill:var(--d-db-s);opacity:.85"/>
+<rect x="570" y="173.6" width="12" height="58.4" rx="2" style="fill:var(--d-db-s);opacity:.85"/>
+<rect x="588" y="161.7" width="12" height="70.3" rx="2" style="fill:var(--d-db-s);opacity:.85"/>
+<rect x="606" y="175.9" width="12" height="56.1" rx="2" style="fill:var(--d-db-s);opacity:.85"/>
+<rect x="624" y="161.2" width="12" height="70.8" rx="2" style="fill:var(--d-db-s);opacity:.85"/>
+<rect x="642" y="168.5" width="12" height="63.5" rx="2" style="fill:var(--d-db-s);opacity:.85"/>
+<rect x="660" y="174.2" width="12" height="57.8" rx="2" style="fill:var(--d-db-s);opacity:.85"/>
+<rect x="678" y="177.6" width="12" height="54.4" rx="2" style="fill:var(--d-db-s);opacity:.85"/>
+<path d="M404,175.3 H692" style="stroke:var(--accent);stroke-width:1.5;stroke-dasharray:5 4;fill:none"/>
+<text class="t xs mute mid" x="548" y="248">16 shards</text>
+<text class="t xs red end" x="258" y="52">shard with user 1</text>
+<text class="t xs accent" x="680" y="171.3">mean</text>
+</svg>
+</div>
+<figcaption><b>Load per shard, from the simulation above.</b> One celebrity key puts its shard at three times the average, so the cluster has to be sized for that shard. Salting the ten hottest keys brings the busiest shard to 1.3 times the mean.</figcaption>
+</figure>
+<p>Ways to deal with a hot key, roughly in order of preference:</p>
+<ul>
+<li><strong>Cache it.</strong> If the hot traffic is reads, a cache in front (or an in-process cache for the top few keys) absorbs it before it reaches the shard. See <a href="caching.html">Caching</a>.</li>
+<li><strong>Salt it.</strong> Append a suffix, <code>user:1#0</code> to <code>user:1#15</code>, and write to a random one. Writes spread across 16 shards; reads must gather all 16 sub-keys and merge. Good for counters and append-only data, and worth doing only for keys known to be hot, since every read of them now fans out.</li>
+<li><strong>Isolate it.</strong> With a directory or range scheme, give the hot tenant its own shard or hardware.</li>
+<li><strong>Change the data model.</strong> Twitter's answer for celebrity tweets was not to fan them out on write at all, but to merge them at read time. See the <a href="news-feed.html">news feed</a> case study.</li>
+</ul>
+
+<h2 id="secondary-indexes">Secondary indexes on sharded data</h2>
+<p>The shard key answers "where is user 42?". It does not answer "which user has email asha@example.com?". Sharded systems offer two kinds of secondary index, and the difference shapes query cost.</p>
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 342" role="img" aria-label="Local secondary indexes require querying every shard; a global secondary index sharded by email finds the user in one index shard and then reads one data shard">
+<g><rect class="n svc" x="280" y="16" width="160" height="48" rx="8"/>
+<text class="t b mid" x="360.0" y="37.0">Query service</text><text class="t xs mute mid" x="360.0" y="53.0">email = 'asha@…'</text></g>
+<g><rect class="n db" x="40" y="230" width="130" height="52" rx="8"/>
+<text class="t b mid" x="105.0" y="253.0">shard 1</text><text class="t xs mute mid" x="105.0" y="269.0">users + local index</text></g>
+<g><rect class="n db" x="210" y="230" width="130" height="52" rx="8"/>
+<text class="t b mid" x="275.0" y="253.0">shard 2</text><text class="t xs mute mid" x="275.0" y="269.0">users + local index</text></g>
+<g><rect class="n db" x="380" y="230" width="130" height="52" rx="8"/>
+<text class="t b mid" x="445.0" y="253.0">shard 3</text><text class="t xs mute mid" x="445.0" y="269.0">users + local index</text></g>
+<g><rect class="n db" x="550" y="230" width="130" height="52" rx="8"/>
+<text class="t b mid" x="615.0" y="253.0">shard 4</text><text class="t xs mute mid" x="615.0" y="269.0">users + local index</text></g>
+<g data-show="1">
+<path class="e accent" d="M330,64 L105,226"/>
+<path class="e accent" d="M350,64 L275,226"/>
+<path class="e accent" d="M370,64 L445,226"/>
+<path class="e accent" d="M390,64 L615,226"/>
+<text class="t xs accent end" x="195" y="150">ask every shard</text>
+<text class="t sm" x="20" y="312">Local (document-partitioned) index: each shard indexes only its own rows. Writes stay on one shard,</text>
+<text class="t sm" x="20" y="330">but a lookup by email must ask all shards and wait for the slowest.</text></g>
+<g data-show="2">
+<g><rect class="n cache" x="110" y="120" width="150" height="48" rx="8"/>
+<text class="t b mid" x="185.0" y="141.0">email index</text><text class="t xs mute mid" x="185.0" y="157.0">emails a to m</text></g>
+<g><rect class="n cache" x="460" y="120" width="150" height="48" rx="8"/>
+<text class="t b mid" x="535.0" y="141.0">email index</text><text class="t xs mute mid" x="535.0" y="157.0">emails n to z</text></g>
+<path class="e accent" d="M300,64 L230,116"/><text class="t xs accent end" x="250" y="88">1 asha → user 42</text>
+<path class="e accent" d="M380,64 L445,226"/><text class="t xs accent" x="452" y="205">2 fetch from shard 3</text>
+<path class="e dash" d="M400,226 C380,190 300,190 234,172"/><text class="t xs mute mid" x="310" y="212">async index update</text>
+<text class="t sm" x="20" y="312">Global (term-partitioned) index: the index is sharded by email, not by user. A lookup touches two shards,</text>
+<text class="t sm" x="20" y="330">but every write must update a remote index shard, usually asynchronously, so the index can lag.</text></g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Local index</button><button type="button" data-step="2" aria-pressed="false">Global index</button></div>
+</div>
+<figcaption><b>Local vs global secondary indexes.</b> Local indexes make writes cheap and reads scatter-gather. Global indexes make reads targeted and writes cross-shard.</figcaption>
+</figure>
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Local (document-partitioned)</th><th>Global (term-partitioned)</th></tr></thead>
+<tbody>
+<tr><th>Index lives</th><td>On each shard, covering that shard's rows</td><td>In its own shards, partitioned by the indexed value</td></tr>
+<tr><th>Write</th><td class="yes">Same shard, same transaction</td><td class="meh">Second shard, usually asynchronous</td></tr>
+<tr><th>Read by indexed value</th><td class="no">Ask every shard</td><td class="yes">One index shard, then the data shard(s)</td></tr>
+<tr><th>Freshness</th><td class="yes">Updated with the data on the same shard (Elasticsearch: after a ~1 s refresh)</td><td class="meh">May lag behind writes</td></tr>
+<tr><th>Examples</th><td>DynamoDB LSI, MongoDB, Elasticsearch, Cassandra secondary indexes</td><td>DynamoDB GSI (eventually consistent), CockroachDB and Spanner indexes (transactional)</td></tr>
+</tbody></table></div>
+<p>Distributed SQL databases maintain global indexes transactionally, paying a cross-node commit on writes. Many teams skip built-in secondary indexes and maintain a second table keyed by the lookup value (<code>users_by_email</code>), which is a global index managed by hand.</p>
+
+<h2 id="cross-shard">Cross-shard queries and joins</h2>
+<p>A query without the shard key becomes <dfn>scatter-gather</dfn>: send it to every shard, wait for all of them, merge the results. Two costs grow with the number of shards. Total work grows linearly, since every shard does the work even if most return nothing. And latency is set by the slowest shard: if each shard is slow 1% of the time, the simulation above shows a 64-shard query waits on a slow shard 47% of the time. This is <dfn>tail latency amplification</dfn>, and it is why fan-out queries belong off the hot path.</p>
+<p>Joins follow the same logic. A join between two tables sharded on the same key, for the same key value, runs locally on one shard: <code>orders</code> and <code>order_items</code> both sharded by <code>user_id</code> join without any network traffic. Citus calls these <dfn>co-located tables</dfn>. Small, rarely changing tables (countries, currencies, product categories) are copied to every shard as <dfn>reference tables</dfn> so any shard can join against them. Everything else is either denormalized at write time, joined in the application, or sent to an analytics system that is built for big scans. Transactions across shards need two-phase commit or a saga; see <a href="distributed-transactions.html">Distributed Transactions</a>.</p>
+
+<h2 id="resharding">Resharding without downtime</h2>
+<p>Data grows unevenly, so you will need to move it. The partitioning scheme decides how painful that is.</p>
+<div class="defs">
+<div><h4>Fixed number of partitions</h4><p>Create many more logical partitions than machines at the start, for example 1,024 for a 16-node cluster, and move whole partitions when nodes join. The key-to-partition mapping never changes. Redis Cluster (16,384 slots), Couchbase (1,024 vBuckets) and Elasticsearch (primary shard count set at index creation) work this way. Pick the count for the largest cluster you expect.</p></div>
+<div><h4>Dynamic splitting</h4><p>Start with one range and split it when it exceeds a size or load threshold, then move halves to balance. The number of partitions tracks the data. HBase, CockroachDB and DynamoDB split automatically (CockroachDB and DynamoDB also split on load for hot ranges); MongoDB balances chunk ranges by data size.</p></div>
+<div><h4>Logical shards on physical hosts</h4><p>The application-level version of fixed partitions. Instagram mapped thousands of logical PostgreSQL schemas onto a few physical servers; Notion started with 480 logical shards on 32 databases. Moving capacity means moving whole logical shards, never re-hashing rows.</p></div>
+</div>
+<p>Moving data while it is being written follows the same pattern everywhere: copy a snapshot, stream the changes made since, cut over when the copy is caught up, keep a way back. Vitess, the MySQL sharding system built at YouTube, automates it as a resharding workflow:</p>
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 382" role="img" aria-label="Online resharding: shard -80 is copied into new shards -40 and 40-80 with continuous replication, then reads and finally writes are switched to the new shards">
+<rect class="n svc" x="230" y="14" width="260" height="76" rx="8"/><text class="t b mid" x="360" y="36">Router (VTGate)</text>
+<g data-show="1"><text class="t mono mid" x="360" y="58">reads  → -80, 80-</text><text class="t mono mid" x="360" y="76">writes → -80, 80-</text></g>
+<g data-show="2"><text class="t mono mid" x="360" y="58">reads  → -80, 80-</text><text class="t mono mid" x="360" y="76">writes → -80, 80-</text></g>
+<g data-show="3"><text class="t mono mid" x="360" y="58">reads  → -40, 40-80, 80-</text><text class="t mono mid" x="360" y="76">writes → -80, 80-</text></g>
+<g data-show="4"><text class="t mono mid" x="360" y="58">reads  → -40, 40-80, 80-</text><text class="t mono mid" x="360" y="76">writes → -40, 40-80, 80-</text></g>
+<path class="e" d="M360,90 V116"/>
+<rect class="zone" x="12" y="120" width="696" height="210" rx="10"/>
+<g data-show="1 2 3"><rect class="n db" x="60" y="140" width="180" height="56" rx="8" style="stroke:var(--d-red);stroke-width:2"/>
+<text class="t b mid" x="150.0" y="165.0">shard -80</text><text class="t xs mute mid" x="150.0" y="181.0">keys 00-7f, 1.8 TB</text></g>
+<g data-show="4"><rect class="n ghost" x="60" y="140" width="180" height="56" rx="8"/>
+<text class="t b mid" x="150.0" y="165.0">shard -80</text><text class="t xs mute mid" x="150.0" y="181.0">retired after cutover</text></g>
+<g><rect class="n db" x="480" y="140" width="180" height="56" rx="8"/>
+<text class="t b mid" x="570.0" y="165.0">shard 80-</text><text class="t xs mute mid" x="570.0" y="181.0">keys 80-ff, 0.9 TB</text></g>
+<g data-show="1"><rect class="n ghost" x="20" y="256" width="160" height="56" rx="8"/>
+<text class="t b mid" x="100.0" y="281.0">shard -40</text><text class="t xs mute mid" x="100.0" y="297.0">not created yet</text></g>
+<g data-show="1"><rect class="n ghost" x="200" y="256" width="160" height="56" rx="8"/>
+<text class="t b mid" x="280.0" y="281.0">shard 40-80</text><text class="t xs mute mid" x="280.0" y="297.0">not created yet</text></g>
+<g data-show="2 3 4"><rect class="n db" x="20" y="256" width="160" height="56" rx="8"/>
+<text class="t b mid" x="100.0" y="281.0">shard -40</text><text class="t xs mute mid" x="100.0" y="297.0">keys 00-3f, 0.9 TB</text></g>
+<g data-show="2 3 4"><rect class="n db" x="200" y="256" width="160" height="56" rx="8"/>
+<text class="t b mid" x="280.0" y="281.0">shard 40-80</text><text class="t xs mute mid" x="280.0" y="297.0">keys 40-7f, 0.9 TB</text></g>
+<g data-show="2 3"><path class="e dash accent" d="M110,196 L100,252"/><path class="e dash accent" d="M190,196 L270,252"/><path class="flow" d="M110,196 L100,252"/><path class="flow" d="M190,196 L270,252"/><text class="t xs accent" x="250" y="222">copy rows, then stream the binlog</text></g>
+<g data-show="4"><path class="e dash" d="M100,252 L110,200"/><text class="t xs mute" x="116" y="230">reverse stream for rollback</text></g>
+<g data-show="1"><text class="t sm" x="20" y="352">Shard -80 holds 1.8 TB and most of the writes. Goal: split it into -40 and 40-80</text><text class="t sm" x="20" y="370">without downtime. Keyspace ids are hex prefixes of a hash, so the split point is just 40.</text></g>
+<g data-show="2"><text class="t sm" x="20" y="352">Create the new shards, bulk-copy their halves of the rows, then replay the source's binlog</text><text class="t sm" x="20" y="370">continuously until they are seconds behind. The source still serves all traffic.</text></g>
+<g data-show="3"><text class="t sm" x="20" y="352">Switch reads to the new shards first. Writes still go to -80 and stream across,</text><text class="t sm" x="20" y="370">so rolling back is just switching reads back.</text></g>
+<g data-show="4"><text class="t sm" x="20" y="352">Pause writes to -80 for a moment, let the stream drain, switch writes, and keep a reverse</text><text class="t sm" x="20" y="370">stream so the old shard stays current in case of rollback. Retire -80 later.</text></g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Before</button><button type="button" data-step="2" aria-pressed="false">Copy and catch up</button><button type="button" data-step="3" aria-pressed="false">Switch reads</button><button type="button" data-step="4" aria-pressed="false">Switch writes</button></div>
+</div>
+<figcaption><b>Splitting a Vitess shard.</b> Shard names are ranges of a hashed keyspace id. Only the shard being split is involved; 80- never notices. The only write pause is the final drain, typically seconds.</figcaption>
+</figure>
+<p>Citus (distributed PostgreSQL) does the same with logical replication in its shard rebalancer: move a shard by copying it, replicating changes, then briefly locking it to switch over. The design lesson for interviews is the order of operations: <strong>copy, catch up, switch reads, switch writes, keep rollback</strong>, and never a big-bang migration with the old system turned off.</p>
+
+<h2 id="routing">Request routing</h2>
+<p>Someone has to turn a key into a shard address. There are three places to put that logic:</p>
+<ul>
+<li><strong>Smart client.</strong> The client library holds the partition map and connects straight to the right node, saving a hop. Cassandra's token-aware drivers and Redis Cluster clients (which follow <code>MOVED</code> redirects and refresh their slot map) work this way. Every client must be updated when the map changes.</li>
+<li><strong>Routing proxy.</strong> Clients talk to a stateless router that knows the map: Vitess VTGate, MongoDB <code>mongos</code>, Twemproxy, Envoy's Redis proxy. Applications stay simple; the proxy is an extra hop and must be scaled and kept highly available.</li>
+<li><strong>Any node as coordinator.</strong> Clients connect to any node, which forwards the request to the owners. Cassandra coordinators, Elasticsearch nodes and CockroachDB gateways work this way.</li>
+</ul>
+<p>In all three, the authoritative partition map lives in a strongly consistent store (ZooKeeper, etcd, MongoDB config servers, Vitess's topology service) or is spread by gossip, and routers cache it. A request that reaches a node that no longer owns the key must be redirected or rejected, never served from stale ownership.</p>
+
+<h2 id="worked-example">Worked example: sharding an orders table</h2>
+<p>An e-commerce platform has 2 billion orders, growing by 3 million a day, on 64 shards. The access patterns:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Query</th><th>Rate</th><th>Shard by <code>user_id</code></th><th>Shard by <code>order_id</code></th></tr></thead>
+<tbody>
+<tr><th>Order detail by id</th><td class="num">6,000/s</td><td class="meh">Needs the user id or a lookup (fixable: see below)</td><td class="yes">One shard</td></tr>
+<tr><th>"My orders" page</th><td class="num">4,000/s</td><td class="yes">One shard, one index range</td><td class="no">All 64 shards, merge, sort</td></tr>
+<tr><th>Place order</th><td class="num">350/s peak</td><td class="yes">One shard, local transaction</td><td class="yes">One shard</td></tr>
+<tr><th>Seller's orders</th><td class="num">300/s</td><td class="no">All shards</td><td class="no">All shards</td></tr>
+<tr><th>Load balance</th><td></td><td class="meh">Skewed by heavy buyers (B2B accounts)</td><td class="yes">Perfectly even</td></tr>
+</tbody></table></div>
+<div class="calc">"My orders" with order_id sharding   64 shard queries per page view
+                                     4,000/s × 64      = <span class="r">256,000 shard queries/s</span>
+                                     P(slow shard) = 1 - 0.99^64 ≈ 47% of page views hit a p99
+"My orders" with user_id sharding    4,000/s × 1       = <span class="r">4,000 shard queries/s</span></div>
+<p>Shard by <code>user_id</code>. It keeps the busiest read and every write transaction on one shard. Then fix its two weaknesses:</p>
+<ul>
+<li><strong>Order lookup by id.</strong> Embed the shard in the order id itself. Instagram's scheme packs 41 bits of milliseconds, 13 bits of logical shard id and 10 bits of sequence into a 64-bit id, so any service can extract the shard from the id with a bit shift, no lookup needed. See <a href="id-generation.html">Distributed ID Generation</a>.</li>
+<li><strong>Seller view.</strong> Maintain a second, seller-sharded table (<code>orders_by_seller</code>), fed asynchronously from the order shards by change data capture. Sellers tolerate a second of lag; buyers placing orders never wait for it.</li>
+<li><strong>Heavy buyers.</strong> A B2B account with millions of orders gets a bigger share of one shard. With 1,024 logical shards on 64 hosts, that logical shard can be moved to a less loaded host; if a single account outgrows a host, it gets a dedicated shard through a small directory override.</li>
+</ul>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+<li><strong>Vitess</strong> shards MySQL at YouTube, Slack and many others: the application connects to VTGate as if to one MySQL, and <dfn>vindexes</dfn> map columns to keyspace ids.</li>
+<li><strong>Citus</strong> distributes PostgreSQL tables by a distribution column, co-locates tables with the same column, and replicates reference tables to every node.</li>
+<li><strong>DynamoDB</strong> hashes the partition key, splits partitions automatically by size and throughput, and applies per-partition throughput limits, which is why a hot partition key is the classic DynamoDB performance problem.</li>
+<li><strong>Discord</strong> partitions messages by <code>(channel_id, time bucket)</code> so that a busy channel's history is split into bounded partitions instead of one ever-growing hot one.</li>
+<li><strong>Notion</strong> sharded PostgreSQL by workspace id in 2021, using 480 logical shards so it could later grow the number of physical databases without re-sharding.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>After estimation shows that data or writes exceed one node, not before. Name the shard key, say why the top queries stay on one shard, and say what fans out: "Shard messages by <code>conversation_id</code>; loading a conversation is one shard; search across conversations goes to a separate search index."</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>Why that shard key? What query does it make expensive?</li>
+<li>How do you find an order by id if you shard by user? (Shard bits in the id, or a lookup table.)</li>
+<li>One customer is 20% of traffic. What happens and what do you do?</li>
+<li>How do you add shards without downtime? (Fixed logical partitions, or copy, catch up, cut over.)</li>
+<li>How do you handle a transaction that spans two users on different shards?</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li><code>hash(key) % N</code> with no plan for changing N.</li>
+<li>Sharding by a timestamp or auto-increment id with range partitioning.</li>
+<li>A shard key under which the main query is scatter-gather.</li>
+<li>Sharding a 200 GB database "for scale" when one node and replicas would do.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://vitess.io/docs/" target="_blank" rel="noopener">Vitess documentation</a><span>Keyspaces, vindexes, VTGate routing and the resharding workflow used at YouTube and Slack.</span></li>
+<li><a href="https://docs.citusdata.com/" target="_blank" rel="noopener">Citus documentation</a><span>Distribution columns, co-location, reference tables and online shard rebalancing for PostgreSQL.</span></li>
+<li><a href="https://www.notion.so/blog/sharding-postgres-at-notion" target="_blank" rel="noopener">Herding elephants: lessons learned from sharding Postgres at Notion</a><span>Notion, 2021. Choosing a shard key, logical shards and a live migration with double writes.</span></li>
+<li><a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-partition-key-design.html" target="_blank" rel="noopener">DynamoDB: best practices for designing partition keys</a><span>Hot partitions, write sharding with suffixes, and adaptive capacity.</span></li>
+</ul>

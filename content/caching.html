@@ -1,0 +1,495 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">A product page needs data that takes 10 ms to compute from the database. It is requested 100,000 times per second and changes a few times a day. Computing it 100,000 times a second is wasted work; computing it once and keeping the answer in memory, where it can be read in half a millisecond, is caching. Almost every system that serves real traffic depends on it, and many outages start with a cache that stopped doing its job.</p>
+<p>A <dfn>cache</dfn> is a fast, smaller store holding copies of data whose source of truth lives elsewhere. Caches work because access is skewed: a small fraction of keys gets most of the traffic. They are hard because a copy can disagree with its source. The chapter covers where caches sit, how reads and writes flow through them, what to evict, how to keep copies correct, and how to stop a cache miss from taking down the database.</p>
+
+<h3 id="hit-ratio">The arithmetic of hit ratio</h3>
+<p>The <dfn>hit ratio</dfn> <code>h</code> is the fraction of requests answered by the cache. Two formulas carry most cache reasoning:</p>
+<div class="calc">average latency = t_cache + (1 - h) × t_db
+database load   = (1 - h) × request rate
+
+with t_cache = 0.5 ms, t_db = 10 ms, 100,000 requests/s:
+  h = 80%     latency 2.5 ms     database 20,000 queries/s
+  h = 90%     latency 1.5 ms     database 10,000 queries/s
+  h = 95%     latency 1.0 ms     database  5,000 queries/s
+  h = 99%     latency 0.6 ms     database  <span class="r">1,000 queries/s</span>
+  h = 99.9%   latency 0.51 ms    database    100 queries/s</div>
+<p>Look at the database column. Going from 90% to 99% is a <strong>tenfold</strong> drop in database load, from a change that looks like nine points. It cuts the other way too: a database sized for a 99% hit ratio is undersized by ten times if the ratio falls to 90%, for example after a cache restart or a deploy that changed key names. The cache has quietly become a load-bearing part of the system, and its failure modes must be designed for.</p>
+
+<h2 id="layers">Where caches live</h2>
+<figure class="fig wide">
+<div class="fig-frame">
+<svg viewBox="0 0 720 296" role="img" aria-label="Cache layers from client to CDN, gateway, in-process cache, Redis and the database buffer pool, with typical hit latency for each">
+<rect class="n client" x="20" y="110" width="100" height="56" rx="8"/>
+<text class="t b mid" x="70.0" y="135.0">Client</text><text class="t xs mute mid" x="70.0" y="151.0">browser / app</text>
+<rect class="n ext" x="150" y="110" width="100" height="56" rx="8"/>
+<text class="t b mid" x="200.0" y="135.0">CDN</text><text class="t xs mute mid" x="200.0" y="151.0">edge PoP</text>
+<rect class="n ext" x="280" y="110" width="100" height="56" rx="8"/>
+<text class="t b mid" x="330.0" y="135.0">Gateway</text><text class="t xs mute mid" x="330.0" y="151.0">reverse proxy</text>
+<rect class="n svc" x="410" y="70" width="140" height="136" rx="8"/><text class="t b mid" x="480" y="92">App server</text>
+<rect class="n cache" x="424" y="112" width="112" height="56" rx="8"/>
+<text class="t b mid" x="480.0" y="137.0">In-process</text><text class="t xs mute mid" x="480.0" y="153.0">LRU map</text>
+<rect class="n cache" x="590" y="40" width="120" height="56" rx="8"/>
+<text class="t b mid" x="650.0" y="65.0">Redis</text><text class="t xs mute mid" x="650.0" y="81.0">shared cache</text>
+<rect class="n db" x="590" y="186" width="120" height="64" rx="8"/>
+<text class="t b mid" x="650.0" y="215.0">Database</text><text class="t xs mute mid" x="650.0" y="231.0">buffer pool</text>
+<path class="e" d="M120,138 H146"/><path class="e" d="M250,138 H276"/><path class="e" d="M380,138 H406"/>
+<path class="e" d="M550,110 C570,110 566,68 586,68"/><path class="e" d="M550,176 C570,176 566,218 586,218"/>
+<path class="flow" d="M120,138 H146"/><path class="flow" d="M250,138 H276"/><path class="flow" d="M380,138 H406"/><path class="flow" d="M550,110 C570,110 566,68 586,68"/>
+<text class="t mono mid" x="70" y="190">0 ms</text><text class="t xs mute mid" x="70" y="206">Cache-Control, ETag</text>
+<text class="t mono mid" x="200" y="190">10 to 30 ms</text><text class="t xs mute mid" x="200" y="206">static files, public pages</text>
+<text class="t mono mid" x="330" y="190">~1 ms</text><text class="t xs mute mid" x="330" y="206">whole responses</text>
+<text class="t mono mid" x="480" y="226">~100 ns</text><text class="t xs mute mid" x="480" y="242">hottest objects</text>
+<text class="t mono mid" x="650" y="114">0.2 to 1 ms</text><text class="t xs mute mid" x="650" y="130">objects, sessions</text>
+<text class="t mono mid" x="650" y="268">1 to 50 ms</text><text class="t xs mute mid" x="650" y="284">pages from disk</text>
+<text class="t sm" x="20" y="34">The closer to the user, the faster the hit</text>
+<text class="t sm" x="20" y="52">and the harder it is to invalidate.</text>
+</svg>
+</div>
+<figcaption><b>Cache layers on a request path.</b> The animated path is a request answered from Redis. Each layer to the left avoids more work on a hit, and is shared by fewer or harder-to-reach copies when you need to invalidate it.</figcaption>
+</figure>
+<div class="table-wrap"><table>
+<thead><tr><th>Layer</th><th>What it holds</th><th>Strength</th><th>Weakness</th></tr></thead>
+<tbody>
+<tr><th>Client</th><td>HTTP responses, assets, app data</td><td>Zero network cost</td><td>You cannot reach in to invalidate; rely on TTLs and versioned URLs</td></tr>
+<tr><th>CDN</th><td>Static files, public pages, API responses with <code>Cache-Control: public</code></td><td>Near users, absorbs spikes</td><td>Purges take seconds and cost API calls; no per-user data. See <a href="cdn.html">CDN</a></td></tr>
+<tr><th>Gateway / reverse proxy</th><td>Whole responses (Varnish, NGINX)</td><td>Protects every service behind it</td><td>Coarse keys; must vary on headers correctly</td></tr>
+<tr><th>In-process</th><td>Hot objects in the service's heap (Caffeine, a dict)</td><td>~100 ns, no network</td><td>One copy per instance: N copies to invalidate, memory per pod, cold after deploy</td></tr>
+<tr><th>Distributed</th><td>Objects, sessions, counters (Redis, Memcached)</td><td>Shared by all instances, large, one place to invalidate</td><td>A network hop; its own scaling and failure modes</td></tr>
+<tr><th>Database buffer pool</th><td>Pages of tables and indexes</td><td>Automatic and always consistent</td><td>Still pays query parsing, planning and execution</td></tr>
+</tbody></table></div>
+<p>Layers compose. A common stack is a short TTL in-process cache for the few hundred hottest keys in front of Redis for everything else, which removes the network hop for the keys that would otherwise make one Redis node hot.</p>
+
+<h2 id="patterns">Read and write patterns</h2>
+<p>Five patterns describe who talks to the cache and when the database is updated. Step through them:</p>
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 306" role="img" aria-label="Sequence diagrams for cache-aside, read-through, write-through, write-back and write-around">
+<rect class="n svc" x="50" y="16" width="120" height="36" rx="7"/><text class="t sm b mid" x="110" y="39">App</text>
+<path class="line faint" d="M110,52 V250" style="stroke-dasharray:3 4"/>
+<rect class="n cache" x="300" y="16" width="120" height="36" rx="7"/><text class="t sm b mid" x="360" y="39">Cache</text>
+<path class="line faint" d="M360,52 V250" style="stroke-dasharray:3 4"/>
+<rect class="n db" x="550" y="16" width="120" height="36" rx="7"/><text class="t sm b mid" x="610" y="39">DB</text>
+<path class="line faint" d="M610,52 V250" style="stroke-dasharray:3 4"/>
+<g data-show="1">
+<path class="e " d="M110,85 H356"/><text class="t sm mid " x="235.0" y="78">GET user:42</text>
+<path class="e dash" d="M360,120 H114"/><text class="t sm mid " x="235.0" y="113">miss</text>
+<path class="e " d="M110,160 H606"/><text class="t sm mid " x="360.0" y="153">SELECT ... WHERE id = 42</text>
+<path class="e dash" d="M610,195 H114"/><text class="t sm mid " x="360.0" y="188">row</text>
+<path class="e accent" d="M110,235 H356"/><text class="t sm mid accent" x="235.0" y="228">SET user:42 EX 300</text>
+<text class="t sm" x="20" y="276">Cache-aside (lazy loading): the app reads the cache, and on a miss reads the database and fills the cache.</text><text class="t sm mute" x="20" y="294">Only requested data is cached; a cache outage degrades to database reads. The most common pattern.</text></g>
+<g data-show="2">
+<path class="e " d="M110,85 H356"/><text class="t sm mid " x="235.0" y="78">get(user:42)</text>
+<path class="e accent" d="M360,130 H606"/><text class="t sm mid accent" x="485.0" y="123">load on miss</text>
+<path class="e dash" d="M610,170 H364"/><text class="t sm mid " x="485.0" y="163">row</text>
+<path class="e dash" d="M360,215 H114"/><text class="t sm mid " x="235.0" y="208">value</text>
+<text class="t sm" x="20" y="276">Read-through: the cache itself loads missing data, so the app only ever talks to the cache.</text><text class="t sm mute" x="20" y="294">Same behaviour as cache-aside, with loading logic in a library or cache provider (Caffeine, DAX).</text></g>
+<g data-show="3">
+<path class="e " d="M110,85 H356"/><text class="t sm mid " x="235.0" y="78">write user:42</text>
+<path class="e accent" d="M360,130 H606"/><text class="t sm mid accent" x="485.0" y="123">write, synchronously</text>
+<path class="e dash" d="M610,170 H364"/><text class="t sm mid " x="485.0" y="163">ok</text>
+<path class="e dash" d="M360,215 H114"/><text class="t sm mid " x="235.0" y="208">ok</text>
+<text class="t sm" x="20" y="276">Write-through: every write goes through the cache to the database before it is acknowledged.</text><text class="t sm mute" x="20" y="294">Cache is always fresh for written keys; writes pay both latencies, and rarely read data fills the cache.</text></g>
+<g data-show="4">
+<path class="e " d="M110,85 H356"/><text class="t sm mid " x="235.0" y="78">write user:42</text>
+<path class="e dash" d="M360,120 H114"/><text class="t sm mid " x="235.0" y="113">ok (immediately)</text>
+<path class="e dash accent" d="M360,200 H606"/><text class="t sm mid accent" x="485.0" y="193">later: batched flush</text>
+<text class="t sm" x="20" y="276">Write-back (write-behind): the cache acknowledges at once and flushes to the database later.</text><text class="t sm mute" x="20" y="294">Fastest writes and absorbs bursts; a cache crash before the flush loses acknowledged writes.</text></g>
+<g data-show="5">
+<path class="e " d="M110,85 H606"/><text class="t sm mid " x="360.0" y="78">UPDATE users SET ...</text>
+<path class="e dash" d="M610,120 H114"/><text class="t sm mid " x="360.0" y="113">ok</text>
+<path class="e accent" d="M110,165 H356"/><text class="t sm mid accent" x="235.0" y="158">DELETE user:42</text>
+<path class="e dash" d="M110,225 H356"/><text class="t sm mid " x="235.0" y="218">next read: miss, refill</text>
+<text class="t sm" x="20" y="276">Write-around: writes go straight to the database and the cached copy is deleted (or left to expire).</text><text class="t sm mute" x="20" y="294">Pairs with cache-aside. Delete rather than update the cache: a delete cannot install a wrong value.</text></g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Cache-aside</button><button type="button" data-step="2" aria-pressed="false">Read-through</button><button type="button" data-step="3" aria-pressed="false">Write-through</button><button type="button" data-step="4" aria-pressed="false">Write-back</button><button type="button" data-step="5" aria-pressed="false">Write-around</button></div>
+</div>
+<figcaption><b>Caching patterns.</b> The first two are read patterns, the last three are write patterns, and real systems pick one of each. Cache-aside with delete-on-write is the default for most web services.</figcaption>
+</figure>
+<div class="table-wrap"><table>
+<thead><tr><th>Pattern</th><th>Freshness</th><th>Write latency</th><th>Risk</th><th>Good fit</th></tr></thead>
+<tbody>
+<tr><th>Cache-aside + delete on write</th><td class="meh">Stale only in races and TTL windows</td><td class="yes">Database only</td><td>Race shown below; first read after write is a miss</td><td>General web reads</td></tr>
+<tr><th>Read-through</th><td class="meh">Same as cache-aside</td><td>n/a</td><td>Cache layer must know how to load</td><td>Libraries and managed caches (DAX)</td></tr>
+<tr><th>Write-through</th><td class="yes">Fresh for written keys</td><td class="no">Cache + database</td><td>Caches data nobody reads; partial failure leaves them disagreeing</td><td>Read-after-write heavy data</td></tr>
+<tr><th>Write-back</th><td class="yes">Cache is the latest</td><td class="yes">Cache only</td><td class="no">Data loss if the cache dies before flushing</td><td>Counters, metrics, write bursts that tolerate loss</td></tr>
+<tr><th>Write-around</th><td class="meh">Miss after each write</td><td class="yes">Database only</td><td>Write-heavy keys never stay cached</td><td>Data written once, read later (or never)</td></tr>
+</tbody></table></div>
+<p>Why delete rather than update on write? Two concurrent writers that each update the cache after the database can interleave so the cache ends up with the older value, forever. A delete is idempotent and order-independent: whatever the interleaving, the next read reloads from the database. Updating the cache also wastes work on keys nobody will read.</p>
+
+<h2 id="eviction">Eviction</h2>
+<p>A cache is smaller than the data, so it must choose what to drop. <dfn>Eviction policies</dfn> bet on which keys will be needed again.</p>
+<div class="defs">
+<div><h4>LRU</h4><p>Least recently used goes first. Captures recency, and is the default almost everywhere. Weakness: one big scan of cold keys flushes the hot set.</p></div>
+<div><h4>LFU</h4><p>Least frequently used goes first. Keeps stable favourites through scans, but needs counters that decay, or yesterday's viral key lives forever.</p></div>
+<div><h4>FIFO and random</h4><p>Cheap and surprisingly close to LRU on many real workloads. Twitter's study of its cache clusters found FIFO performing similarly to LRU for most of them.</p></div>
+<div><h4>TTL</h4><p>Not an eviction policy but an expiry: each key carries a lifetime. It bounds staleness and reclaims memory from dead keys. Use it on almost every key.</p></div>
+</div>
+<p>Production caches approximate these. Redis does not keep a global LRU list; it samples a few keys (5 by default, <code>maxmemory-samples</code>) and evicts the best candidate among them. Its LFU mode uses an 8-bit logarithmic counter per key that decays over time. Memcached keeps a segmented LRU per slab size class. Caffeine (Java) uses W-TinyLFU, which admits a new key only if it is likely to be more popular than the one it would evict. Note that Redis's default policy is <code>noeviction</code>: when memory is full, writes fail. Set <code>allkeys-lru</code> or <code>allkeys-lfu</code> for a pure cache.</p>
+<p>An exact LRU is short in Python because <code>OrderedDict</code> keeps keys in order and moves one to the end in O(1):</p>
+<pre><code class="language-python">from collections import OrderedDict
+
+
+class LRUCache:
+    """O(1) get and put: OrderedDict keeps keys in recency order."""
+
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.data = OrderedDict()
+        self.hits = self.misses = 0
+
+    def get(self, key):
+        if key not in self.data:
+            self.misses += 1
+            return None
+        self.hits += 1
+        self.data.move_to_end(key)            # now the most recently used
+        return self.data[key]
+
+    def put(self, key, value):
+        self.data[key] = value
+        self.data.move_to_end(key)
+        if len(self.data) &gt; self.capacity:
+            self.data.popitem(last=False)     # evict the least recently used
+
+
+cache = LRUCache(capacity=3)
+for key in ["home", "cart", "home", "p:91", "p:17", "home", "cart"]:
+    if cache.get(key) is None:
+        cache.put(key, f"&lt;html for {key}&gt;")
+print(list(cache.data), f"hits={cache.hits} misses={cache.misses}")
+# ['p:17', 'home', 'cart'] hits=2 misses=5</code></pre>
+
+<h2 id="invalidation">Invalidation</h2>
+<p>Every cached value is a copy that may be out of date. The strategies trade freshness against effort:</p>
+<ol class="steps">
+<li><strong>TTL only.</strong> Accept staleness up to the TTL. Simple and robust; fine for data where minutes of staleness are invisible (a product description, a follower count).</li>
+<li><strong>Delete on write.</strong> The service that writes the database deletes the key. Fresh within milliseconds, if every write path remembers to do it.</li>
+<li><strong>Change data capture.</strong> A separate process tails the database's replication log and deletes keys for every changed row. No write path can forget. Facebook's McSqueal daemons read the MySQL commit log and broadcast deletes to every frontend memcache cluster in that region.</li>
+<li><strong>Versioned keys.</strong> Put a version in the key (<code>product:91:v17</code>) and bump the version on change. Old entries are never read again and age out. Ideal for client and CDN caches you cannot reach.</li>
+</ol>
+<p>Keep a TTL even with active invalidation. It is the backstop that bounds the damage when an invalidation is lost, and invalidations do get lost: a network blip, a crashed consumer, a bug in one write path.</p>
+
+<h3 id="cache-aside-race">The race in cache-aside</h3>
+<p>Delete-on-write has a well-known hole. It needs a slow reader and a writer to interleave in a specific way, which at high request rates happens every day.</p>
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 318" role="img" aria-label="Cache-aside race: a slow reader writes a stale value into the cache after a writer deleted it; with leases the stale write is rejected">
+<rect class="n svc" x="35" y="16" width="110" height="36" rx="7"/><text class="t sm b mid" x="90" y="39">Reader A</text>
+<path class="line faint" d="M90,52 V262" style="stroke-dasharray:3 4"/>
+<rect class="n svc" x="215" y="16" width="110" height="36" rx="7"/><text class="t sm b mid" x="270" y="39">Writer B</text>
+<path class="line faint" d="M270,52 V262" style="stroke-dasharray:3 4"/>
+<rect class="n cache" x="395" y="16" width="110" height="36" rx="7"/><text class="t sm b mid" x="450" y="39">Cache</text>
+<path class="line faint" d="M450,52 V262" style="stroke-dasharray:3 4"/>
+<rect class="n db" x="575" y="16" width="110" height="36" rx="7"/><text class="t sm b mid" x="630" y="39">DB</text>
+<path class="line faint" d="M630,52 V262" style="stroke-dasharray:3 4"/>
+<g data-show="1">
+<path class="e " d="M90,85 H446"/><text class="t sm mid " x="270.0" y="78">GET user:42 → miss</text>
+<path class="e " d="M90,120 H626"/><text class="t sm mid " x="360.0" y="113">SELECT → v1 (then A stalls)</text>
+<path class="e accent" d="M270,155 H626"/><text class="t sm mid accent" x="450.0" y="148">UPDATE → v2</text>
+<path class="e accent" d="M270,190 H446"/><text class="t sm mid accent" x="360.0" y="183">DELETE user:42</text>
+<path class="e red" d="M90,240 H446"/><text class="t sm mid red" x="270.0" y="233">SET user:42 = v1</text>
+<text class="t sm" x="20" y="288">A read v1 before B's update and wrote it after B's delete. The cache now serves v1</text><text class="t sm" x="20" y="306">while the database has v2, until the TTL expires. Deleting on write did not help.</text></g>
+<g data-show="2">
+<path class="e " d="M90,85 H446"/><text class="t sm mid " x="270.0" y="78">GET → miss, lease L1</text>
+<path class="e " d="M90,120 H626"/><text class="t sm mid " x="360.0" y="113">SELECT → v1 (then A stalls)</text>
+<path class="e accent" d="M270,155 H626"/><text class="t sm mid accent" x="450.0" y="148">UPDATE → v2</text>
+<path class="e accent" d="M270,190 H446"/><text class="t sm mid accent" x="360.0" y="183">DELETE: invalidates L1</text>
+<path class="e green" d="M90,240 H446"/><text class="t sm mid " x="270.0" y="233">SET with L1 → rejected</text>
+<text class="t sm" x="20" y="288">Leases: a miss hands out a token, and a delete invalidates outstanding tokens. A's late SET</text><text class="t sm" x="20" y="306">carries a dead token and is dropped; the next reader gets a new lease and loads v2.</text></g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">The race</button><button type="button" data-step="2" aria-pressed="false">Fixed with a lease</button></div>
+</div>
+<figcaption><b>Stale set after delete.</b> Each step is correct alone. The bug is that A's SET is based on a read that happened before B's write but lands after B's delete.</figcaption>
+</figure>
+<p>Fixes, from strongest to cheapest:</p>
+<ul>
+<li><strong>Leases.</strong> From Facebook's memcache paper: a miss returns a lease token, a delete invalidates outstanding tokens, and a SET is accepted only with a valid token. The same mechanism limits stampedes, because memcache hands out a token for a key at most once every 10 seconds; other clients are told to wait briefly and retry. Facebook reported this cut peak database queries for affected keys from 17,000 to 1,300 per second.</li>
+<li><strong>Versioned sets.</strong> Store the row's version (or <code>updated_at</code>) with the cached value, and set only if the new version is higher, using memcached's <code>cas</code> or a small Redis Lua script. A stale reader cannot overwrite a newer value. This fixes stale-overwrite races; it cannot help if the stale reader is the first to fill an empty key, which is why it pairs with delete-on-write plus a short TTL.</li>
+<li><strong>Delayed second delete.</strong> Delete the key on write, then delete it again a second or so later, after any in-flight stale reader has finished. Cheap and effective in practice, but a timing guess.</li>
+<li><strong>Short TTL.</strong> Bounds the window. It does not fix anything, it only limits how long the wrong value lives.</li>
+</ul>
+
+<h2 id="stampede">Stampedes and thundering herds</h2>
+<p>A popular key expires. In the time it takes one request to recompute it, every other request for that key also misses and goes to the database. At 2,000 requests per second and a 200 ms recompute, that is about 400 identical queries in a burst, for one key. If the recompute is an expensive aggregate, the database falls over, the recompute times out, the key never gets filled, and the herd keeps coming. This is a <dfn>cache stampede</dfn> (or dog-pile). The same thing happens on a much larger scale when a cache node restarts empty.</p>
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 336" role="img" aria-label="Timeline around a hot key expiring: without protection hundreds of requests hit the database; with coalescing one query runs and others wait; with XFetch one request recomputes early and nobody misses">
+<path d="M550.0,34 V286" style="stroke:var(--d-red);stroke-width:1.5;stroke-dasharray:5 4;fill:none"/>
+<text class="t xs red mid" x="550.0" y="26">key expires</text>
+<text class="t sm b" x="20" y="74">No protection</text>
+<path class="line faint" d="M150,82 H700"/>
+<text class="t sm b" x="20" y="159">Coalescing / lock</text>
+<path class="line faint" d="M150,167 H700"/>
+<text class="t sm b" x="20" y="244">XFetch</text>
+<path class="line faint" d="M150,252 H700"/>
+<rect x="148.0" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="148.0" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="148.0" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="160.5" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="160.5" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="160.5" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="173.0" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="173.0" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="173.0" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="185.5" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="185.5" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="185.5" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="198.0" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="198.0" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="198.0" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="210.5" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="210.5" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="210.5" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="223.0" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="223.0" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="223.0" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="235.5" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="235.5" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="235.5" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="248.0" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="248.0" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="248.0" y="226" width="4" height="26" rx="1" style="fill:var(--d-red)"/>
+<rect x="260.5" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="260.5" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="260.5" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="273.0" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="273.0" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="273.0" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="285.5" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="285.5" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="285.5" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="298.0" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="298.0" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="298.0" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="310.5" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="310.5" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="310.5" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="323.0" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="323.0" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="323.0" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="335.5" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="335.5" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="335.5" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="348.0" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="348.0" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="348.0" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="360.5" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="360.5" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="360.5" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="373.0" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="373.0" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="373.0" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="385.5" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="385.5" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="385.5" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="398.0" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="398.0" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="398.0" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="410.5" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="410.5" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="410.5" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="423.0" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="423.0" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="423.0" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="435.5" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="435.5" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="435.5" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="448.0" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="448.0" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="448.0" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="460.5" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="460.5" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="460.5" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="473.0" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="473.0" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="473.0" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="485.5" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="485.5" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="485.5" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="498.0" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="498.0" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="498.0" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="510.5" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="510.5" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="510.5" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="523.0" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="523.0" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="523.0" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="535.5" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="535.5" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="535.5" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="548.0" y="56" width="4" height="26" rx="1" style="fill:var(--d-red)"/>
+<rect x="548.0" y="141" width="4" height="26" rx="1" style="fill:var(--d-red)"/>
+<rect x="548.0" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="560.5" y="56" width="4" height="26" rx="1" style="fill:var(--d-red)"/>
+<rect x="560.5" y="149" width="4" height="18" rx="1" style="fill:var(--d-cache-s)"/>
+<rect x="560.5" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="573.0" y="56" width="4" height="26" rx="1" style="fill:var(--d-red)"/>
+<rect x="573.0" y="149" width="4" height="18" rx="1" style="fill:var(--d-cache-s)"/>
+<rect x="573.0" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="585.5" y="56" width="4" height="26" rx="1" style="fill:var(--d-red)"/>
+<rect x="585.5" y="149" width="4" height="18" rx="1" style="fill:var(--d-cache-s)"/>
+<rect x="585.5" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="598.0" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="598.0" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="598.0" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="610.5" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="610.5" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="610.5" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="623.0" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="623.0" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="623.0" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="635.5" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="635.5" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="635.5" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="648.0" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="648.0" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="648.0" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="660.5" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="660.5" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="660.5" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="673.0" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="673.0" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="673.0" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="685.5" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="685.5" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="685.5" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="698.0" y="70" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="698.0" y="155" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<rect x="698.0" y="240" width="4" height="12" rx="1" style="fill:var(--d-stroke)"/>
+<text class="t xs red" x="605.0" y="60">~400 DB queries</text>
+<text class="t xs mute" x="605.0" y="145">1 query, rest wait</text>
+<text class="t xs mute mid" x="250.0" y="222">early recompute</text>
+<text class="t xs mute" x="275.0" y="272">refreshed early: nobody misses or waits</text>
+<text class="t xs mono mute mid" x="175.0" y="300">-1.5 s</text>
+<text class="t xs mono mute mid" x="300.0" y="300">-1.0 s</text>
+<text class="t xs mono mute mid" x="425.0" y="300">-0.5 s</text>
+<text class="t xs mono mute mid" x="550.0" y="300">+0.0 s</text>
+<text class="t xs mono mute mid" x="675.0" y="300">+0.5 s</text>
+<rect x="20" y="314" width="4" height="12" style="fill:var(--d-stroke)"/><text class="t xs mute" x="30" y="324">cache hit</text>
+<rect x="100" y="314" width="4" height="12" style="fill:var(--d-red)"/><text class="t xs mute" x="110" y="324">database query</text>
+<rect x="210" y="314" width="4" height="12" style="fill:var(--d-cache-s)"/><text class="t xs mute" x="220" y="324">waiting</text>
+<text class="t xs mute" x="300" y="324">each tick is 100 requests (2,000/s); recompute takes 0.2 s</text>
+</svg>
+</div>
+<figcaption><b>One hot key expiring.</b> Without protection, every request during the recompute window hits the database. Coalescing sends one query and makes the others wait; XFetch refreshes the value just before it expires, so nobody misses.</figcaption>
+</figure>
+<ul>
+<li><strong>Request coalescing (single-flight).</strong> Within one process, the first miss for a key starts the load; concurrent misses for the same key wait on that load instead of starting their own. Go's <code>singleflight</code> package and Caffeine's loading cache do this. It reduces the herd to one query per process, not one per cluster.</li>
+<li><strong>A distributed lock or lease.</strong> The first miss takes a short lock in the cache (<code>SET lock:key NX PX 2000</code>); others wait briefly and retry, or serve a stale copy. One query per cluster. Remember lock expiry, so a crashed holder does not block the key.</li>
+<li><strong>Serve stale while revalidating.</strong> Keep the old value past its soft expiry and refresh in the background. Users see slightly stale data instead of a slow page. HTTP has this built in as <code>stale-while-revalidate</code>.</li>
+<li><strong>Probabilistic early expiration (XFetch).</strong> Each request recomputes early with a probability that rises as expiry approaches: recompute if <code>now - delta × beta × ln(rand()) ≥ expiry</code>, where <code>delta</code> is how long the last recompute took, <code>rand()</code> is uniform in (0, 1], and <code>beta</code> (default 1) tunes eagerness. Since <code>ln(rand())</code> is negative, the left side is <code>now</code> plus a random amount with mean <code>delta × beta</code>. Expensive keys start refreshing earlier. No coordination needed.</li>
+<li><strong>Jittered TTLs.</strong> Keys written together (a cache warm-up, a batch job) expire together. Add a random 10 to 20% to each TTL so their expiries spread out.</li>
+</ul>
+<p>XFetch is three lines of logic. This simulation runs one hot key for ten minutes at 2,000 requests per second with a 60-second TTL and a 200 ms recompute:</p>
+<pre><code class="language-python">import math
+import random
+
+
+def should_recompute(now, expiry, delta, beta=1.0, rng=random):
+    """XFetch (Vattani et al., VLDB 2015): recompute early with a probability that rises
+    as expiry approaches. delta = how long the last recompute took."""
+    r = 1.0 - rng.random()                       # uniform in (0, 1], so log(r) is defined
+    return now - delta * beta * math.log(r) &gt;= expiry
+
+
+def simulate(policy, rate=2_000, ttl=60.0, delta=0.2, seconds=600, seed=1):
+    """Count database queries for one hot key under a steady request rate."""
+    rng = random.Random(seed)
+    now, expiry, db_queries, refill_at = 0.0, ttl, 0, None
+    while now &lt; seconds:
+        now += rng.expovariate(rate)                  # next request
+        if refill_at is not None and now &gt;= refill_at:
+            expiry, refill_at = refill_at + ttl, None  # recompute finished: fresh value
+        if policy == "naive" and now &gt;= expiry:
+            db_queries += 1                            # every miss goes to the database
+            if refill_at is None:
+                refill_at = now + delta
+        elif policy == "xfetch" and should_recompute(now, expiry, delta, rng=rng):
+            db_queries += 1                            # early recompute; the old value is still served
+            if refill_at is None:                      # (no coordination between requests)
+                refill_at = now + delta
+    return db_queries
+
+
+print("naive :", simulate("naive"), "DB queries in 10 minutes")
+print("xfetch:", simulate("xfetch"), "DB queries in 10 minutes")
+# naive : 3533 DB queries in 10 minutes
+# xfetch: 18 DB queries in 10 minutes</code></pre>
+<p>Without protection, each expiry costs about 400 database queries. With XFetch it costs about two, and because the refresh happens before expiry, no request ever waits for the database.</p>
+
+<h2 id="hot-keys">Hot keys</h2>
+<p>A distributed cache spreads keys across nodes with <a href="consistent-hashing.html">consistent hashing</a> or hash slots, which balances keys, not traffic. A single key at 200,000 reads per second exceeds what one Redis node comfortably serves, and every request for it goes to the same node. Responses:</p>
+<ul>
+<li><strong>Local cache in front.</strong> A few seconds of in-process caching for the hottest keys removes most of their traffic from the network. Staleness is bounded by that short TTL.</li>
+<li><strong>Replicate the hot key.</strong> Store copies under <code>key#0</code> to <code>key#7</code> on different nodes and read a random one. Writes must update or delete all copies.</li>
+<li><strong>Read replicas.</strong> Redis replicas can serve reads for a hot shard, with replication lag as the price.</li>
+<li><strong>Detect, do not guess.</strong> Hot keys change minute to minute (the trending product, the live match). Sample access counts in the client or proxy and promote keys to local caching automatically.</li>
+</ul>
+
+<h2 id="redis-vs-memcached">Redis vs Memcached</h2>
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Redis</th><th>Memcached</th></tr></thead>
+<tbody>
+<tr><th>Data model</th><td class="yes">Strings, hashes, lists, sets, sorted sets, streams, HyperLogLog, geo</td><td class="meh">Opaque byte values only</td></tr>
+<tr><th>Threads</th><td>Single-threaded command execution (I/O threads optional since 6.0)</td><td>Multithreaded, scales with cores on one host</td></tr>
+<tr><th>Persistence</th><td class="yes">RDB snapshots and append-only file</td><td class="no">None, memory only</td></tr>
+<tr><th>Replication and clustering</th><td class="yes">Built-in replicas, Sentinel, Cluster with 16,384 hash slots</td><td class="meh">Client-side sharding; replication via proxies such as mcrouter</td></tr>
+<tr><th>Atomic operations</th><td class="yes">INCR, SET NX, Lua scripts, transactions</td><td class="meh">incr/decr, add, CAS</td></tr>
+<tr><th>Memory efficiency for simple values</th><td class="meh">Good</td><td class="yes">Very good: slab allocator, little per-key overhead</td></tr>
+<tr><th>Choose when</th><td>You need data structures, counters, rate limiting, leaderboards, queues, or persistence</td><td>A simple, very large, multithreaded look-aside cache of blobs</td></tr>
+</tbody></table></div>
+<p>For a new system, Redis (or a compatible fork such as Valkey) is the usual default because it covers caching and several adjacent jobs. Memcached remains excellent at exactly one thing and runs some of the largest caches in the world.</p>
+
+<h2 id="worked-example">Worked example: caching a product page</h2>
+<p>A store serves 50,000 product page requests per second at peak. Each page needs the product record (5 ms query), price and stock (3 ms), and review summary (40 ms aggregate). The database is sized for 5,000 queries per second.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Data</th><th>Changes</th><th>Cache decision</th><th>Expected hit ratio</th></tr></thead>
+<tbody>
+<tr><th>Product record</th><td>A few times a day</td><td>Cache-aside in Redis, TTL 1 h with jitter, delete via CDC on update</td><td class="num">~99%</td></tr>
+<tr><th>Price and stock</th><td>Every purchase</td><td>Short TTL (5 s) for display; checkout always reads the database</td><td class="num">~90%</td></tr>
+<tr><th>Review summary</th><td>Slowly, tolerates hours</td><td>TTL 6 h, XFetch so the 40 ms aggregate never stampedes</td><td class="num">~99.9%</td></tr>
+<tr><th>Top 500 products</th><td>Same as above</td><td>Also in-process for 2 s in every app server</td><td class="num">Removes their Redis traffic</td></tr>
+</tbody></table></div>
+<div class="calc">Database queries/s = 50,000 × [(1 - 0.99) + (1 - 0.90) + (1 - 0.999)]
+                   = 50,000 × (0.01 + 0.10 + 0.001)       ≈ <span class="r">5,550/s</span>   over the 5,000 budget
+Raise stock TTL hit ratio to 95% (TTL 10 s):
+                   = 50,000 × (0.01 + 0.05 + 0.001)       ≈ <span class="r">3,050/s</span>   fits</div>
+<p>The weakest-cached item dominates the database load, so that is where tuning pays. The product decision hiding in the arithmetic: showing stock up to 10 seconds old on the product page is acceptable because checkout re-reads it transactionally. Caching is often a product question disguised as an infrastructure one.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+<li><strong>Facebook</strong> ran memcache as a look-aside cache at billions of requests per second: leases against stale sets and stampedes, McSqueal for invalidation from the MySQL log, mcrouter for routing, a "gutter" pool to absorb a failed server's keys, and warming new clusters from existing ones.</li>
+<li><strong>Twitter</strong> runs hundreds of cache clusters (Twemcache, then Pelikan). Its 2020 OSDI study of those clusters found heavy TTL use, many write-heavy workloads, and that simple FIFO performed comparably to LRU for most of them.</li>
+<li><strong>Netflix EVCache</strong> wraps Memcached with replication across availability zones, so a zone failure does not cold-start the cache.</li>
+<li><strong>Amazon DynamoDB Accelerator (DAX)</strong> is a managed read-through and write-through cache in front of DynamoDB.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>Whenever reads dominate writes. State the pattern, the TTL, the invalidation path and the expected hit ratio in one breath, then show what the hit ratio does to database load. Mention stampede protection for any hot or expensive key without being asked.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>What happens to the database when the cache restarts? (Hit ratio collapses; warm-up, gradual traffic shift, coalescing.)</li>
+<li>How do you keep the cache consistent with the database? (Delete on write or CDC, TTL backstop, the stale-set race and leases.)</li>
+<li>Why delete instead of update on write?</li>
+<li>One key gets 500k reads per second. Now what?</li>
+<li>Write-back looks fast. Why is it rarely used for business data?</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>A cache with no TTL and no invalidation story.</li>
+<li>Treating the cache as the source of truth for data you cannot lose.</li>
+<li>Sizing the database for the cached load with no plan for a cold cache.</li>
+<li>Caching per-user data at the CDN.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala" target="_blank" rel="noopener">Scaling Memcache at Facebook</a><span>Nishtala et al., NSDI 2013. Leases, invalidation from the database log, regional pools and cold-cluster warm-up.</span></li>
+<li><a href="https://www.usenix.org/conference/osdi20/presentation/yang" target="_blank" rel="noopener">A Large Scale Analysis of Hundreds of In-memory Cache Clusters at Twitter</a><span>Yang, Yue and Rashmi, OSDI 2020. What production cache workloads actually look like.</span></li>
+<li><a href="https://www.vldb.org/pvldb/vol8/p886-vattani.pdf" target="_blank" rel="noopener">Optimal Probabilistic Cache Stampede Prevention</a><span>Vattani, Chierichetti and Lowenstein, VLDB 2015. The XFetch algorithm and its analysis.</span></li>
+<li><a href="https://redis.io/docs/latest/develop/reference/eviction/" target="_blank" rel="noopener">Redis documentation: key eviction</a><span>Eviction policies, approximated LRU and the LFU counter.</span></li>
+</ul>
