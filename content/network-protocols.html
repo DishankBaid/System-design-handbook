@@ -1,0 +1,456 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">A user in Sydney opens your app, and your servers are in Virginia. The round trip is about 200 ms, and before a single byte of your response leaves the server, the client may already have spent three of those round trips just setting up the connection. Nothing in your code can make light travel faster, so the number of round trips a protocol needs is often the biggest term in user-facing latency.</p>
+<p>Every request rides on the same stack: IP moves packets, TCP or UDP turns them into a stream or datagrams, TLS encrypts them, and HTTP gives them meaning. Knowing what each layer costs lets you answer "why is the first request slow?", "why did moving to HTTP/2 make our mobile app worse on bad networks?" and "why are we seeing 502s from the load balancer every few minutes?".</p>
+<p>This chapter covers the transport and HTTP layers. Name resolution happens before any of this and is covered in <a href="dns.html">DNS</a>; long-lived push connections are covered in <a href="realtime.html">Polling, SSE &amp; WebSockets</a>.</p>
+
+<h2 id="tcp">TCP: a reliable, ordered byte stream</h2>
+<p><dfn>TCP</dfn> (Transmission Control Protocol) gives two programs the illusion of a pipe: bytes written on one side come out on the other side, all of them, exactly once, in order. The network underneath offers none of that. IP packets get dropped, duplicated, reordered and delayed. TCP hides this with sequence numbers, acknowledgements, retransmission, and two separate rate controls.</p>
+
+<h3 id="handshake">The three-way handshake</h3>
+<p>Before any data flows, the two sides agree on starting sequence numbers:</p>
+<ol class="steps">
+<li><strong>SYN.</strong> The client picks a random initial sequence number and sends it.</li>
+<li><strong>SYN-ACK.</strong> The server acknowledges it and sends its own initial sequence number.</li>
+<li><strong>ACK.</strong> The client acknowledges the server's number. It may put data in this same packet.</li>
+</ol>
+<p>So a new TCP connection costs <strong>one full round trip</strong> before the client can send its request. A lost SYN is expensive: the initial retransmission timeout is 1 second (RFC 6298), so one dropped packet during setup adds a full second to the request.</p>
+<p>Closing is a separate exchange of FIN packets. The side that closes first enters <dfn>TIME_WAIT</dfn> and keeps the connection's port pair reserved for twice the maximum segment lifetime (60 seconds on Linux), so stray packets from the old connection cannot corrupt a new one. This detail comes back when we look at <a href="#pooling">connections between services</a>.</p>
+
+<h3 id="reliability">Reliability: sequence numbers, ACKs and retransmission</h3>
+<p>TCP numbers every byte, not every packet. The receiver sends back a <dfn>cumulative acknowledgement</dfn>: "I have everything up to byte 48,201". If a segment goes missing, the sender finds out in one of two ways:</p>
+<ul>
+<li><strong>Fast retransmit.</strong> Later segments still arrive, so the receiver keeps acknowledging the same byte. Three duplicate ACKs tell the sender a segment was lost, and it resends immediately, roughly one round trip after the loss. Selective acknowledgements (SACK) mean only the gap is resent.</li>
+<li><strong>Retransmission timeout (RTO).</strong> If nothing comes back at all, the sender waits for a timer derived from measured RTT, with a 200 ms floor on Linux, then resends and doubles the timer on each further failure.</li>
+</ul>
+<p>The receiver delivers bytes to the application <strong>strictly in order</strong>. If byte range 10,000 to 11,459 is missing, everything after it waits in the kernel buffer, even if it arrived perfectly. That rule is the root of <a href="#tcp-hol">head-of-line blocking</a>, the main thing HTTP/3 was built to fix.</p>
+
+<h3 id="flow-vs-congestion">Flow control vs congestion control</h3>
+<p>TCP limits how much unacknowledged data a sender may have in flight. Two different limits apply, protecting two different things, and the sender uses whichever is smaller.</p>
+<div class="defs">
+<div><h4>Flow control: rwnd</h4><p>Protects the <strong>receiver</strong>. Every ACK advertises a <dfn>receive window</dfn> (rwnd): how much free buffer the receiving application has. A slow consumer shrinks the window to zero and the sender stops. This is end-to-end and explicit.</p></div>
+<div><h4>Congestion control: cwnd</h4><p>Protects the <strong>network</strong>. The sender keeps a private <dfn>congestion window</dfn> (cwnd) estimating how much the path can carry without overflowing a router queue. Nobody tells the sender this number; it infers it from ACKs, losses and delay.</p></div>
+</div>
+<p>The window caps throughput: one connection can move at most one window per round trip. The original TCP header has a 16-bit window field, so without the window scaling option (RFC 7323) the ceiling at 100 ms RTT is 65,535 bytes per 0.1 s, about 5.2 Mbit/s, no matter how fast the link is. To fill a 1 Gbit/s path at 100 ms RTT the window must cover the <dfn>bandwidth-delay product</dfn>: 1 Gbit/s × 0.1 s = 12.5 MB in flight. Window scaling allows windows up to 1 GiB, but this is still why a single TCP stream across an ocean often cannot fill a fat pipe.</p>
+
+<h3 id="slow-start">Slow start and the congestion window</h3>
+<p>A new connection does not know the path's capacity, so it probes. <dfn>Slow start</dfn> begins with a small window, 10 segments (about 14.6 KB) on modern stacks per RFC 6928, and doubles it every round trip as ACKs come back. When a loss signals congestion, the window is cut and growth turns linear. This additive increase, multiplicative decrease (<dfn>AIMD</dfn>) pattern lets many flows share a link fairly.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 300" role="img" aria-label="Congestion window per round trip: slow start doubles 10, 20, 40, 80, 160 segments, a loss halves it to 80, then it grows by one segment per round trip">
+<path class="line faint" d="M70,250.0 H690"/><text class="t xs mute end" x="62" y="254.0">0</text>
+<path class="line faint" d="M70,201.1 H690"/><text class="t xs mute end" x="62" y="205.1">40</text>
+<path class="line faint" d="M70,152.2 H690"/><text class="t xs mute end" x="62" y="156.2">80</text>
+<path class="line faint" d="M70,103.3 H690"/><text class="t xs mute end" x="62" y="107.3">120</text>
+<path class="line faint" d="M70,54.4 H690"/><text class="t xs mute end" x="62" y="58.4">160</text>
+<text class="t xs mute mid" x="70.0" y="268">0</text>
+<text class="t xs mute mid" x="158.6" y="268">2</text>
+<text class="t xs mute mid" x="247.1" y="268">4</text>
+<text class="t xs mute mid" x="335.7" y="268">6</text>
+<text class="t xs mute mid" x="424.3" y="268">8</text>
+<text class="t xs mute mid" x="512.9" y="268">10</text>
+<text class="t xs mute mid" x="601.4" y="268">12</text>
+<text class="t xs mute mid" x="690.0" y="268">14</text>
+<text class="t xs mute mid" x="380" y="288">round trip number</text>
+<text class="t xs mute" x="20" y="18">cwnd (segments)</text>
+<polyline points="70.0,237.8 114.3,225.6 158.6,201.1 202.9,152.2 247.1,54.4 291.4,152.2 335.7,151.0 380.0,149.8 424.3,148.6 468.6,147.3 512.9,146.1 557.1,144.9 601.4,143.7 645.7,142.4 690.0,141.2" style="fill:none;stroke:var(--accent);stroke-width:2"/>
+<circle class="dot accent" cx="70.0" cy="237.8" r="3.5"/>
+<text class="t xs mono" x="76.0" y="229.8">10</text>
+<circle class="dot accent" cx="114.3" cy="225.6" r="3.5"/>
+<text class="t xs mono end" x="107.3" y="219.6">20</text>
+<circle class="dot accent" cx="158.6" cy="201.1" r="3.5"/>
+<text class="t xs mono end" x="151.6" y="195.1">40</text>
+<circle class="dot accent" cx="202.9" cy="152.2" r="3.5"/>
+<text class="t xs mono end" x="195.9" y="146.2">80</text>
+<circle class="dot accent" cx="247.1" cy="54.4" r="3.5"/>
+<circle class="dot svc" cx="291.4" cy="152.2" r="3.5"/>
+<circle class="dot svc" cx="335.7" cy="151.0" r="3.5"/>
+<circle class="dot svc" cx="380.0" cy="149.8" r="3.5"/>
+<circle class="dot svc" cx="424.3" cy="148.6" r="3.5"/>
+<circle class="dot svc" cx="468.6" cy="147.3" r="3.5"/>
+<circle class="dot svc" cx="512.9" cy="146.1" r="3.5"/>
+<circle class="dot svc" cx="557.1" cy="144.9" r="3.5"/>
+<circle class="dot svc" cx="601.4" cy="143.7" r="3.5"/>
+<circle class="dot svc" cx="645.7" cy="142.4" r="3.5"/>
+<circle class="dot svc" cx="690.0" cy="141.2" r="3.5"/>
+<text class="t xs mono mid" x="247.1" y="44.4">160</text>
+<text class="t xs mono" x="297.4" y="168.2">80</text>
+<text class="t sm b" x="96" y="84">slow start</text><text class="t xs mute" x="96" y="99">doubles every RTT</text>
+<text class="t sm b red" x="276" y="66">loss detected</text><text class="t xs mute" x="276" y="81">cwnd halves: 160 to 80</text>
+<text class="t sm b" x="420" y="116">congestion avoidance</text><text class="t xs mute" x="420" y="131">+1 segment per RTT (additive increase)</text>
+</svg>
+</div>
+<figcaption><b>The congestion window over time.</b> Reno-style behaviour, drawn to scale. Slow start reaches 160 segments in four round trips, a loss halves the window, and additive increase then adds only one segment per round trip. CUBIC, the Linux default, cuts to 70% instead of 50% and regrows along a cubic curve; BBR models bandwidth and RTT directly instead of reacting to loss.</figcaption>
+</figure>
+
+<p>Slow start has a direct design consequence: <strong>a fresh connection is slow for the first few round trips even on a fast network</strong>. A 100 KB response needs 69 segments, which on a new connection takes three flights (10 + 20 + 40), so two extra round trips after the first byte. Reusing a warm connection avoids both the handshake and part of the ramp-up, although Linux by default resets cwnd after a connection has been idle for longer than its RTO (<code>tcp_slow_start_after_idle</code>), so long-idle pooled connections ramp up again.</p>
+
+<h2 id="udp">UDP: datagrams and nothing else</h2>
+<p><dfn>UDP</dfn> (User Datagram Protocol) adds almost nothing to IP: port numbers, a length and a checksum, in an 8-byte header (TCP's is at least 20 bytes). There is no handshake, no acknowledgement, no retransmission, no ordering and no congestion control. Each <code>send()</code> is one datagram that arrives once, or not at all, possibly out of order.</p>
+<p>That is a feature when the application knows better than TCP what to do about loss:</p>
+<ul>
+<li><strong>Small request-response.</strong> A <a href="dns.html">DNS</a> query and answer each fit in one packet. A TCP handshake would double the round trips, and the client can simply retry.</li>
+<li><strong>Real-time media.</strong> In a video call, a packet that arrives 300 ms late is useless. Retransmitting it, and holding back newer audio behind it as TCP would, makes the call worse. WebRTC carries media over UDP and conceals losses instead.</li>
+<li><strong>Game state and telemetry.</strong> Position updates where only the latest value matters, and metrics (StatsD) where a lost sample is fine.</li>
+<li><strong>Building a better transport in user space.</strong> QUIC is the big one: it implements reliability, congestion control and encryption itself, on top of UDP, because UDP is the only other transport that passes through the internet's middleboxes.</li>
+</ul>
+<div class="callout warn">
+<div class="callout-title">What you take on with UDP</div>
+<p>You own reliability, ordering and congestion control. Keep datagrams under about 1,200 bytes to avoid IP fragmentation. Some networks block UDP, and NATs drop idle UDP mappings quickly, so long-lived flows need keepalives. With no handshake the source address is unverified, which makes UDP services a favourite tool for amplification DDoS attacks.</p>
+</div>
+
+<h2 id="tls">TLS 1.3: encryption in one round trip</h2>
+<p><dfn>TLS</dfn> runs on top of TCP and adds confidentiality, integrity and server authentication. Before encrypted data can flow, client and server must agree on a cipher, prove the server's identity with a certificate, and derive shared keys with a Diffie-Hellman exchange. The question for latency is how many round trips that takes.</p>
+<ul>
+<li><strong>TLS 1.2</strong> needs <strong>two round trips</strong> for a full handshake: one to exchange hellos and the certificate, one for the client's key exchange and both sides' Finished messages. Session resumption and the False Start extension can cut that to one.</li>
+<li><strong>TLS 1.3</strong> (RFC 8446, 2018) needs <strong>one</strong>. The client guesses which key-exchange group the server will accept (almost always X25519) and sends its key share in the very first message. The server can then derive keys immediately, and everything after its ServerHello, including the certificate, is encrypted. If the guess is wrong the server sends a HelloRetryRequest and it costs an extra round trip, which is rare in practice.</li>
+</ul>
+<p>TLS 1.3 also removed static RSA key exchange, so every connection has <dfn>forward secrecy</dfn>: stealing the server's private key later does not decrypt recorded traffic. Certificates, mutual TLS between services and key management are covered in <a href="security.html">Security Fundamentals</a>.</p>
+
+<h3 id="zero-rtt">0-RTT resumption and its replay problem</h3>
+<p>When a client has talked to a server before, it can hold a <dfn>session ticket</dfn> containing a pre-shared key. On the next connection it can encrypt application data with that key and send it in the first flight, alongside the ClientHello. This is <dfn>0-RTT</dfn> or early data: the request reaches the server with zero round trips of TLS overhead.</p>
+<p>The cost is security. Early data is not protected against <strong>replay</strong>: an attacker who records the first flight can send it again, and the server will decrypt and process it again. The server cannot tell the copies apart without extra state. It is also not forward secret, since it is encrypted only under the resumption key. So the rule is strict:</p>
+<ul>
+<li>Only accept early data for requests that are safe to run twice, typically <code>GET</code> and <code>HEAD</code> with no side effects.</li>
+<li>Never let a <code>POST /payments</code> ride in 0-RTT. If an <a href="idempotency.html">idempotency key</a> is not already enforced, a replayed early request is a double charge.</li>
+<li>Proxies that accept early data forward it with an <code>Early-Data: 1</code> header (RFC 8470), and the origin can reply <code>425 Too Early</code> to force the client to retry after the full handshake.</li>
+</ul>
+
+<h2 id="http1">HTTP/1.1: keep-alive and its limits</h2>
+<p>HTTP/1.0 opened a new TCP connection per request, paying the handshake and slow start every time. HTTP/1.1 made <dfn>persistent connections</dfn> (keep-alive) the default: after a response, the connection stays open for the next request. That one change removes most setup cost for a busy client.</p>
+<p>What HTTP/1.1 cannot do is overlap requests on one connection. It is a text protocol where a response is just bytes on the stream, delimited by <code>Content-Length</code> or chunked encoding, with no identifier saying which request it answers. So a connection carries one request at a time: send, wait a round trip plus server time, read, repeat.</p>
+
+<h3 id="pipelining">Why pipelining failed</h3>
+<p><dfn>Pipelining</dfn> lets a client send several requests back to back without waiting. The catch is that responses must come back in the same order the requests were sent, because nothing else ties them together. If the first request is a slow database query and the next four are tiny static files, the four small responses wait behind the slow one. That is <dfn>head-of-line blocking</dfn> at the application layer. Add buggy proxies and no safe way to retry after a failure halfway, and every major browser shipped with pipelining disabled.</p>
+<p>Browsers worked around the limit by opening <strong>up to six connections per host</strong>. Sites with dozens of assets pushed further with hacks that look odd today: <em>domain sharding</em> (spreading assets over <code>static1.example.com</code> to <code>static4.example.com</code> to get more connections), image sprites and file concatenation. Each extra connection pays its own handshake and its own slow start.</p>
+
+<h2 id="http2">HTTP/2: many streams on one connection</h2>
+<p>HTTP/2 (RFC 9113) keeps HTTP's semantics (methods, headers, status codes) but replaces the wire format. Messages are split into binary <dfn>frames</dfn>, each tagged with a <dfn>stream</dfn> ID. A stream is one request-response exchange. Frames from many streams interleave on a single TCP connection, and the receiver reassembles each stream by its ID. That is <dfn>multiplexing</dfn>: one connection carries a hundred concurrent requests (a common <code>SETTINGS_MAX_CONCURRENT_STREAMS</code> value), and a slow response no longer blocks fast ones at the HTTP layer.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 290" role="img" aria-label="HTTP/1.1 uses six connections each with its own handshake and one response at a time; HTTP/2 uses one connection with frames from several streams interleaved">
+<text class="t sm b" x="20" y="22">HTTP/1.1: six connections, one response at a time on each</text>
+<g>
+<text class="t xs mute" x="20" y="51">conn 1</text><rect class="n ext" x="110" y="40" width="80" height="14" rx="3"/><rect class="n svc" x="220" y="40" width="80" height="14" rx="3"/><rect class="n db" x="340" y="40" width="80" height="14" rx="3"/>
+<text class="t xs mute" x="20" y="71">conn 2</text><rect class="n ext" x="110" y="60" width="80" height="14" rx="3"/><rect class="n cache" x="220" y="60" width="80" height="14" rx="3"/><rect class="n queue" x="340" y="60" width="80" height="14" rx="3"/>
+<text class="t xs mute" x="20" y="91">conn 3</text><rect class="n ext" x="110" y="80" width="80" height="14" rx="3"/><rect class="n db" x="220" y="80" width="80" height="14" rx="3"/><rect class="n svc" x="340" y="80" width="80" height="14" rx="3"/>
+<text class="t xs mute" x="20" y="111">conn 4</text><rect class="n ext" x="110" y="100" width="80" height="14" rx="3"/><rect class="n queue" x="220" y="100" width="80" height="14" rx="3"/><rect class="n cache" x="340" y="100" width="80" height="14" rx="3"/>
+<text class="t xs mute" x="20" y="131">conn 5</text><rect class="n ext" x="110" y="120" width="80" height="14" rx="3"/><rect class="n svc" x="220" y="120" width="80" height="14" rx="3"/>
+<text class="t xs mute" x="20" y="151">conn 6</text><rect class="n ext" x="110" y="140" width="80" height="14" rx="3"/><rect class="n db" x="220" y="140" width="80" height="14" rx="3"/>
+</g>
+<text class="t xs mute mid" x="150" y="172">6 handshakes</text>
+<text class="t xs mute mid" x="320" y="172">idle gap: next request in flight</text>
+<path class="line faint" d="M300,160 V164 H340 V160"/>
+<text class="t sm" x="450" y="78">10 responses need 6 TCP and</text>
+<text class="t sm" x="450" y="96">TLS handshakes, 6 slow starts,</text>
+<text class="t sm" x="450" y="114">and a round trip of idle time</text>
+<text class="t sm" x="450" y="132">between responses.</text>
+
+<path class="line faint" d="M20,190 H700"/>
+<text class="t sm b" x="20" y="214">HTTP/2: one connection, frames from many streams interleaved</text>
+<text class="t xs mute" x="20" y="241">conn 1</text>
+<rect class="n ext" x="110" y="228" width="80" height="20" rx="3"/>
+<rect class="n svc" x="220" y="228" width="18" height="20" rx="2"/><text class="t xs mid" x="229" y="242">1</text>
+<rect class="n db" x="240" y="228" width="18" height="20" rx="2"/><text class="t xs mid" x="249" y="242">3</text>
+<rect class="n cache" x="260" y="228" width="18" height="20" rx="2"/><text class="t xs mid" x="269" y="242">5</text>
+<rect class="n queue" x="280" y="228" width="18" height="20" rx="2"/><text class="t xs mid" x="289" y="242">7</text>
+<rect class="n svc" x="300" y="228" width="18" height="20" rx="2"/><text class="t xs mid" x="309" y="242">1</text>
+<rect class="n cache" x="320" y="228" width="18" height="20" rx="2"/><text class="t xs mid" x="329" y="242">5</text>
+<rect class="n db" x="340" y="228" width="18" height="20" rx="2"/><text class="t xs mid" x="349" y="242">3</text>
+<rect class="n queue" x="360" y="228" width="18" height="20" rx="2"/><text class="t xs mid" x="369" y="242">7</text>
+<rect class="n cache" x="380" y="228" width="18" height="20" rx="2"/><text class="t xs mid" x="389" y="242">5</text>
+<rect class="n svc" x="400" y="228" width="18" height="20" rx="2"/><text class="t xs mid" x="409" y="242">1</text>
+<text class="t xs mute mid" x="150" y="266">1 handshake</text>
+<text class="t xs mute mid" x="319" y="266">frames tagged with stream IDs 1, 3, 5, 7</text>
+<text class="t sm" x="450" y="236">All requests sent at once; one</text>
+<text class="t sm" x="450" y="254">window, one slow start, shared.</text>
+<path class="e" d="M110,282 H690"/><text class="t xs mute end" x="690" y="276">time</text>
+</svg>
+</div>
+<figcaption><b>Multiplexing.</b> Grey blocks are connection setup, coloured blocks are response data. HTTP/1.1 needs parallel connections to get concurrency and still idles between requests. HTTP/2 sends every request immediately and interleaves the responses as frames on one connection.</figcaption>
+</figure>
+
+<p>Streams also get their own flow-control windows, so one large download cannot starve the others, and a client can cancel a single stream with <code>RST_STREAM</code> instead of tearing down the connection. The ability to open and cancel streams cheaply has a dark side: the 2023 "Rapid Reset" attack (CVE-2023-44487) opened and immediately reset streams in a loop, producing record-breaking request floods against servers that did real work for each stream before noticing the cancel. Anything that terminates HTTP/2 at your edge, such as a <a href="proxies-gateways.html">reverse proxy or gateway</a>, needs limits on stream churn.</p>
+
+<h3 id="hpack">HPACK header compression</h3>
+<p>Every request from a browser repeats the same <code>user-agent</code>, <code>accept-*</code> and often a cookie of several hundred bytes; across 80 requests that is tens of kilobytes of identical text. <dfn>HPACK</dfn> (RFC 7541) compresses headers with three tools:</p>
+<ul>
+<li>A <strong>static table</strong> of 61 common header fields, such as <code>:method: GET</code> and <code>:status: 200</code>, each sendable as a single index byte.</li>
+<li>A <strong>dynamic table</strong> (4,096 bytes by default) that both sides fill with headers seen on this connection. The second time a 400-byte cookie is sent, it costs a one or two byte index.</li>
+<li><strong>Huffman coding</strong> for literal values that are not in either table.</li>
+</ul>
+<p>HPACK deliberately avoids general-purpose compression like gzip, because compressing secrets alongside attacker-influenced data leaks them through compressed size (the CRIME attack). It relies on both sides updating the dynamic table in exactly the same order, which TCP guarantees. QUIC does not, which is why HTTP/3 needed a different scheme.</p>
+
+<h3 id="tcp-hol">The catch: TCP head-of-line blocking</h3>
+<p>HTTP/2 removed head-of-line blocking at the HTTP layer and moved it down to TCP. All streams share one TCP byte stream, and TCP delivers bytes strictly in order. When one packet is lost, every byte after it waits in the kernel for the retransmission, about one round trip later, even if those bytes belong to other streams that are complete.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 295" role="img" aria-label="One lost packet carrying stream A: over TCP, streams B and C wait too; over QUIC, only stream A waits">
+<text class="t sm b" x="20" y="24">HTTP/2 over TCP: one ordered byte stream</text>
+<rect class="n svc" x="20" y="40" width="54" height="40" rx="5"/><text class="t b mid" x="47" y="58">A</text><text class="t xs mute mid" x="47" y="73">pkt 1</text>
+<rect class="n db" x="84" y="40" width="54" height="40" rx="5"/><text class="t b mid" x="111" y="58">B</text><text class="t xs mute mid" x="111" y="73">pkt 2</text>
+<rect class="n bad" x="148" y="40" width="54" height="40" rx="5" style="stroke-dasharray:4 3"/><text class="t b mid red" x="175" y="58">A</text><text class="t xs red mid" x="175" y="73">lost</text>
+<rect class="n cache" x="212" y="40" width="54" height="40" rx="5"/><text class="t b mid" x="239" y="58">C</text><text class="t xs mute mid" x="239" y="73">pkt 4</text>
+<rect class="n db" x="276" y="40" width="54" height="40" rx="5"/><text class="t b mid" x="303" y="58">B</text><text class="t xs mute mid" x="303" y="73">pkt 5</text>
+<rect class="n svc" x="340" y="40" width="54" height="40" rx="5"/><text class="t b mid" x="367" y="58">A</text><text class="t xs mute mid" x="367" y="73">pkt 6</text>
+<rect class="n cache" x="404" y="40" width="54" height="40" rx="5"/><text class="t b mid" x="431" y="58">C</text><text class="t xs mute mid" x="431" y="73">pkt 7</text>
+<rect class="n db" x="468" y="40" width="54" height="40" rx="5"/><text class="t b mid" x="495" y="58">B</text><text class="t xs mute mid" x="495" y="73">pkt 8</text>
+<path class="line faint" d="M212,90 V96 H522 V90"/>
+<text class="t sm mid" x="367" y="114">arrived, but held in the kernel until pkt 3 is resent</text>
+<text class="t xs mute" x="565" y="50">delivered to the app</text>
+<text class="t sm red" x="565" y="72">stream A: waits</text>
+<text class="t sm red" x="565" y="92">stream B: waits</text>
+<text class="t sm red" x="565" y="112">stream C: waits</text>
+
+<path class="line faint" d="M20,150 H700"/>
+<text class="t sm b" x="20" y="184">HTTP/3 over QUIC: streams ordered independently</text>
+<rect class="n svc" x="20" y="200" width="54" height="40" rx="5"/><text class="t b mid" x="47" y="218">A</text><text class="t xs mute mid" x="47" y="233">pkt 1</text>
+<rect class="n db" x="84" y="200" width="54" height="40" rx="5"/><text class="t b mid" x="111" y="218">B</text><text class="t xs mute mid" x="111" y="233">pkt 2</text>
+<rect class="n bad" x="148" y="200" width="54" height="40" rx="5" style="stroke-dasharray:4 3"/><text class="t b mid red" x="175" y="218">A</text><text class="t xs red mid" x="175" y="233">lost</text>
+<rect class="n cache" x="212" y="200" width="54" height="40" rx="5"/><text class="t b mid" x="239" y="218">C</text><text class="t xs mute mid" x="239" y="233">pkt 4</text>
+<rect class="n db" x="276" y="200" width="54" height="40" rx="5"/><text class="t b mid" x="303" y="218">B</text><text class="t xs mute mid" x="303" y="233">pkt 5</text>
+<rect class="n svc" x="340" y="200" width="54" height="40" rx="5"/><text class="t b mid" x="367" y="218">A</text><text class="t xs mute mid" x="367" y="233">pkt 6</text>
+<rect class="n cache" x="404" y="200" width="54" height="40" rx="5"/><text class="t b mid" x="431" y="218">C</text><text class="t xs mute mid" x="431" y="233">pkt 7</text>
+<rect class="n db" x="468" y="200" width="54" height="40" rx="5"/><text class="t b mid" x="495" y="218">B</text><text class="t xs mute mid" x="495" y="233">pkt 8</text>
+<path class="line faint" d="M212,250 V256 H522 V250"/>
+<text class="t sm mid" x="367" y="274">B and C handed to the app now; only A waits</text>
+<text class="t xs mute" x="565" y="210">delivered to the app</text>
+<text class="t sm red" x="565" y="232">stream A: waits</text>
+<text class="t sm green" x="565" y="252">stream B: delivered</text>
+<text class="t sm green" x="565" y="272">stream C: delivered</text>
+</svg>
+</div>
+<figcaption><b>Where head-of-line blocking lives.</b> The same eight packets and the same loss. TCP cannot release packets 4 to 8 because it only knows about one byte stream. QUIC knows which stream each frame belongs to, so a loss only stalls the stream that lost data.</figcaption>
+</figure>
+
+<p>On a clean wired network this rarely matters. On a lossy mobile or Wi-Fi link it can make HTTP/2 slower than HTTP/1.1, because with six connections one loss stalls one-sixth of the traffic, while with one HTTP/2 connection it stalls all of it, and the single connection's window is halved for everyone. That observation is the main motivation for HTTP/3.</p>
+
+<h2 id="http3">HTTP/3 and QUIC</h2>
+<p><dfn>QUIC</dfn> (RFC 9000, 2021) is a transport protocol that runs over UDP and does what TCP plus TLS did, with three structural changes. Google started it as an experiment around 2013; HTTP/3 (RFC 9114) is HTTP mapped onto it.</p>
+<ul>
+<li><strong>Streams are a transport concept.</strong> Reliability and ordering are per stream, so a lost packet only stalls the streams whose data it carried, as in the figure above.</li>
+<li><strong>The handshake is merged.</strong> TLS 1.3 is built in, not layered on top, so transport and cryptographic setup complete together in <strong>one round trip</strong>, and resumed connections can send 0-RTT data with the same replay caveats as TLS 1.3.</li>
+<li><strong>Almost everything is encrypted.</strong> Packet numbers and most header fields are protected, so middleboxes cannot inspect or tamper with transport state. That keeps QUIC evolvable, where TCP is frozen by routers that assume how it behaves.</li>
+</ul>
+<p>Because HPACK depends on in-order delivery, HTTP/3 uses <dfn>QPACK</dfn> (RFC 9204), which updates the dynamic table on a separate stream so header blocks on different streams do not block each other.</p>
+
+<h3 id="migration">Connection migration</h3>
+<p>A TCP connection is identified by its 4-tuple: source IP, source port, destination IP, destination port. When a phone walks out of Wi-Fi range and switches to cellular, its IP changes, the 4-tuple changes, and every TCP connection dies. The app must reconnect, redo handshakes and retry in-flight requests.</p>
+<p>QUIC identifies connections by a <dfn>connection ID</dfn> carried in each packet. When the client's address changes, it keeps sending with the same connection ID from the new address; the server validates the new path and the connection continues. The infrastructure consequence: a <a href="load-balancing.html">load balancer</a> in front of QUIC servers must route by connection ID, not by the 4-tuple, or migrated packets land on a server that has never seen the connection.</p>
+
+<h3 id="quic-costs">What QUIC costs</h3>
+<ul>
+<li><strong>Discovery.</strong> A browser's first contact is usually over TCP; the server advertises HTTP/3 with an <code>Alt-Svc</code> response header; an HTTPS DNS record can advertise it up front.</li>
+<li><strong>Blocked UDP.</strong> Some networks block or throttle UDP on port 443, so clients race or fall back to TCP. You must keep serving HTTP/2.</li>
+<li><strong>CPU.</strong> QUIC runs in user space and encrypts every packet, and decades of kernel and NIC offloads were built for TCP. Per byte it costs noticeably more CPU, although batching (UDP GSO) closes much of the gap.</li>
+<li><strong>Amplification limits.</strong> Until a client's address is validated, a server may send at most three times the bytes it received, which can add a round trip when certificate chains are large.</li>
+</ul>
+
+<h2 id="round-trips">Worked example: time to first byte at 100 ms RTT</h2>
+<p>A client 100 ms of round-trip time from the server requests a page. The server takes 20 ms to produce the first byte. DNS is already cached. Count round trips before the request can leave, add one for the request itself, then add server time. Step through the sequence diagrams to see where each round trip goes.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 470" role="img" aria-label="Sequence diagrams of the round trips before the first response byte for TCP plus TLS 1.2, TCP plus TLS 1.3, QUIC, and QUIC 0-RTT">
+<rect class="n client" x="120" y="20" width="100" height="36" rx="7"/><text class="t sm b mid" x="170" y="43">Client</text>
+<rect class="n svc" x="420" y="20" width="100" height="36" rx="7"/><text class="t sm b mid" x="470" y="43">Server</text>
+<path class="line faint" d="M170,56 V450 M470,56 V450" style="stroke-dasharray:3 4"/>
+<path class="line faint" d="M80,86 H90"/><text class="t xs mute end" x="74" y="90">0 ms</text>
+<path class="line faint" d="M80,174 H90"/><text class="t xs mute end" x="74" y="178">100 ms</text>
+<path class="line faint" d="M80,262 H90"/><text class="t xs mute end" x="74" y="266">200 ms</text>
+<path class="line faint" d="M80,350 H90"/><text class="t xs mute end" x="74" y="354">300 ms</text>
+<path class="line faint" d="M80,438 H90"/><text class="t xs mute end" x="74" y="442">400 ms</text>
+<g data-show="1">
+<path class="e " d="M170,86.0 L467.0,129.6"/><text class="t sm mid" transform="translate(320.0,108.0) rotate(8.34)" x="0" y="-6">SYN</text>
+<path class="e " d="M470,130.0 L173.0,173.6"/><text class="t sm mid" transform="translate(320.0,152.0) rotate(-8.34)" x="0" y="-6">SYN-ACK</text>
+<path class="e " d="M170,174.0 L467.0,217.6"/><text class="t sm mid" transform="translate(320.0,196.0) rotate(8.34)" x="0" y="-6">ACK, ClientHello</text>
+<path class="e " d="M470,218.0 L173.0,261.6"/><text class="t sm mid" transform="translate(320.0,240.0) rotate(-8.34)" x="0" y="-6">ServerHello, Cert, Done</text>
+<path class="e " d="M170,262.0 L467.0,305.6"/><text class="t sm mid" transform="translate(320.0,284.0) rotate(8.34)" x="0" y="-6">KeyExchange, Finished</text>
+<path class="e " d="M470,306.0 L173.0,349.6"/><text class="t sm mid" transform="translate(320.0,328.0) rotate(-8.34)" x="0" y="-6">Finished</text>
+<path class="e accent" d="M170,350.0 L467.0,393.6"/><text class="t sm mid accent" transform="translate(320.0,372.0) rotate(8.34)" x="0" y="-6">GET /</text>
+<path class="e green" d="M470,394.0 L177.9,436.8"/><text class="t sm mid green" transform="translate(320.0,416.0) rotate(-8.34)" x="0" y="-6">200 OK, first byte</text>
+<circle class="dot accent" cx="170" cy="438.0" r="5"/><text class="t sm b end accent" x="160" y="456.0">first byte</text>
+<rect class="n" x="505" y="86" width="205" height="128" rx="8"/>
+<text class="t b" x="519" y="110">TCP + TLS 1.2</text>
+<text class="t sm" x="519" y="134">TCP handshake: 1 RTT</text>
+<text class="t sm" x="519" y="152">TLS handshake: 2 RTT</text>
+<text class="t sm" x="519" y="170">Request: 1 RTT</text>
+<text class="t sm b accent" x="519" y="198">First byte at 4 RTT = 400 ms</text>
+</g>
+<g data-show="2">
+<path class="e " d="M170,86.0 L467.0,129.6"/><text class="t sm mid" transform="translate(320.0,108.0) rotate(8.34)" x="0" y="-6">SYN</text>
+<path class="e " d="M470,130.0 L173.0,173.6"/><text class="t sm mid" transform="translate(320.0,152.0) rotate(-8.34)" x="0" y="-6">SYN-ACK</text>
+<path class="e " d="M170,174.0 L467.0,217.6"/><text class="t sm mid" transform="translate(320.0,196.0) rotate(8.34)" x="0" y="-6">ACK, ClientHello + key</text>
+<path class="e " d="M470,218.0 L173.0,261.6"/><text class="t sm mid" transform="translate(320.0,240.0) rotate(-8.34)" x="0" y="-6">ServerHello ... Finished</text>
+<path class="e accent" d="M170,262.0 L467.0,305.6"/><text class="t sm mid accent" transform="translate(320.0,284.0) rotate(8.34)" x="0" y="-6">Finished, GET /</text>
+<path class="e green" d="M470,306.0 L177.9,348.8"/><text class="t sm mid green" transform="translate(320.0,328.0) rotate(-8.34)" x="0" y="-6">200 OK, first byte</text>
+<circle class="dot accent" cx="170" cy="350.0" r="5"/><text class="t sm b end accent" x="160" y="368.0">first byte</text>
+<rect class="n" x="505" y="86" width="205" height="128" rx="8"/>
+<text class="t b" x="519" y="110">TCP + TLS 1.3</text>
+<text class="t sm" x="519" y="134">TCP handshake: 1 RTT</text>
+<text class="t sm" x="519" y="152">TLS handshake: 1 RTT</text>
+<text class="t sm" x="519" y="170">Request: 1 RTT</text>
+<text class="t sm b accent" x="519" y="198">First byte at 3 RTT = 300 ms</text>
+</g>
+<g data-show="3">
+<path class="e " d="M170,86.0 L467.0,129.6"/><text class="t sm mid" transform="translate(320.0,108.0) rotate(8.34)" x="0" y="-6">Initial: ClientHello + key</text>
+<path class="e " d="M470,130.0 L173.0,173.6"/><text class="t sm mid" transform="translate(320.0,152.0) rotate(-8.34)" x="0" y="-6">ServerHello ... Finished</text>
+<path class="e accent" d="M170,174.0 L467.0,217.6"/><text class="t sm mid accent" transform="translate(320.0,196.0) rotate(8.34)" x="0" y="-6">Finished, GET /</text>
+<path class="e green" d="M470,218.0 L177.9,260.8"/><text class="t sm mid green" transform="translate(320.0,240.0) rotate(-8.34)" x="0" y="-6">200 OK, first byte</text>
+<circle class="dot accent" cx="170" cy="262.0" r="5"/><text class="t sm b end accent" x="160" y="280.0">first byte</text>
+<rect class="n" x="505" y="86" width="205" height="128" rx="8"/>
+<text class="t b" x="519" y="110">QUIC (HTTP/3)</text>
+<text class="t sm" x="519" y="134">Transport + TLS together:</text>
+<text class="t sm" x="519" y="152">1 RTT</text>
+<text class="t sm" x="519" y="170">Request: 1 RTT</text>
+<text class="t sm b accent" x="519" y="198">First byte at 2 RTT = 200 ms</text>
+</g>
+<g data-show="4">
+<path class="e accent" d="M170,86.0 L467.0,129.6"/><text class="t sm mid accent" transform="translate(320.0,108.0) rotate(8.34)" x="0" y="-6">ClientHello + 0-RTT GET /</text>
+<path class="e green" d="M470,130.0 L177.9,172.8"/><text class="t sm mid green" transform="translate(320.0,152.0) rotate(-8.34)" x="0" y="-6">ServerHello + 200 OK</text>
+<circle class="dot accent" cx="170" cy="174.0" r="5"/><text class="t sm b end accent" x="160" y="192.0">first byte</text>
+<rect class="n" x="505" y="86" width="205" height="150" rx="8"/>
+<text class="t b" x="519" y="110">QUIC 0-RTT (resumed)</text>
+<text class="t sm" x="519" y="134">Request rides in the</text>
+<text class="t sm" x="519" y="152">first flight, encrypted</text>
+<text class="t sm" x="519" y="170">with a resumption key</text>
+<text class="t sm b accent" x="519" y="198">First byte at 1 RTT = 100 ms</text>
+<text class="t sm red" x="519" y="220">Replayable: safe methods only</text>
+</g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">TCP + TLS 1.2</button><button type="button" data-step="2" aria-pressed="false">TCP + TLS 1.3</button><button type="button" data-step="3" aria-pressed="false">QUIC</button><button type="button" data-step="4" aria-pressed="false">QUIC 0-RTT</button></div>
+</div>
+<figcaption><b>Round trips to the first byte.</b> Each diagonal is half a round trip. Server processing time is left out of the drawing. Each protocol generation removes one round trip of setup: TLS 1.3 drops one from TLS, QUIC merges the transport handshake into the TLS one, and 0-RTT removes setup entirely for returning clients.</figcaption>
+</figure>
+
+<div class="calc">TCP + TLS 1.2    1 (TCP) + 2 (TLS) + 1 (request) = 4 RTT  →  4 × 100 + 20 = <span class="r">420 ms</span>
+TCP + TLS 1.3    1 (TCP) + 1 (TLS) + 1 (request) = 3 RTT  →  3 × 100 + 20 = <span class="r">320 ms</span>
+QUIC             1 (QUIC + TLS)    + 1 (request) = 2 RTT  →  2 × 100 + 20 = <span class="r">220 ms</span>
+QUIC 0-RTT       request in first flight         = 1 RTT  →  1 × 100 + 20 = <span class="r">120 ms</span>
+Warm keep-alive  connection already open         = 1 RTT  →  1 × 100 + 20 = <span class="r">120 ms</span>
+
+100 KB body = 69 segments of 1,460 B. Fresh window: 10 + 20 + 40 = 70 segments
+→ 3 flights, so 2 more round trips after the first byte = +200 ms</div>
+
+<p>The same arithmetic as a script, so the numbers can be checked and re-run for other RTTs:</p>
+<pre><code class="language-python">import math
+
+RTT_MS = 100        # client to server round trip
+SERVER_MS = 20      # time the server spends producing the first byte
+MSS = 1460          # bytes of payload per TCP segment
+INIT_CWND = 10      # initial congestion window in segments (RFC 6928)
+
+# Round trips spent on setup before the request can be sent
+SETUP_RTTS = {
+    "warm keep-alive connection": 0,
+    "TCP, plain HTTP": 1,
+    "TCP + TLS 1.2": 3,
+    "TCP + TLS 1.3": 2,
+    "TCP + TLS 1.3, 0-RTT": 1,
+    "QUIC (HTTP/3)": 1,
+    "QUIC, 0-RTT": 0,
+}
+
+
+def slow_start_rounds(size_bytes: int) -&gt; int:
+    """Flights needed to send size_bytes on a fresh window: cwnd doubles per RTT, no loss."""
+    segments = math.ceil(size_bytes / MSS)
+    flights, cwnd, sent = 0, INIT_CWND, 0
+    while sent &lt; segments:
+        sent += cwnd
+        cwnd *= 2
+        flights += 1
+    return flights
+
+
+extra = slow_start_rounds(100_000) - 1   # the first flight arrives with the first byte
+for name, setup in SETUP_RTTS.items():
+    ttfb = (setup + 1) * RTT_MS + SERVER_MS
+    print(f"{name:28} TTFB {ttfb:3} ms   100 KB done {ttfb + extra * RTT_MS:3} ms")
+
+# warm keep-alive connection   TTFB 120 ms   100 KB done 320 ms
+# TCP, plain HTTP              TTFB 220 ms   100 KB done 420 ms
+# TCP + TLS 1.2                TTFB 420 ms   100 KB done 620 ms
+# TCP + TLS 1.3                TTFB 320 ms   100 KB done 520 ms
+# TCP + TLS 1.3, 0-RTT         TTFB 220 ms   100 KB done 420 ms
+# QUIC (HTTP/3)                TTFB 220 ms   100 KB done 420 ms
+# QUIC, 0-RTT                  TTFB 120 ms   100 KB done 320 ms</code></pre>
+<p>Three lessons come out of the table:</p>
+<ul>
+<li><strong>Setup dominates small requests.</strong> For TCP + TLS 1.2, 300 of the 420 ms is handshake.</li>
+<li><strong>Connection reuse beats every protocol upgrade.</strong> A warm keep-alive connection matches QUIC 0-RTT, with no replay risk. The "100 KB done" column assumes a fresh window; a warm connection whose cwnd is still open could deliver the body in one flight, unless it sat idle long enough for the kernel to reset it.</li>
+<li><strong>Distance is the multiplier.</strong> Every row scales with RTT. Terminating TCP and TLS at a nearby edge, 10 ms away instead of 100 ms, shrinks the handshake round trips tenfold and leaves only the request to travel to the origin over a long-lived, pre-warmed connection. That is why <a href="cdn.html">CDNs</a> speed up even uncacheable content.</li>
+</ul>
+
+<h2 id="pooling">Connections between services</h2>
+<p>Inside a data centre, RTTs are well under a millisecond, so handshake latency matters less. What matters is CPU (a TLS handshake with mutual authentication is far more expensive than reusing a connection), ports, and how connection lifetimes interact with load balancers. Every service-to-service client should use a <dfn>connection pool</dfn>: a set of open, reusable connections per destination.</p>
+
+<h3 id="pool-sizing">Sizing a pool</h3>
+<p>With HTTP/1.1 each connection carries one request at a time, so by Little's law the pool needs about <code>request rate × latency</code> connections. A service calling a dependency at 2,000 requests per second with 25 ms average latency needs 2,000 × 0.025 = 50 busy connections on average; size the pool with headroom for latency spikes, since latency doubling doubles the connections in use. With HTTP/2 or gRPC a handful of connections carries the same load as multiplexed streams.</p>
+<p>Bound the pool and the wait for a free connection; an unbounded pool turns one slow dependency into thousands of open connections in every caller. See <a href="fault-tolerance.html">Timeouts, Retries &amp; Circuit Breakers</a>.</p>
+
+<h3 id="pool-pitfalls">The classic pitfalls</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><th>Sporadic 502s from the load balancer</th><td>The backend's keep-alive timeout is shorter than the LB's idle timeout. The backend closes an idle connection just as the LB sends a request on it. AWS ALB defaults to 60 s idle; Node.js servers default to a 5 s keep-alive timeout.</td><td>Make the server-side keep-alive timeout longer than the client-side idle timeout, at every hop.</td></tr>
+<tr><th><code>EADDRNOTAVAIL</code>, connect failures under load</th><td>Ephemeral port exhaustion. A client opening and closing connections leaves each in TIME_WAIT for 60 s. Linux's default port range has 28,232 ports, so one client to one backend address tops out near 28,232 / 60 ≈ 470 new connections per second.</td><td>Reuse connections. Spread over more destination addresses. Widen the port range.</td></tr>
+<tr><th>One backend pod hot, new pods idle</th><td>HTTP/2 or gRPC connections are long-lived and an L4 balancer picks a backend once per connection, not per request. New pods get no traffic until clients reconnect.</td><td>Balance per request at L7 or in the client, or cap connection age (gRPC <code>MAX_CONNECTION_AGE</code>) so clients rebalance. See <a href="load-balancing.html">Load Balancing</a>.</td></tr>
+<tr><th>Traffic keeps going to removed hosts</th><td>Pooled connections outlive DNS or service-discovery changes.</td><td>Maximum connection lifetime, plus draining on the server side. See <a href="service-discovery.html">Service Discovery</a>.</td></tr>
+<tr><th>Small requests take an extra ~40 ms</th><td>Nagle's algorithm holds a small write until the previous one is acknowledged, and the peer's delayed ACK holds that acknowledgement, typically about 40 ms on Linux and up to 200 ms on other stacks.</td><td>Set <code>TCP_NODELAY</code>; most HTTP and RPC libraries already do.</td></tr>
+</tbody></table></div>
+
+<h2 id="comparison">Choosing a protocol</h2>
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>HTTP/1.1</th><th>HTTP/2</th><th>HTTP/3</th></tr></thead>
+<tbody>
+<tr><th>Transport</th><td>TCP (+ TLS)</td><td>TCP + TLS</td><td>QUIC over UDP, TLS 1.3 built in</td></tr>
+<tr><th>Concurrency per connection</th><td class="no">One request at a time</td><td class="yes">Many multiplexed streams</td><td class="yes">Many independent streams</td></tr>
+<tr><th>Head-of-line blocking</th><td class="no">HTTP layer and TCP layer</td><td class="meh">TCP layer only</td><td class="yes">Only within one stream</td></tr>
+<tr><th>Header compression</th><td class="no">None</td><td class="yes">HPACK</td><td class="yes">QPACK</td></tr>
+<tr><th>Setup before first request (new)</th><td>2 RTT with TLS 1.3</td><td>2 RTT with TLS 1.3</td><td class="yes">1 RTT, 0 when resumed</td></tr>
+<tr><th>Survives IP change</th><td class="no">No</td><td class="no">No</td><td class="yes">Yes, via connection IDs</td></tr>
+<tr><th>Works everywhere</th><td class="yes">Yes</td><td class="yes">Yes</td><td class="meh">Needs UDP 443; TCP fallback required</td></tr>
+<tr><th>Best fit</th><td>Simple clients, debugging, legacy</td><td>Default for browsers and service-to-service (gRPC)</td><td>Mobile and lossy networks, global consumer apps</td></tr>
+</tbody></table></div>
+<p>A sensible default: HTTP/2 between services, HTTP/3 enabled at the edge or CDN for browsers and mobile apps, TLS 1.3 everywhere, and raw UDP only for real-time media, games or telemetry. For the API style on top (REST, gRPC, GraphQL) see <a href="api-design.html">API Design</a>.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+<li><strong>Google</strong> built QUIC to cut search and YouTube latency, ran it as gQUIC in Chrome for years, then took it through the IETF, where it became RFC 9000 in 2021. Google also developed BBR congestion control and deployed it for google.com and YouTube traffic.</li>
+<li><strong>Browsers and CDNs</strong>: Chrome, Firefox and Safari all speak HTTP/3, and CDNs such as Cloudflare, Akamai and Fastly terminate it at the edge, so most sites get HTTP/3 by flipping a setting rather than changing their origin. Chrome removed HTTP/2 server push in 2022; <a href="realtime.html">server-to-client push</a> is done with SSE or WebSockets instead.</li>
+<li><strong>Meta and Uber</strong> moved mobile app traffic to QUIC and reported lower tail latencies, mostly on lossy cellular networks.</li>
+<li><strong>gRPC</strong> runs on HTTP/2 and is the standard example of the long-lived connection balancing problem. Envoy and other service-mesh proxies solve it by balancing each request at L7 instead of each connection.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>When latency for distant or mobile users is a requirement, when you choose a transport for real-time features, and when you design service-to-service communication. One sentence is often enough: "Clients are global and mobile, so I'll terminate TLS 1.3 and HTTP/3 at edge PoPs and keep warm, pooled HTTP/2 connections back to the origin."</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>Why is the first request to a new server slow? Count the round trips: TCP, TLS, request, plus slow start for the body.</li>
+<li>What does HTTP/2 fix, and what does it not? Multiplexing and header compression; TCP head-of-line blocking remains.</li>
+<li>Why is HTTP/3 built on UDP rather than a new transport? Middleboxes only pass TCP and UDP, and TCP is ossified in kernels and routers.</li>
+<li>Is 0-RTT safe? Only for replay-safe requests; explain the replay attack and <code>425 Too Early</code>.</li>
+<li>Our gRPC service has one hot pod after a scale-out. Why? Long-lived HTTP/2 connections behind an L4 balancer.</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>Saying HTTP/2 removes head-of-line blocking entirely.</li>
+<li>Confusing flow control (receiver buffer) with congestion control (network capacity).</li>
+<li>Choosing UDP "because it is faster" for data that must arrive completely, then reinventing TCP badly.</li>
+<li>Allowing non-idempotent requests in 0-RTT.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://www.rfc-editor.org/rfc/rfc9293" target="_blank" rel="noopener">RFC 9293: Transmission Control Protocol (TCP)</a><span>IETF, 2022. The consolidated TCP specification, replacing RFC 793.</span></li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc8446" target="_blank" rel="noopener">RFC 8446: The Transport Layer Security (TLS) Protocol Version 1.3</a><span>IETF, 2018. The 1-RTT handshake, PSK resumption, and section 8 on 0-RTT replay.</span></li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9000" target="_blank" rel="noopener">RFC 9000: QUIC: A UDP-Based Multiplexed and Secure Transport</a><span>IETF, 2021. Streams, connection IDs, migration and address validation.</span></li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9114" target="_blank" rel="noopener">RFC 9114: HTTP/3</a><span>IETF, 2022. How HTTP maps onto QUIC streams, and why QPACK replaces HPACK.</span></li>
+<li><a href="https://hpbn.co/" target="_blank" rel="noopener">High Performance Browser Networking</a><span>Ilya Grigorik, O'Reilly, 2013, free online. The clearest treatment of TCP slow start, TLS cost and HTTP/2 from a latency point of view.</span></li>
+</ul>

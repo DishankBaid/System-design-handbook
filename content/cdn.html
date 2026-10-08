@@ -1,0 +1,483 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">A user in Sydney opens a product page served from a data centre in Virginia. Light in fibre covers about 200 km per millisecond, the cable path is longer than the great circle, and the round trip comes out around 200 ms. A fresh HTTPS connection needs three round trips before the first byte of the response arrives, so the page has waited 600 ms before the server has done any work at all.</p>
+<p>No amount of server tuning fixes that, because the cost is distance. A <dfn>content delivery network</dfn> (CDN) is a fleet of caching reverse proxies placed close to users. If the Sydney user talks to a server in Sydney at 10 ms round-trip time, the same three round trips cost 30 ms, and if that server already holds the response, the request never crosses the Pacific at all.</p>
+<p>That second effect is the other half of the value. Every response served from the edge is a request your origin never sees and a byte your origin never sends. A site with a 95% hit ratio runs its origin for one twentieth of the traffic its users generate. CDNs also give you a very large, very spread-out front door that absorbs traffic spikes and attacks that would flatten a single region.</p>
+<div class="defs">
+<div><h4>Origin</h4><p>The system that owns the content: your application servers, or an object store bucket. The CDN fetches from it on a miss.</p></div>
+<div><h4>PoP</h4><p>A <dfn>point of presence</dfn>: a CDN site in a city, a rack or a building of cache servers, routers and load balancers.</p></div>
+<div><h4>Hit ratio</h4><p>The fraction of requests answered from cache. Also measured in bytes (<dfn>byte hit ratio</dfn>), which is what drives egress cost.</p></div>
+<div><h4>TTL</h4><p>How long a cached response counts as fresh. Set by the origin through HTTP headers or overridden by CDN configuration.</p></div>
+</div>
+
+<h2 id="anatomy">Anatomy of a CDN</h2>
+<p>A CDN is not one cache but a hierarchy of them. The tiers exist because two goals pull in opposite directions: you want caches as close to users as possible, which means many small sites, and you want as few cache misses as possible reaching the origin, which means a few large sites that see all the traffic.</p>
+
+<figure class="fig wide">
+<div class="fig-frame">
+<svg viewBox="0 0 760 360" role="img" aria-label="CDN hierarchy: users in three regions connect to nearby edge PoPs, which fill from regional caches, which fill from a single origin shield in front of the origin">
+<rect class="zone" x="20" y="30" width="230" height="226" rx="12"/>
+<text class="t sm b" x="32" y="50">Americas</text>
+<circle class="n client" cx="60" cy="76" r="5"/>
+<path class="line faint" d="M60,81 L72,106"/>
+<circle class="n client" cx="80" cy="76" r="5"/>
+<path class="line faint" d="M80,81 L80,106"/>
+<circle class="n client" cx="100" cy="76" r="5"/>
+<path class="line faint" d="M100,81 L88,106"/>
+<rect class="n svc" x="34" y="108" width="92" height="40" rx="7"/>
+<text class="t sm b mid" x="80" y="125">Dallas</text><text class="t xs mute mid" x="80" y="140">edge PoP</text>
+<path class="e" d="M80,148 L105,186"/>
+<circle class="n client" cx="170" cy="76" r="5"/>
+<path class="line faint" d="M170,81 L182,106"/>
+<circle class="n client" cx="190" cy="76" r="5"/>
+<path class="line faint" d="M190,81 L190,106"/>
+<circle class="n client" cx="210" cy="76" r="5"/>
+<path class="line faint" d="M210,81 L198,106"/>
+<rect class="n svc" x="144" y="108" width="92" height="40" rx="7"/>
+<text class="t sm b mid" x="190" y="125">Sao Paulo</text><text class="t xs mute mid" x="190" y="140">edge PoP</text>
+<path class="e" d="M190,148 L165,186"/>
+<rect class="n cache" x="65" y="190" width="140" height="44" rx="8"/>
+<text class="t sm b mid" x="135" y="208">Regional tier</text><text class="t xs mute mid" x="135" y="224">mid-tier cache</text>
+<path class="e" d="M135,234 L330,292"/>
+<rect class="zone" x="265" y="30" width="230" height="226" rx="12"/>
+<text class="t sm b" x="277" y="50">Europe</text>
+<circle class="n client" cx="305" cy="76" r="5"/>
+<path class="line faint" d="M305,81 L317,106"/>
+<circle class="n client" cx="325" cy="76" r="5"/>
+<path class="line faint" d="M325,81 L325,106"/>
+<circle class="n client" cx="345" cy="76" r="5"/>
+<path class="line faint" d="M345,81 L333,106"/>
+<rect class="n svc" x="279" y="108" width="92" height="40" rx="7"/>
+<text class="t sm b mid" x="325" y="125">London</text><text class="t xs mute mid" x="325" y="140">edge PoP</text>
+<path class="e" d="M325,148 L350,186"/>
+<circle class="n client" cx="415" cy="76" r="5"/>
+<path class="line faint" d="M415,81 L427,106"/>
+<circle class="n client" cx="435" cy="76" r="5"/>
+<path class="line faint" d="M435,81 L435,106"/>
+<circle class="n client" cx="455" cy="76" r="5"/>
+<path class="line faint" d="M455,81 L443,106"/>
+<rect class="n svc" x="389" y="108" width="92" height="40" rx="7"/>
+<text class="t sm b mid" x="435" y="125">Frankfurt</text><text class="t xs mute mid" x="435" y="140">edge PoP</text>
+<path class="e" d="M435,148 L410,186"/>
+<rect class="n cache" x="310" y="190" width="140" height="44" rx="8"/>
+<text class="t sm b mid" x="380" y="208">Regional tier</text><text class="t xs mute mid" x="380" y="224">mid-tier cache</text>
+<path class="e" d="M380,234 L380,292"/>
+<rect class="zone" x="510" y="30" width="230" height="226" rx="12"/>
+<text class="t sm b" x="522" y="50">Asia-Pacific</text>
+<circle class="n client" cx="550" cy="76" r="5"/>
+<path class="line faint" d="M550,81 L562,106"/>
+<circle class="n client" cx="570" cy="76" r="5"/>
+<path class="line faint" d="M570,81 L570,106"/>
+<circle class="n client" cx="590" cy="76" r="5"/>
+<path class="line faint" d="M590,81 L578,106"/>
+<rect class="n svc" x="524" y="108" width="92" height="40" rx="7"/>
+<text class="t sm b mid" x="570" y="125">Tokyo</text><text class="t xs mute mid" x="570" y="140">edge PoP</text>
+<path class="e" d="M570,148 L595,186"/>
+<circle class="n client" cx="660" cy="76" r="5"/>
+<path class="line faint" d="M660,81 L672,106"/>
+<circle class="n client" cx="680" cy="76" r="5"/>
+<path class="line faint" d="M680,81 L680,106"/>
+<circle class="n client" cx="700" cy="76" r="5"/>
+<path class="line faint" d="M700,81 L688,106"/>
+<rect class="n svc" x="634" y="108" width="92" height="40" rx="7"/>
+<text class="t sm b mid" x="680" y="125">Sydney</text><text class="t xs mute mid" x="680" y="140">edge PoP</text>
+<path class="e" d="M680,148 L655,186"/>
+<rect class="n cache" x="555" y="190" width="140" height="44" rx="8"/>
+<text class="t sm b mid" x="625" y="208">Regional tier</text><text class="t xs mute mid" x="625" y="224">mid-tier cache</text>
+<path class="e" d="M625,234 L430,292"/>
+<text class="t xs mute end" x="50" y="79">users</text>
+<rect class="n cache" x="300" y="296" width="160" height="44" rx="8"/><text class="t sm b mid" x="380" y="314">Origin shield</text><text class="t xs mute mid" x="380" y="330">one PoP near the origin</text>
+<rect class="n db" x="60" y="296" width="130" height="44" rx="8"/><text class="t sm b mid" x="125" y="314">Origin</text><text class="t xs mute mid" x="125" y="330">us-east, app + bucket</text>
+<path class="e" d="M300,318 L194,318"/><text class="t xs mute mid" x="247" y="310">shield misses</text>
+<text class="t sm" x="490" y="304">Sydney, edge hit: ~10 ms RTT</text>
+<text class="t sm" x="490" y="322">Sydney, full miss: + ~200 ms</text>
+<text class="t xs mute" x="490" y="340">animated: one miss walking every tier</text>
+<path class="flow" d="M700,81 L688,106"/>
+<path class="flow" d="M680,148 L655,186"/>
+<path class="flow" d="M625,234 L430,292"/>
+<path class="flow" d="M300,318 L194,318"/>
+</svg>
+</div>
+<figcaption><b>The cache hierarchy.</b> Each user reaches a nearby edge PoP. Edge misses go to a regional tier, regional misses go to one origin shield, and only the shield talks to the origin. The animated path is the worst case: a Sydney request for an object no tier holds.</figcaption>
+</figure>
+
+<h3 id="tiers">The tiers</h3>
+<ol class="steps">
+<li><strong>Edge PoPs.</strong> Hundreds of sites in major cities and inside ISP networks. They terminate the user's TCP and TLS connections, so the handshake round trips are short. Each one has limited disk and only sees local traffic, so it holds the locally popular objects.</li>
+<li><strong>Regional or mid-tier caches.</strong> A smaller number of larger sites, one per continent or large region. When the Sydney and Tokyo PoPs both miss on the same object, the regional tier fetches it once and serves both. CloudFront calls these Regional Edge Caches; Cloudflare and Akamai call the idea tiered caching or tiered distribution.</li>
+<li><strong>Origin shield.</strong> One designated cache location in front of the origin, usually in the same region. Every miss from every tier funnels through it, so the origin sees at most one request per object per TTL, no matter how many PoPs exist.</li>
+<li><strong>Origin.</strong> Your service. With a shield in place it can be provisioned for the shield's miss rate rather than the world's request rate.</li>
+</ol>
+<p>Every extra tier adds a hop on a miss, so a full miss is slower through a three-tier CDN than through a single edge going straight to origin. It pays off for long-tail content, which a single PoP rarely sees twice but a continent-wide tier does.</p>
+
+<h3 id="routing">Getting users to the right PoP</h3>
+<p>A CDN has to steer each user to a nearby, healthy PoP. Two techniques dominate, and both are covered in the <a href="dns.html">DNS</a> chapter:</p>
+<ul>
+<li><strong>DNS-based steering.</strong> The CDN's authoritative DNS answers <code>img.shop.example</code> with the address of a PoP chosen from the resolver's location, measured latency and PoP load. It is precise, but only as precise as the resolver's location, and changes are delayed by DNS caching.</li>
+<li><strong>Anycast.</strong> Every PoP announces the same IP prefix over BGP, and the internet's routing delivers each packet to the topologically nearest one. Failover is a route withdrawal, which takes effect within seconds to a minute without waiting for DNS TTLs. Cloudflare runs almost entirely on anycast; many CDNs combine both.</li>
+</ul>
+<p>Inside a PoP, a layer-4 load balancer spreads connections across servers, and each server then forwards a request to the cache server that owns that URL by a consistent hash so the PoP's disks hold one copy of each object, not one per server. That is <a href="consistent-hashing.html">consistent hashing</a> again, applied to URLs. See <a href="load-balancing.html">Load Balancing</a> for the machinery.</p>
+
+<h3 id="collapsing">Request collapsing</h3>
+<p>When a popular object expires, hundreds of requests for it can arrive at a PoP in the same few milliseconds. Without protection, each one is a miss and each one goes upstream: a <dfn>cache stampede</dfn> aimed at your origin. CDNs prevent this with <dfn>request collapsing</dfn> (also called coalescing): the first miss goes upstream and every concurrent request for the same key waits for that one response. NGINX exposes this as <code>proxy_cache_lock</code>; Varnish, Fastly and CloudFront do it by default for cacheable responses.</p>
+
+<h2 id="pull-push">Pull vs push</h2>
+<p>There are two ways content gets into the CDN. In a <dfn>pull CDN</dfn> the edge fetches from the origin on the first miss and caches the result. In a <dfn>push CDN</dfn> you upload content to the CDN's storage ahead of time, and the CDN distributes it.</p>
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Pull (origin pull)</th><th>Push (pre-positioned)</th></tr></thead>
+<tbody>
+<tr><th>Setup</th><td class="yes">Point the CDN at an origin hostname</td><td class="meh">Upload pipeline, storage management</td></tr>
+<tr><th>First request for an object</th><td class="meh">Miss, pays origin latency</td><td class="yes">Already at the edge</td></tr>
+<tr><th>Storage used</th><td class="yes">Only what users ask for</td><td class="no">Everything you push, everywhere you push it</td></tr>
+<tr><th>Origin load</th><td class="meh">Proportional to misses</td><td class="yes">Near zero for pushed content</td></tr>
+<tr><th>Freshness</th><td>TTLs and purges</td><td>You replace the object when it changes</td></tr>
+<tr><th>Good fit</th><td>Websites, APIs, images, anything with a long tail</td><td>Large, predictable files: video catalogues, game patches, OS updates</td></tr>
+</tbody></table></div>
+<p>Pull is the default for almost everything because it is self-managing: the cache contents track demand automatically. Push wins when you know what will be popular before users do. A game studio releasing a 40 GB patch at 18:00 does not want the first million downloads to be misses, so it pre-warms the CDN in the hours before. Netflix takes this furthest, as described below.</p>
+
+<h2 id="cache-keys">Cache keys</h2>
+<p>The <dfn>cache key</dfn> is the identifier a CDN uses to decide whether two requests can share one stored response. By default it is roughly scheme, host, path and full query string. Getting the key right is the single biggest lever on hit ratio, and getting it wrong is how private data leaks.</p>
+<p>The rule is simple to state: <strong>the key must include everything that changes the response bytes, and nothing else</strong>. Anything extra splits one object into many copies that each miss separately. Anything missing serves one user's response to another.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 372" role="img" aria-label="Building a cache key: host, path and the width parameter are kept, tracking and session parameters and cookies are dropped, encoding and image format headers are normalised to one value each">
+<text class="t sm b" x="20" y="26">Incoming request</text><text class="t sm b mid" x="425" y="26">Rule</text><text class="t sm b" x="520" y="26">Goes into the key</text>
+<rect class="n" x="20" y="40" width="300" height="24" rx="5"/><text class="t mono" x="30" y="56">Host: img.shop.example</text>
+<path class="e" d="M320,52 H356"/>
+<rect class="n good" x="360" y="40" width="130" height="24" rx="5"/><text class="t xs mid" x="425" y="56">kept</text>
+<path class="e" d="M490,52 H512"/><text class="t mono b" x="520" y="56">img.shop.example</text>
+<rect class="n" x="20" y="70" width="300" height="24" rx="5"/><text class="t mono" x="30" y="86">/products/9481.jpg</text>
+<path class="e" d="M320,82 H356"/>
+<rect class="n good" x="360" y="70" width="130" height="24" rx="5"/><text class="t xs mid" x="425" y="86">kept</text>
+<path class="e" d="M490,82 H512"/><text class="t mono b" x="520" y="86">/products/9481.jpg</text>
+<rect class="n" x="20" y="100" width="300" height="24" rx="5"/><text class="t mono" x="30" y="116">?w=400</text>
+<path class="e" d="M320,112 H356"/>
+<rect class="n good" x="360" y="100" width="130" height="24" rx="5"/><text class="t xs mid" x="425" y="116">kept: changes bytes</text>
+<path class="e" d="M490,112 H512"/><text class="t mono b" x="520" y="116">w=400</text>
+<rect class="n" x="20" y="130" width="300" height="24" rx="5"/><text class="t mono" x="30" y="146">&amp;utm_source=mail</text>
+<path class="e" d="M320,142 H356"/>
+<rect class="n bad" x="360" y="130" width="130" height="24" rx="5"/><text class="t xs mid" x="425" y="146">dropped: tracking</text>
+<text class="t mono mute" x="520" y="146">-</text>
+<rect class="n" x="20" y="160" width="300" height="24" rx="5"/><text class="t mono" x="30" y="176">&amp;sid=ab12</text>
+<path class="e" d="M320,172 H356"/>
+<rect class="n bad" x="360" y="160" width="130" height="24" rx="5"/><text class="t xs mid" x="425" y="176">dropped: per user</text>
+<text class="t mono mute" x="520" y="176">-</text>
+<rect class="n" x="20" y="190" width="300" height="24" rx="5"/><text class="t mono" x="30" y="206">Accept-Encoding: gzip, deflate, br</text>
+<path class="e" d="M320,202 H356"/>
+<rect class="n cache" x="360" y="190" width="130" height="24" rx="5"/><text class="t xs mid" x="425" y="206">normalised</text>
+<path class="e" d="M490,202 H512"/><text class="t mono b" x="520" y="206">enc=br</text>
+<rect class="n" x="20" y="220" width="300" height="24" rx="5"/><text class="t mono" x="30" y="236">Accept: image/avif,image/webp,*/*</text>
+<path class="e" d="M320,232 H356"/>
+<rect class="n cache" x="360" y="220" width="130" height="24" rx="5"/><text class="t xs mid" x="425" y="236">normalised</text>
+<path class="e" d="M490,232 H512"/><text class="t mono b" x="520" y="236">fmt=avif</text>
+<rect class="n" x="20" y="250" width="300" height="24" rx="5"/><text class="t mono" x="30" y="266">Cookie: sid=ab12; cart=3</text>
+<path class="e" d="M320,262 H356"/>
+<rect class="n bad" x="360" y="250" width="130" height="24" rx="5"/><text class="t xs mid" x="425" y="266">ignored</text>
+<text class="t mono mute" x="520" y="266">-</text>
+<text class="t sm b" x="20" y="306">Resulting cache key</text>
+<rect class="n good" x="20" y="316" width="680" height="36" rx="7"/><text class="t mono b mid" x="360" y="338">img.shop.example/products/9481.jpg?w=400 | enc=br | fmt=avif</text>
+</svg>
+</div>
+<figcaption><b>Composing a cache key.</b> The width parameter changes the image, so it stays. Marketing tags and session ids do not, so keeping them would give every newsletter recipient a private copy and a guaranteed miss. Headers that do change the bytes are normalised to a handful of values before they enter the key.</figcaption>
+</figure>
+
+<ul>
+<li><strong>Query strings.</strong> Allow-list the parameters that matter rather than block-listing the ones that do not. Sort them, so <code>?w=400&amp;q=80</code> and <code>?q=80&amp;w=400</code> hit the same entry.</li>
+<li><strong>Headers and <code>Vary</code>.</strong> When an origin sends <code>Vary: Accept-Encoding</code>, it tells caches that the response depends on that request header, and caches store one variant per distinct value. <code>Accept-Encoding</code> strings from real browsers come in many spellings, so CDNs normalise them to a few buckets (<code>br</code>, <code>gzip</code>, none). <code>Vary: User-Agent</code> is the classic mistake: there are thousands of user-agent strings, so the hit ratio collapses. Normalise to a device class (<code>mobile</code>, <code>desktop</code>) at the edge if you need per-device responses.</li>
+<li><strong>Cookies.</strong> Keep them out of the key for shared content. Many CDNs will not cache a response that sets a cookie at all, because a <code>Set-Cookie</code> header served to the wrong user is a session hijack.</li>
+</ul>
+<div class="callout warn">
+<div class="callout-title">Cache poisoning and cache deception</div>
+<p>If a request header changes the response but is not in the key (an <dfn>unkeyed input</dfn>), an attacker can send one crafted request, for example with <code>X-Forwarded-Host: evil.example</code>, get a poisoned response cached, and have the CDN serve it to everyone. The reverse attack, <dfn>web cache deception</dfn>, tricks a cache into storing a logged-in user's page under a URL like <code>/account/settings/x.css</code> because the path looks static. Defend with strict keys, origins that ignore unexpected headers, and caching rules based on the response's <code>Cache-Control</code>, not on file extensions.</p>
+</div>
+
+<h2 id="http-caching">Controlling freshness with HTTP headers</h2>
+<p>The origin tells every cache on the path what it may do through response headers, defined in RFC 9111. A CDN is a <dfn>shared cache</dfn> (one copy serves many users); the browser is a <dfn>private cache</dfn>. Most directives let you treat the two differently.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Directive</th><th>Meaning</th><th>Typical use</th></tr></thead>
+<tbody>
+<tr><td><code>max-age=N</code></td><td>Fresh for N seconds in any cache</td><td>Static assets, public pages</td></tr>
+<tr><td><code>s-maxage=N</code></td><td>Overrides <code>max-age</code> for shared caches only</td><td>Browser keeps 60 s, CDN keeps 1 hour</td></tr>
+<tr><td><code>no-cache</code></td><td>May be stored, but must be revalidated before every use</td><td>HTML that must never be stale, but is often unchanged</td></tr>
+<tr><td><code>no-store</code></td><td>Never write it to any cache</td><td>Bank statements, anything sensitive</td></tr>
+<tr><td><code>private</code></td><td>Only the browser may store it, never the CDN</td><td>Personalised pages</td></tr>
+<tr><td><code>immutable</code></td><td>The content will never change at this URL; skip revalidation (RFC 8246)</td><td>Fingerprinted assets</td></tr>
+<tr><td><code>stale-while-revalidate=N</code></td><td>For N seconds after expiry, serve stale and refresh in the background (RFC 5861)</td><td>Anything where slightly old beats slow</td></tr>
+<tr><td><code>stale-if-error=N</code></td><td>For N seconds after expiry, serve stale if the origin errors (RFC 5861)</td><td>Survive origin outages</td></tr>
+</tbody></table></div>
+<p>Two more headers complete the picture. <code>Age</code> is added by caches to say how long a response has been sitting in cache, so a downstream cache does not restart the clock. <code>CDN-Cache-Control</code> (RFC 9213) and the older <code>Surrogate-Control</code> let you give the CDN instructions that browsers and other proxies ignore, which is cleaner than overloading <code>s-maxage</code>.</p>
+
+<h3 id="validation">Revalidation with ETag</h3>
+<p>Expiry does not mean the object changed. Instead of downloading it again, a cache can ask "is my copy still current?" with a <dfn>conditional request</dfn>. The origin labels each version of a response with an <dfn>ETag</dfn> (an opaque version string, often a content hash) or a <code>Last-Modified</code> time. The cache sends the label back in <code>If-None-Match</code> or <code>If-Modified-Since</code>. If nothing changed, the origin answers <code>304 Not Modified</code> with no body, and the cache resets the object's age. A 304 still costs a round trip to the origin, but it costs almost no bandwidth and no rendering work.</p>
+<pre><code class="language-http">GET /products/9481.jpg?w=400 HTTP/1.1
+Host: img.shop.example
+If-None-Match: "v42-9f3c1a"
+
+HTTP/1.1 304 Not Modified
+ETag: "v42-9f3c1a"
+Cache-Control: public, max-age=60, s-maxage=3600, stale-while-revalidate=600</code></pre>
+<p>If the origin sends neither <code>max-age</code> nor <code>Expires</code>, caches may invent a lifetime from <code>Last-Modified</code>. RFC 9111 suggests 10% of the time since the last modification as a typical heuristic, so a file last changed 10 days ago may be cached for a day without anyone choosing that. Always send explicit <code>Cache-Control</code>.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 380" role="img" aria-label="Sequence diagram of four CDN cache outcomes: fresh hit, full miss through shield to origin, conditional revalidation returning 304, and stale-while-revalidate serving immediately while refreshing in the background">
+<rect class="n client" x="25" y="16" width="110" height="36" rx="7"/><text class="t sm b mid" x="80" y="39">Browser</text>
+<rect class="n svc" x="225" y="16" width="110" height="36" rx="7"/><text class="t sm b mid" x="280" y="39">Edge PoP</text>
+<rect class="n cache" x="415" y="16" width="110" height="36" rx="7"/><text class="t sm b mid" x="470" y="39">Shield</text>
+<rect class="n db" x="585" y="16" width="110" height="36" rx="7"/><text class="t sm b mid" x="640" y="39">Origin</text>
+<path class="line faint" d="M80,52 V330 M280,52 V330 M470,52 V330 M640,52 V330" style="stroke-dasharray:3 4"/>
+
+<path class="e" d="M80,90 H276"/><text class="t mono mid" x="180" y="83">GET /9481.jpg?w=400</text>
+
+<g data-show="1">
+<text class="t sm" x="292" y="118">fresh: Age 120 &lt; s-maxage 3600</text>
+<path class="e green" d="M280,150 H84"/><text class="t mono mid" x="180" y="143">200  X-Cache: HIT</text>
+<text class="t sm mid" x="360" y="360">Hit: served from the PoP's memory or disk. One short round trip, origin untouched.</text>
+</g>
+
+<g data-show="2">
+<path class="e" d="M280,125 H466"/><text class="t sm mid" x="375" y="118">miss</text>
+<path class="e" d="M470,160 H636"/><text class="t sm mid" x="555" y="153">miss</text>
+<path class="e dash" d="M640,200 H474"/><text class="t mono mid" x="555" y="193">200 + ETag "v42"</text>
+<path class="e dash" d="M470,235 H284"/><text class="t sm mid" x="375" y="228">200, shield stores it</text>
+<path class="e green" d="M280,270 H84"/><text class="t mono mid" x="180" y="263">200  X-Cache: MISS</text>
+<text class="t sm mid" x="360" y="360">Miss: two cache tiers fill on the way back, so the next request anywhere is cheaper.</text>
+</g>
+
+<g data-show="3">
+<text class="t sm" x="292" y="114">stale: Age 3700 &gt; 3600</text>
+<path class="e" d="M280,140 H466"/><text class="t mono mid" x="375" y="133">If-None-Match: "v42"</text>
+<path class="e" d="M470,170 H636"/><text class="t mono mid" x="555" y="163">If-None-Match: "v42"</text>
+<path class="e dash" d="M640,205 H474"/><text class="t mono mid" x="555" y="198">304, no body</text>
+<path class="e dash" d="M470,240 H284"/><text class="t mono mid" x="375" y="233">304, age reset</text>
+<path class="e green" d="M280,275 H84"/><text class="t mono mid" x="180" y="268">200 from cache</text>
+<text class="t sm mid" x="360" y="360">Revalidate: a full round trip to origin, but only headers cross the wire.</text>
+</g>
+
+<g data-show="4">
+<text class="t sm" x="292" y="114">stale, inside the SWR window</text>
+<path class="e green" d="M280,145 H84"/><text class="t mono mid" x="180" y="138">200 (stale) now</text>
+<path class="e dash accent" d="M280,180 H466"/><text class="t sm accent mid" x="375" y="173">background refresh</text>
+<path class="e dash accent" d="M470,210 H636"/><text class="t mono accent mid" x="555" y="203">If-None-Match</text>
+<path class="e dash" d="M640,245 H474"/><text class="t mono mid" x="555" y="238">304</text>
+<path class="e dash" d="M470,280 H284"/><text class="t sm mid" x="375" y="273">fresh again</text>
+<text class="t sm mid" x="360" y="360">Stale-while-revalidate: the user never waits; the refresh happens off the request path.</text>
+</g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Fresh hit</button><button type="button" data-step="2" aria-pressed="false">Miss</button><button type="button" data-step="3" aria-pressed="false">Revalidate</button><button type="button" data-step="4" aria-pressed="false">Stale-while-revalidate</button></div>
+</div>
+<figcaption><b>Four ways a CDN answers.</b> The response to the browser looks the same in all four cases. What differs is how far the request travelled and what the origin had to do.</figcaption>
+</figure>
+
+<h2 id="invalidation">Invalidation</h2>
+<p>A TTL is a promise that you will tolerate stale content for that long. When you cannot tolerate it, for a price change, a takedown or a broken deploy, you need to remove content from caches you do not run, in hundreds of locations at once. There are two approaches, and mature systems use both.</p>
+
+<h3 id="purge">Purging</h3>
+<p>A <dfn>purge</dfn> (or invalidation) is an API call that tells every PoP to drop or mark stale a set of cached objects. CDNs support several granularities:</p>
+<ul>
+<li><strong>By URL</strong>: <code>purge https://img.shop.example/products/9481.jpg</code>. Precise, but you have to know every URL and every variant.</li>
+<li><strong>By tag</strong>: the origin labels responses with a header such as <code>Surrogate-Key: product-9481 category-shoes</code> (Fastly) or <code>Cache-Tag</code> (Cloudflare). One purge of <code>product-9481</code> removes the product page, its images at every width and every listing page that showed it. This is the form that scales to real applications.</li>
+<li><strong>By prefix or wildcard</strong>: <code>/products/*</code>. Convenient, expensive for the CDN, and often rate-limited or billed.</li>
+<li><strong>Everything</strong>: the emergency lever. It turns a 98% hit ratio into 0% for a few minutes, so be sure the origin can survive the refill first.</li>
+</ul>
+<p>Purges are fast on modern CDNs, from under a second to a few minutes depending on the provider, but they are still asynchronous and a PoP that is briefly unreachable can miss one. Browsers are worse: a purge never reaches the copy already in a user's browser cache. That is why HTML usually gets a short or zero browser TTL (<code>max-age=0, s-maxage=3600</code>) even when the CDN keeps it longer: the CDN copy can be purged, the browser copy cannot.</p>
+
+<h3 id="versioned-urls">Versioned URLs</h3>
+<p>The cleanest invalidation is not needing one. Put a content hash in the file name at build time, so <code>app.js</code> becomes <code>app.3f9a2c71.js</code>, and serve it with <code>Cache-Control: public, max-age=31536000, immutable</code>. When the file changes, its name changes, and the HTML references the new name. The old object is never invalidated; it just stops being requested and ages out. This gives a near-100% hit ratio for every asset once each cache has it, zero purge traffic, and atomic deploys: a user either gets the old HTML with the old assets or the new HTML with the new ones, never a mix.</p>
+<p>The pattern pushes the freshness problem up to one place: the HTML (or API response) that contains the versioned links. That small document gets a short TTL and is revalidated or purged on deploy. Everything heavy is immutable.</p>
+<div class="callout note">
+<div class="callout-title">A sensible default policy</div>
+<p>Fingerprinted assets: one year, <code>immutable</code>. Images keyed by content id: long TTL plus tag purge. HTML: <code>max-age=0</code> for browsers, minutes to an hour at the CDN with purge on publish and <code>stale-while-revalidate</code>. Personalised responses: <code>private</code> or <code>no-store</code>. Everything gets <code>stale-if-error</code> so an origin outage serves slightly old pages instead of errors.</p>
+</div>
+
+<h2 id="dynamic">Dynamic content and edge compute</h2>
+<p>Not everything can be cached. A shopping cart, a search result for a rare query or a <code>POST /checkout</code> must go to the origin. A CDN still helps these requests, just less dramatically.</p>
+
+<h3 id="acceleration">Dynamic content acceleration</h3>
+<ul>
+<li><strong>Short client handshakes.</strong> The user's TCP and TLS handshakes complete against the nearby PoP. Only the request itself crosses the long path.</li>
+<li><strong>Warm long-haul connections.</strong> PoPs keep pools of established, already-warmed connections to the origin (or to the shield), so there is no handshake and no TCP slow start on the long leg. For a 200 ms path, skipping two round trips saves 400 ms. See <a href="network-protocols.html">TCP, UDP &amp; HTTP</a> for why fresh connections are slow.</li>
+<li><strong>Better routes.</strong> The CDN's backbone often beats the default BGP path between continents.</li>
+<li><strong>Microcaching.</strong> Even "dynamic" pages are often identical for everyone for a second. Caching a busy anonymous page for 1 to 5 seconds turns 2,000 requests per second for it into one origin request per second per PoP, with staleness no user notices.</li>
+</ul>
+
+<h3 id="edge-compute">Edge compute</h3>
+<p><dfn>Edge compute</dfn> runs your code inside the PoP, on the request path. Cloudflare Workers run JavaScript and WebAssembly in V8 isolates that start in milliseconds; Fastly Compute runs WebAssembly; AWS offers lightweight CloudFront Functions at the edge and Lambda@Edge at the regional tier. Good uses are small and latency-sensitive:</p>
+<ul>
+<li>Rewriting the cache key, normalising headers, A/B test bucketing that stays cacheable.</li>
+<li>Validating a JWT or a signed URL before the request touches the origin.</li>
+<li>Redirects, geo-based routing, header injection, bot challenges.</li>
+</ul>
+<p>The trap is putting business logic at the edge that needs your database. The code then runs 10 ms from the user and 200 ms from its data, and a request that makes three sequential queries is slower than if it had run at the origin. Edge compute pays off when the data it needs is in the request, in the cache, or in an edge-replicated key-value store.</p>
+
+<h2 id="tls-security">TLS and security at the edge</h2>
+<p>Because the CDN terminates the user's connection, it holds a certificate for your domain. CDNs automate certificate renewal and offer modern TLS and HTTP/3 at the edge whatever your origin speaks. Organisations that cannot hand a private key to a third party can use schemes such as Cloudflare's Keyless SSL, where the edge asks a key server in the customer's network to perform the one private-key operation in the handshake. Edge to origin is a separate connection and should also be TLS, ideally with the origin verifying that the caller really is the CDN.</p>
+<p>The CDN also becomes your first line of defence:</p>
+<ul>
+<li><strong>DDoS absorption.</strong> A volumetric attack of hundreds of gigabits per second would saturate a single region's links. Spread by anycast across hundreds of PoPs, it becomes a manageable slice per site, and network-layer floods (SYN floods, UDP reflection) are dropped at the edge before they reach any application.</li>
+<li><strong>Web application firewall.</strong> A <dfn>WAF</dfn> inspects HTTP requests at the edge and blocks known attack patterns such as SQL injection and path traversal, plus rules you write. Edge <a href="rate-limiting.html">rate limiting</a> and bot management run here too.</li>
+<li><strong>Origin cloaking.</strong> All of this is worthless if attackers can reach the origin directly. Firewall the origin to accept only the CDN's published IP ranges, or require a secret header or mutual TLS on edge-to-origin requests, and never expose the origin's address in DNS.</li>
+<li><strong>Signed URLs and cookies.</strong> For paid or private content, the application issues a URL with an expiry and an HMAC signature; the edge verifies it without calling the origin. This is how video platforms protect their segments, see <a href="video-streaming.html">Design a Video Platform</a>. The broader topics are in <a href="security.html">Security Fundamentals</a>.</li>
+</ul>
+
+<h2 id="worked-example">Worked example: hit ratio, origin load and egress cost</h2>
+<p>An e-commerce image service receives 20,000 requests per second on average, with a mean response of 100 KB. How much does the hit ratio matter?</p>
+<div class="stats">
+<div><b>16 Gbps</b><span>average delivery bandwidth</span></div>
+<div><b>~5.2 PB</b><span>delivered per 30-day month</span></div>
+<div><b>2,000/s</b><span>origin requests at 90% hit ratio</span></div>
+<div><b>200/s</b><span>origin requests at 99% hit ratio</span></div>
+</div>
+<div class="calc">Bandwidth   20,000 req/s × 100 KB         = 2 GB/s = <span class="r">16 Gbps</span>
+Per month   2 GB/s × 86,400 s × 30         = 5,184,000 GB ≈ <span class="r">5.2 PB</span>
+Origin      requests = total × (1 - hit ratio)
+            90% hit: 20,000 × 0.10         = <span class="r">2,000 req/s</span>, 1.6 Gbps
+            99% hit: 20,000 × 0.01         = <span class="r">200 req/s</span>,  0.16 Gbps</div>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 680 262" role="img" aria-label="Bar chart of origin requests per second at 20,000 requests per second total: 4,000 at 80 percent hit ratio, 2,000 at 90, 1,000 at 95, 400 at 98 and 200 at 99">
+<path class="line faint" d="M90,170 H650"/><text class="t xs mute end" x="82" y="174">1,000</text>
+<path class="line faint" d="M90,130 H650"/><text class="t xs mute end" x="82" y="134">2,000</text>
+<path class="line faint" d="M90,90 H650"/><text class="t xs mute end" x="82" y="94">3,000</text>
+<path class="line faint" d="M90,50 H650"/><text class="t xs mute end" x="82" y="54">4,000</text>
+<path class="line" d="M90,210 H650"/><text class="t xs mute end" x="82" y="214">0</text>
+<text class="t xs mute" x="20" y="22">origin req/s</text>
+<rect x="125" y="50" width="60" height="160" rx="3" style="fill:var(--d-svc);stroke:var(--d-svc-s)"/>
+<text class="t sm b mid" x="155" y="42">4,000</text>
+<text class="t sm mid" x="155" y="230">80% hit</text>
+<rect x="235" y="130" width="60" height="80" rx="3" style="fill:var(--d-svc);stroke:var(--d-svc-s)"/>
+<text class="t sm b mid" x="265" y="122">2,000</text>
+<text class="t sm mid" x="265" y="230">90% hit</text>
+<rect x="345" y="170" width="60" height="40" rx="3" style="fill:var(--d-svc);stroke:var(--d-svc-s)"/>
+<text class="t sm b mid" x="375" y="162">1,000</text>
+<text class="t sm mid" x="375" y="230">95% hit</text>
+<rect x="455" y="194" width="60" height="16" rx="3" style="fill:var(--d-svc);stroke:var(--d-svc-s)"/>
+<text class="t sm b mid" x="485" y="186">400</text>
+<text class="t sm mid" x="485" y="230">98% hit</text>
+<rect x="565" y="202" width="60" height="8" rx="3" style="fill:var(--d-svc);stroke:var(--d-svc-s)"/>
+<text class="t sm b mid" x="595" y="194">200</text>
+<text class="t sm mid" x="595" y="230">99% hit</text>
+<text class="t xs mute mid" x="370" y="252">edge hit ratio, with 20,000 req/s arriving at the CDN</text>
+</svg>
+</div>
+<figcaption><b>Origin load is the miss ratio, not the hit ratio.</b> Going from 90% to 99% sounds like a 10% improvement. It is a tenfold cut in origin traffic, because the miss ratio drops from 10% to 1%.</figcaption>
+</figure>
+
+<p>Now cost. Prices vary by provider, region, volume and contract, so treat these as assumed round numbers for the arithmetic: serving straight from a cloud region costs $0.05/GB of egress, CDN delivery costs $0.02/GB, and origin-to-CDN transfer is billed at $0.02/GB (some clouds waive it for their own CDN).</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Setup</th><th class="num">Origin req/s</th><th class="num">Origin egress / month</th><th class="num">Monthly transfer cost</th></tr></thead>
+<tbody>
+<tr><th>No CDN</th><td class="num">20,000</td><td class="num">5,184,000 GB</td><td class="num">$259,200</td></tr>
+<tr><th>CDN, 90% hit</th><td class="num">2,000</td><td class="num">518,400 GB</td><td class="num">$103,680 + $10,368 = $114,048</td></tr>
+<tr><th>CDN, 99% hit</th><td class="num">200</td><td class="num">51,840 GB</td><td class="num">$103,680 + $1,037 = $104,717</td></tr>
+</tbody></table></div>
+<p>Three things to read from the table. The CDN's cheaper per-gigabyte rate is most of the saving. The hit ratio barely moves the transfer bill once you are on a CDN, but it moves the origin fleet by 10x: at 400 requests per second per image-resizing server, 90% needs five servers and 99% needs one. And the origin still has to survive a purge-all or a cold PoP, so provision for the miss rate during refill, not the steady state.</p>
+
+<h3 id="shield-simulation">How much does a shield help?</h3>
+<p>Without a shield, each PoP misses independently, so an object popular in 20 cities is fetched from the origin 20 times. The simulation below sends 1 million Zipf-distributed requests for 100,000 objects to 20 PoPs, each with an LRU cache holding 10% of the catalogue, with and without a shared shield that holds half of it.</p>
+<pre><code class="language-python">import bisect
+import itertools
+import random
+from collections import OrderedDict
+
+
+class LRU:
+    def __init__(self, capacity):
+        self.capacity, self.items = capacity, OrderedDict()
+
+    def get(self, key):
+        if key in self.items:
+            self.items.move_to_end(key)
+            return True
+        return False
+
+    def put(self, key):
+        self.items[key] = True
+        if len(self.items) &gt; self.capacity:
+            self.items.popitem(last=False)   # evict least recently used
+
+
+def simulate(shield, pops=20, objects=100_000, requests=1_000_000,
+             edge_size=10_000, shield_size=50_000, seed=7):
+    rng = random.Random(seed)
+    # Zipf-like popularity: object k is requested with weight 1 / k^0.9
+    cum = list(itertools.accumulate(1 / k ** 0.9 for k in range(1, objects + 1)))
+    edges = [LRU(edge_size) for _ in range(pops)]
+    mid = LRU(shield_size)
+    edge_hits = origin = 0
+    for _ in range(requests):
+        obj = bisect.bisect(cum, rng.random() * cum[-1])
+        edge = edges[rng.randrange(pops)]          # user lands on a random PoP
+        if edge.get(obj):
+            edge_hits += 1
+            continue
+        if not (shield and mid.get(obj)):
+            origin += 1                            # nobody had it: go to origin
+            if shield:
+                mid.put(obj)
+        edge.put(obj)
+    return edge_hits / requests, origin / requests
+
+
+for shield in (False, True):
+    edge_hit, origin_share = simulate(shield)
+    print(f"shield={shield!s:5}  edge hit ratio {edge_hit:.1%}  "
+          f"origin sees {origin_share:.1%} of requests")
+# shield=False  edge hit ratio 56.5%  origin sees 43.5% of requests
+# shield=True   edge hit ratio 56.5%  origin sees 15.6% of requests</code></pre>
+<p>The edge hit ratio is identical in both runs, because the shield does not change what the edges hold. But origin traffic falls by almost two thirds: most edge misses are for objects some other PoP fetched recently, and the shield answers those. The absolute hit ratios here are low because each simulated PoP only sees 50,000 requests and starts cold; production PoPs run warm for weeks. The ratio between the two runs is the point.</p>
+
+<h2 id="tradeoffs">Trade-offs at a glance</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Decision</th><th>Option A</th><th>Option B</th></tr></thead>
+<tbody>
+<tr><th>TTL length</th><td>Long: high hit ratio, stale until purged</td><td>Short: fresh, more origin load and more revalidations</td></tr>
+<tr><th>Freshness strategy</th><td>Purge on change: precise, needs reliable purge calls and tags</td><td>Versioned URLs: no purges, only works for content referenced by link</td></tr>
+<tr><th>Tiering</th><td>Shield and regional tier: far fewer origin hits</td><td>Edge only: one fewer hop on a miss, more origin load</td></tr>
+<tr><th>Content placement</th><td>Pull: zero management, first request misses</td><td>Push: pre-warmed, you manage storage and distribution</td></tr>
+<tr><th>Cache key</th><td>Narrow: high hit ratio, risk of serving the wrong variant</td><td>Wide: safe, fragmented cache and low hit ratio</td></tr>
+<tr><th>Logic at the edge</th><td>Edge compute: low latency for request-local work</td><td>Origin: close to the data, one place to debug</td></tr>
+</tbody></table></div>
+<p>The structural cost of any CDN is that a third party now sits on your critical path. A CDN control-plane bug or a bad configuration push can take down every site behind it at once, as major CDN outages have shown several times. Large companies mitigate this with a multi-CDN setup, steering traffic between two providers with DNS, at the cost of maintaining two configurations and losing some cache efficiency.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+<li><strong>Netflix Open Connect</strong>: Netflix runs its own CDN of Open Connect Appliances, storage servers placed inside ISP networks and at internet exchange points. It is a push design: Netflix predicts what each region will watch and fills the appliances during off-peak hours, so evening playback is served from inside the viewer's ISP and very little crosses the wider internet at peak.</li>
+<li><strong>Cloudflare</strong>: a single anycast network in which every server in every data centre runs the full stack (cache, WAF, DDoS mitigation, Workers). Tiered Cache adds upper tiers in front of origins, and Workers run customer code in V8 isolates at every location.</li>
+<li><strong>Akamai</strong>: grew out of the consistent hashing research at MIT and places servers deep inside thousands of ISP networks rather than in a few large sites. Its published architecture paper describes the tiered distribution and overlay routing ideas used across the industry.</li>
+<li><strong>Amazon CloudFront</strong>: edge locations backed by Regional Edge Caches, with an optional Origin Shield in front of S3 or any HTTP origin. CloudFront Functions and Lambda@Edge provide edge compute; signed URLs and cookies protect private content.</li>
+<li><strong>Fastly</strong>: built on Varnish, known for purges that complete across the network in well under a second and for surrogate-key purging, which makes long TTLs on dynamic-but-cacheable content such as news articles practical.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>Any design that serves static or shareable content to users in more than one region: images, video, downloads, web assets, public API responses. Say what goes through the CDN, what the TTLs are, how content is invalidated, and what hit ratio you assume, then use the miss ratio to size the origin. In <a href="url-shortener.html">Design a URL Shortener</a> it absorbs viral redirects; in <a href="video-streaming.html">Design a Video Platform</a> it carries almost all of the bandwidth.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>How do you update a cached file? (Versioned URLs for assets; purge by tag for content; short TTLs on HTML.)</li>
+<li>What is in your cache key, and why does <code>Vary: User-Agent</code> hurt?</li>
+<li>The CDN expires a hot object and the origin melts. What happened? (Stampede: request collapsing, shield, stale-while-revalidate.)</li>
+<li>How would you serve private content through a CDN? (Signed URLs or cookies verified at the edge, <code>private</code> for personalised responses.)</li>
+<li>How much origin capacity do you need? (Total rate times miss ratio, plus headroom for refill after a purge.)</li>
+<li>What if the CDN itself goes down? (Multi-CDN with DNS steering, or fall back to origin with enough capacity for a degraded mode.)</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>"Put it behind a CDN" with no word on TTLs, keys or invalidation.</li>
+<li>Planning to purge on every write for content that changes thousands of times a second.</li>
+<li>Caching personalised or authenticated responses in a shared cache without the user in the key.</li>
+<li>Sizing the origin from the hit ratio as if 95% and 99% were similar.</li>
+<li>Leaving the origin reachable from the internet, so the CDN's DDoS protection can be bypassed.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://www.rfc-editor.org/rfc/rfc9111" target="_blank" rel="noopener">RFC 9111: HTTP Caching</a><span>Fielding, Nottingham and Reschke, 2022. The rules every CDN and browser cache follows: freshness, validation, <code>Cache-Control</code>, <code>Vary</code> and <code>Age</code>.</span></li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc5861" target="_blank" rel="noopener">RFC 5861: HTTP Cache-Control Extensions for Stale Content</a><span>Nottingham, 2010. Defines <code>stale-while-revalidate</code> and <code>stale-if-error</code>.</span></li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9213" target="_blank" rel="noopener">RFC 9213: Targeted HTTP Cache Control</a><span>2022. The <code>CDN-Cache-Control</code> header for instructions aimed only at CDNs.</span></li>
+<li><a href="https://dl.acm.org/doi/10.1145/1842733.1842736" target="_blank" rel="noopener">The Akamai Network: A Platform for High-Performance Internet Applications</a><span>Nygren, Sitaraman and Sun, ACM SIGOPS Operating Systems Review, 2010. How a large CDN is built: mapping, tiered distribution, overlay routing.</span></li>
+<li><a href="https://openconnect.netflix.com/" target="_blank" rel="noopener">Netflix Open Connect</a><span>Netflix's own CDN: appliances embedded in ISPs, filled ahead of demand.</span></li>
+</ul>

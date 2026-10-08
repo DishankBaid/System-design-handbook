@@ -1,0 +1,426 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">One server stops being enough long before it stops being convenient. The moment you run two copies of a service, something has to decide which copy gets each request, notice when a copy dies, and keep doing that without becoming the thing that takes the site down. That something is a <dfn>load balancer</dfn>.</p>
+<p>A load balancer publishes one stable address, usually a <dfn>virtual IP</dfn> (VIP) such as <code>203.0.113.10</code>, and spreads the traffic arriving there across a <dfn>pool</dfn> of backends with private addresses. Clients never learn how many backends exist. That indirection is what lets you add capacity before a sale, replace a host during a deploy, or lose a machine at 3am without anyone outside noticing.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 300" role="img" aria-label="Three kinds of clients send requests to one load balancer address, which spreads them across four backends in a pool">
+<rect class="n client" x="20" y="60" width="100" height="44" rx="8"/><text class="t sm b mid" x="70" y="80">Browser</text><text class="t xs mute mid" x="70" y="95">198.51.100.7</text>
+<rect class="n client" x="20" y="138" width="100" height="44" rx="8"/><text class="t sm b mid" x="70" y="158">Mobile app</text><text class="t xs mute mid" x="70" y="173">192.0.2.41</text>
+<rect class="n client" x="20" y="216" width="100" height="44" rx="8"/><text class="t sm b mid" x="70" y="236">Partner API</text><text class="t xs mute mid" x="70" y="251">198.51.100.92</text>
+<rect class="n ext" x="290" y="120" width="120" height="80" rx="8"/><text class="t b mid" x="350" y="148">Load balancer</text><text class="t xs mono mute mid" x="350" y="167">VIP 203.0.113.10</text><text class="t xs mute mid" x="350" y="183">:443</text>
+<text class="t xs mute mid" x="350" y="222">one public address,</text><text class="t xs mute mid" x="350" y="236">picks a backend each time</text>
+<rect class="zone" x="560" y="10" width="152" height="282" rx="10"/>
+<text class="t xs mute mid" x="636" y="28">pool: orders-api</text>
+<rect class="n svc" x="576" y="40" width="120" height="44" rx="8"/><text class="t sm b mid" x="636" y="60">app-1</text><text class="t xs mono mute mid" x="636" y="75">10.0.1.11:8080</text>
+<rect class="n svc" x="576" y="105" width="120" height="44" rx="8"/><text class="t sm b mid" x="636" y="125">app-2</text><text class="t xs mono mute mid" x="636" y="140">10.0.1.12:8080</text>
+<rect class="n svc" x="576" y="170" width="120" height="44" rx="8"/><text class="t sm b mid" x="636" y="190">app-3</text><text class="t xs mono mute mid" x="636" y="205">10.0.2.11:8080</text>
+<rect class="n svc" x="576" y="235" width="120" height="44" rx="8"/><text class="t sm b mid" x="636" y="255">app-4</text><text class="t xs mono mute mid" x="636" y="270">10.0.2.12:8080</text>
+<path class="e" d="M120,82 C200,82 200,145 286,145"/>
+<path class="e" d="M120,160 H286"/>
+<path class="e" d="M120,238 C200,238 200,175 286,175"/>
+<path class="e" d="M410,145 C490,145 490,62 572,62"/>
+<path class="e" d="M410,155 C490,155 490,127 572,127"/>
+<path class="e" d="M410,165 C490,165 490,192 572,192"/>
+<path class="e" d="M410,175 C490,175 490,257 572,257"/>
+<path class="flow" d="M120,82 C200,82 200,145 286,145"/>
+<path class="flow" d="M120,160 H286"/>
+<path class="flow" d="M120,238 C200,238 200,175 286,175"/>
+<path class="flow" d="M410,145 C490,145 490,62 572,62"/>
+<path class="flow" d="M410,155 C490,155 490,127 572,127"/>
+<path class="flow" d="M410,165 C490,165 490,192 572,192"/>
+<path class="flow" d="M410,175 C490,175 490,257 572,257"/>
+</svg>
+</div>
+<figcaption><b>The basic shape.</b> Clients only know the VIP. The balancer chooses a backend for every connection or request, so backends can be added, drained or lost without any client changing configuration.</figcaption>
+</figure>
+
+<p>A load balancer has four jobs, and the rest of this chapter takes them in turn: <strong>distribute</strong> requests so every backend is equally busy, <strong>detect failure</strong> and stop sending traffic to broken backends, <strong>change the pool safely</strong> during deploys and autoscaling, and <strong>stay up itself</strong>, since every request passes through it.</p>
+
+<h2 id="l4-vs-l7">L4 vs L7: what the balancer can see</h2>
+<p>The most important property of a load balancer is the layer it works at, because that decides what information it can route on. The names come from the OSI model.</p>
+<ul>
+<li>A <dfn>layer 4 (L4)</dfn> balancer works on TCP and UDP. It sees IP addresses, ports and TCP flags. It picks a backend when a connection opens and then forwards that connection's packets without reading them.</li>
+<li>A <dfn>layer 7 (L7)</dfn> balancer speaks the application protocol, almost always HTTP. It terminates the client's TCP and TLS connection, parses each request, picks a backend per request, and opens its own connection to that backend.</li>
+</ul>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 320" role="img" aria-label="Side by side: an L4 balancer sees IP and TCP headers and an opaque encrypted payload; an L7 balancer sees the HTTP request line, host and cookies">
+<text class="t b" x="24" y="26">Layer 4: per connection</text>
+<text class="t xs mute" x="24" y="42">reads packet headers only</text>
+<rect class="n ext" x="24" y="56" width="312" height="48" rx="6"/><text class="t sm b" x="36" y="75">IP header</text><text class="t mono" x="36" y="94">198.51.100.7 → 203.0.113.10</text>
+<rect class="n ext" x="24" y="112" width="312" height="48" rx="6"/><text class="t sm b" x="36" y="131">TCP header</text><text class="t mono" x="36" y="150">port 52814 → 443, flags SYN</text>
+<rect class="n ghost" x="24" y="168" width="312" height="48" rx="6"/><text class="t sm b mute" x="36" y="187">Payload: opaque</text><text class="t mono mute" x="36" y="206">17 03 03 00 5a 8c 1e 4f … (TLS)</text>
+<text class="t sm b" x="24" y="244">Can do</text>
+<text class="t sm" x="24" y="264">Route by IP, port and protocol</text>
+<text class="t sm" x="24" y="282">Hash the connection 5-tuple to a backend</text>
+<text class="t sm" x="24" y="300">Pass TLS through untouched, millions of pkts/s</text>
+<path class="line faint" d="M360,16 V308" style="stroke-dasharray:4 4"/>
+<text class="t b" x="384" y="26">Layer 7: per request</text>
+<text class="t xs mute" x="384" y="42">terminates TLS, parses HTTP</text>
+<rect class="n svc" x="384" y="56" width="312" height="48" rx="6"/><text class="t sm b" x="396" y="75">Request line</text><text class="t mono" x="396" y="94">GET /api/v2/orders/8812 HTTP/1.1</text>
+<rect class="n svc" x="384" y="112" width="312" height="48" rx="6"/><text class="t sm b" x="396" y="131">Headers</text><text class="t mono" x="396" y="150">Host: shop.example.com</text>
+<rect class="n svc" x="384" y="168" width="312" height="48" rx="6"/><text class="t sm b" x="396" y="187">Cookies and auth</text><text class="t mono" x="396" y="206">session=7f3a91c2; tenant=acme</text>
+<text class="t sm b" x="384" y="244">Can do</text>
+<text class="t sm" x="384" y="264">Route /api/* and /static/* to different pools</text>
+<text class="t sm" x="384" y="282">Retry a failed GET on another backend</text>
+<text class="t sm" x="384" y="300">Sticky sessions by cookie, add headers, compress</text>
+</svg>
+</div>
+<figcaption><b>The same request, seen from two layers.</b> To an L4 balancer an HTTPS request is a stream of encrypted bytes on port 443. An L7 balancer decrypts it and can make a decision per request based on its path, host and headers.</figcaption>
+</figure>
+
+<h3 id="l4-mechanics">How an L4 balancer forwards packets</h3>
+<p>An L4 balancer must send every packet of a connection to the same backend, otherwise the backend receives a fragment of a TCP stream it never opened. It does that either by recording the choice in a <dfn>connection table</dfn> keyed by the <dfn>5-tuple</dfn> (source IP, source port, destination IP, destination port, protocol), or by hashing the 5-tuple so the same connection always maps to the same backend. Then it delivers packets in one of three ways:</p>
+<div class="defs">
+<div><h4>NAT</h4><p>The balancer rewrites the destination address to the backend's, and the source address on the way back. Simple, but every response byte flows back through the balancer.</p></div>
+<div><h4>Direct server return</h4><p>The balancer forwards the packet unchanged (or encapsulated), the backend also owns the VIP, and replies go straight to the client. Responses are usually much larger than requests, so the balancer handles a small fraction of the bytes.</p></div>
+<div><h4>Proxy</h4><p>The balancer terminates TCP and opens a second connection to the backend, copying bytes between them. This is how HAProxy and NGINX run in TCP mode: two connections, no parsing.</p></div>
+</div>
+
+<h3 id="l7-mechanics">What L7 buys you, and what it costs</h3>
+<p>Because an L7 balancer sees each request, it can do things an L4 one cannot: route <code>/checkout</code> to one pool and <code>/search</code> to another, send 5% of traffic to a canary build, retry an idempotent request on a different backend after a 503, enforce timeouts per route, and attach headers such as <code>X-Request-Id</code> or <code>X-Forwarded-For</code>. Much of this overlaps with what a reverse proxy or API gateway does; the <a href="proxies-gateways.html">Proxies &amp; API Gateways</a> chapter covers those responsibilities.</p>
+<p>The cost is work per request. It holds TLS keys and does the handshake crypto, parses every request, often buffers bodies, and keeps two TCP connections per client conversation. An L7 tier needs noticeably more CPU per gigabit than an L4 tier and adds latency, typically well under a millisecond for a simple proxy hop, more with heavy filtering.</p>
+<div class="callout warn">
+<div class="callout-title">Common mistake: gRPC behind an L4 balancer</div>
+<p>gRPC runs over HTTP/2, which multiplexes many requests on one long-lived TCP connection (see <a href="network-protocols.html">TCP, UDP &amp; HTTP</a>). An L4 balancer balances <em>connections</em>, so if a client service opens one connection, every one of its requests lands on the same backend forever, and newly added backends receive nothing. Use an L7 balancer that understands HTTP/2 streams, or client-side balancing across several connections.</p>
+</div>
+<p>Large sites use both: an L4 tier takes packets at line rate and spreads them across L7 proxies, which route each request.</p>
+
+<h2 id="algorithms">Balancing algorithms</h2>
+<p>The algorithm answers one question: given this request and this pool, which backend? Algorithms differ in what they know about backends. Some know nothing, some count connections, some measure latency, some hash the request.</p>
+
+<h3 id="round-robin">Round robin and weighted round robin</h3>
+<p><dfn>Round robin</dfn> hands requests to backends in order: app-1, app-2, app-3, app-4, app-1, and so on. It needs no state beyond a counter and is perfectly even when every request costs the same and every backend is the same size.</p>
+<p><dfn>Weighted round robin</dfn> gives larger machines a bigger share. With weights 4, 2, 1, the first backend gets 4 of every 7 requests. A naive implementation sends four in a row to the big server; NGINX uses a <em>smooth</em> variant that interleaves them (<code>a b a c a b a</code> instead of <code>a a a a b b c</code>) so no backend gets a burst. Weights are also how you run a canary: give the new version weight 1 against 99.</p>
+<p>Round robin's weakness is that it ignores how busy a backend actually is. If one request generates a 3-second report and the next is a 2 ms lookup, round robin still alternates, and a backend unlucky enough to receive several slow requests builds a queue while its neighbours idle.</p>
+
+<h3 id="least-connections">Least connections and least response time</h3>
+<p><dfn>Least connections</dfn> sends each new request to the backend with the fewest open connections (or, for an L7 balancer, the fewest outstanding requests). Open connections are a decent proxy for current work, so slow requests naturally steer traffic away from the backend handling them. It is the usual default for long-lived connections such as WebSockets or database sessions.</p>
+<p><dfn>Least response time</dfn> also weighs a moving average of recent latency, so it steers away from a backend slowed by garbage collection or a noisy neighbour. It can oscillate: everyone piles onto the fast backend, which then becomes slow.</p>
+
+<h3 id="power-of-two">Power of two choices</h3>
+<p>Least connections has a hidden problem at scale. It assumes the balancer knows every backend's current load. With ten balancer instances each tracking only their own connections, or with load reports that arrive every few hundred milliseconds, every instance sees the same "least loaded" backend at the same moment and they all send their next requests to it. This is <dfn>herding</dfn>, and it can make least connections worse than random.</p>
+<p>The <dfn>power of two choices</dfn> (P2C) fixes it with almost no work: pick two backends at random and send the request to the less loaded of the two. Picking only two means different balancer instances rarely pick the same pair, so stale information cannot make them all agree on one victim. Yet comparing two is enough to avoid the worst choices. The theory is striking: when <code>n</code> requests go to <code>n</code> servers, the busiest server under random placement gets about <code>log n / log log n</code> requests, and with two choices that drops to about <code>log log n / log 2</code>, an exponential improvement from one extra sample.</p>
+<p>The simulation below sends requests to a pool and reports the busiest server. The second experiment gives the balancer a load snapshot that is only refreshed every <code>refresh</code> requests, which is what several independent balancer instances or delayed load reports look like.</p>
+
+<pre><code class="language-python">import random
+
+
+def max_load(servers, requests, policy, refresh=1, seed=42):
+    """Send `requests` to `servers` and return the busiest server's count.
+    The balancer only sees a load snapshot refreshed every `refresh` requests,
+    which models several balancer instances or delayed load reports."""
+    rng = random.Random(seed)
+    load = [0] * servers
+    seen = load[:]
+    for i in range(requests):
+        if i % refresh == 0:
+            seen = load[:]
+        if policy == "random":
+            pick = rng.randrange(servers)
+        elif policy == "two-choices":
+            a, b = rng.randrange(servers), rng.randrange(servers)
+            pick = a if seen[a] &lt;= seen[b] else b
+        else:  # "least-loaded": scan every server, random tie-break
+            low = min(seen)
+            pick = rng.choice([s for s in range(servers) if seen[s] == low])
+        load[pick] += 1
+    return max(load)
+
+
+for n, m in [(100, 10_000), (1_000, 1_000_000)]:
+    print(f"{n} servers, {m:,} requests, mean {m // n}:",
+          {p: max_load(n, m, p) for p in ("random", "two-choices")})
+
+for refresh in (1, 100, 1_000):
+    print(f"snapshot every {refresh:&gt;5} requests:",
+          {p: max_load(100, 10_000, p, refresh) for p in ("least-loaded", "two-choices", "random")})
+
+# 100 servers, 10,000 requests, mean 100: {'random': 126, 'two-choices': 102}
+# 1000 servers, 1,000,000 requests, mean 1000: {'random': 1128, 'two-choices': 1003}
+# snapshot every     1 requests: {'least-loaded': 100, 'two-choices': 102, 'random': 126}
+# snapshot every   100 requests: {'least-loaded': 124, 'two-choices': 103, 'random': 126}
+# snapshot every  1000 requests: {'least-loaded': 528, 'two-choices': 114, 'random': 126}</code></pre>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 280" role="img" aria-label="Bar chart of the busiest server's request count for least-loaded, two choices and random, as load information gets staler; least-loaded rises from 100 to 528 while two choices stays between 102 and 114">
+<path class="line faint" d="M70,230.0 H700"/>
+<text class="t xs mute end" x="64" y="233.5">0</text>
+<path class="line faint" d="M70,195.5 H700"/>
+<text class="t xs mute end" x="64" y="199.0">100</text>
+<path class="line faint" d="M70,160.9 H700"/>
+<text class="t xs mute end" x="64" y="164.4">200</text>
+<path class="line faint" d="M70,126.4 H700"/>
+<text class="t xs mute end" x="64" y="129.9">300</text>
+<path class="line faint" d="M70,91.8 H700"/>
+<text class="t xs mute end" x="64" y="95.3">400</text>
+<path class="line faint" d="M70,57.3 H700"/>
+<text class="t xs mute end" x="64" y="60.8">500</text>
+<path class="line" d="M70,230 H700"/>
+<path class="line" d="M70,195.5 H700" style="stroke-dasharray:5 4;stroke:var(--d-green)"/>
+<text class="t xs green" x="76" y="190.5">mean = 100</text>
+<rect x="149" y="195.5" width="40" height="34.5" rx="3" style="fill:var(--d-cache-s);opacity:.85"/>
+<text class="t xs mono mid" x="169" y="190.5">100</text>
+<rect x="195" y="194.8" width="40" height="35.2" rx="3" style="fill:var(--d-svc-s);opacity:.85"/>
+<text class="t xs mono mid" x="215" y="189.8">102</text>
+<rect x="241" y="186.5" width="40" height="43.5" rx="3" style="fill:var(--d-ext-s);opacity:.85"/>
+<text class="t xs mono mid" x="261" y="181.5">126</text>
+<text class="t sm mid" x="215" y="248">snapshot every 1</text>
+<rect x="349" y="187.2" width="40" height="42.8" rx="3" style="fill:var(--d-cache-s);opacity:.85"/>
+<text class="t xs mono mid" x="369" y="182.2">124</text>
+<rect x="395" y="194.4" width="40" height="35.6" rx="3" style="fill:var(--d-svc-s);opacity:.85"/>
+<text class="t xs mono mid" x="415" y="189.4">103</text>
+<rect x="441" y="186.5" width="40" height="43.5" rx="3" style="fill:var(--d-ext-s);opacity:.85"/>
+<text class="t xs mono mid" x="461" y="181.5">126</text>
+<text class="t sm mid" x="415" y="248">snapshot every 100</text>
+<rect x="549" y="47.6" width="40" height="182.4" rx="3" style="fill:var(--d-cache-s);opacity:.85"/>
+<text class="t xs mono mid" x="569" y="42.6">528</text>
+<rect x="595" y="190.6" width="40" height="39.4" rx="3" style="fill:var(--d-svc-s);opacity:.85"/>
+<text class="t xs mono mid" x="615" y="185.6">114</text>
+<rect x="641" y="186.5" width="40" height="43.5" rx="3" style="fill:var(--d-ext-s);opacity:.85"/>
+<text class="t xs mono mid" x="661" y="181.5">126</text>
+<text class="t sm mid" x="615" y="248">snapshot every 1,000</text>
+<text class="t xs mute mid" x="385" y="266">requests between load updates (100 servers, 10,000 requests)</text>
+<text class="t xs mute" x="8" y="22">busiest server</text>
+<rect x="300" y="12" width="12" height="12" rx="2" style="fill:var(--d-cache-s);opacity:.85"/>
+<text class="t xs" x="317" y="22">least-loaded</text>
+<rect x="410" y="12" width="12" height="12" rx="2" style="fill:var(--d-svc-s);opacity:.85"/>
+<text class="t xs" x="427" y="22">two choices</text>
+<rect x="520" y="12" width="12" height="12" rx="2" style="fill:var(--d-ext-s);opacity:.85"/>
+<text class="t xs" x="537" y="22">random</text>
+</svg>
+</div>
+<figcaption><b>Herding.</b> Numbers from the simulation above. Least-loaded is best with perfect information and worst with stale information. Two choices stays close to the mean throughout, and random is unaffected by staleness because it never looks.</figcaption>
+</figure>
+
+<p>Three findings. With fresh information, choosing among all servers is best, as expected, and two choices is within 2% of it. Random placement leaves the busiest server 26% above average with 100 servers, and still 13% above with 1,000 servers and a million requests. And with stale information, least-loaded collapses: when the snapshot is 1,000 requests old, every request goes to the same "idle" servers and the busiest one ends up at more than five times the mean, while two choices barely moves. That robustness is why Envoy's least-request policy and NGINX's <code>random two</code> are built on P2C.</p>
+
+<h3 id="hashing">Hashing and sticky sessions</h3>
+<p>Sometimes the goal is sending the <em>same</em> client or key to the <em>same</em> backend: a cache node that holds a user's data, or an application with in-memory sessions. Three common ways:</p>
+<ul>
+<li><strong>Source IP hash.</strong> <code>hash(client_ip) % N</code>. Needs no state, but every client behind one corporate NAT or mobile carrier gateway lands on one backend, and changing <code>N</code> remaps almost everyone.</li>
+<li><strong>Consistent hashing on a key.</strong> Hash a header, URL or user id onto a ring so adding or removing a backend moves only about <code>1/N</code> of keys. This is how L7 balancers front cache fleets; the <a href="consistent-hashing.html">Consistent Hashing</a> chapter explains the ring, Maglev hashing and bounded loads.</li>
+<li><strong>Cookie affinity.</strong> On the first response the balancer sets a cookie naming the backend (AWS ALB uses <code>AWSALB</code>), and later requests carrying it go back there. Precise per user, but only works for HTTP clients that keep cookies.</li>
+</ul>
+<p>Treat sticky sessions as a smell. A machine's failure logs its users out, deploys must drain slowly, and load drifts as some users stay longer. Prefer stateless servers with sessions in a shared store (see <a href="scalability.html">Scalability</a>), and keep affinity for cases where locality is the point, such as caches.</p>
+
+<h3 id="algorithm-comparison">Choosing an algorithm</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Algorithm</th><th>Knows about backends</th><th>Good for</th><th>Weak when</th></tr></thead>
+<tbody>
+<tr><th>Round robin</th><td>Nothing</td><td class="yes">Uniform, short requests on identical servers</td><td class="no">Request costs vary widely</td></tr>
+<tr><th>Weighted round robin</th><td>Static capacity</td><td class="yes">Mixed instance sizes, canaries</td><td class="no">Actual load differs from the weights</td></tr>
+<tr><th>Random</th><td>Nothing</td><td class="meh">Many independent balancers, no shared state</td><td class="no">Small pools: noticeable imbalance</td></tr>
+<tr><th>Least connections</th><td>Live connection counts</td><td class="yes">Long-lived or variable-cost requests</td><td class="no">Many balancer instances with stale counts (herding)</td></tr>
+<tr><th>Least response time</th><td>Counts plus latency</td><td class="meh">Backends with uneven performance</td><td class="no">Few samples; can oscillate</td></tr>
+<tr><th>Power of two choices</th><td>Load of two random backends</td><td class="yes">Large fleets, distributed balancers</td><td class="meh">Tiny pools, where it is no better than least connections</td></tr>
+<tr><th>Hash / sticky</th><td>Request key</td><td class="yes">Cache locality, stateful sessions</td><td class="no">Hot keys; uneven when keys are skewed</td></tr>
+</tbody></table></div>
+<p>A reasonable default for an HTTP service is least outstanding requests or P2C over it. Use round robin when requests are uniform and you want predictability, and hashing only when locality matters.</p>
+
+<h2 id="health-checks">Health checks</h2>
+<p>An algorithm that spreads traffic evenly across a pool containing a dead server sends a quarter of requests to a black hole. The balancer needs to know which backends are healthy, and it learns this two ways.</p>
+<div class="defs">
+<div><h4>Active checks</h4><p>The balancer probes each backend on a timer, for example <code>GET /healthz</code> every 2 seconds with a 1 second timeout. A backend is marked down after <code>fall</code> consecutive failures (often 3) and up again after <code>rise</code> consecutive successes (often 2). Detects failure even with no traffic, at the cost of probe load and a detection delay of several intervals.</p></div>
+<div><h4>Passive checks</h4><p>The balancer watches real traffic: connection refusals, timeouts and 5xx responses. After, say, 5 consecutive errors it ejects the backend for 30 seconds. Envoy calls this <dfn>outlier detection</dfn>. Reacts within a handful of requests at high traffic, but sees nothing when traffic is low.</p></div>
+</div>
+<p>Production setups use both: passive checks for speed, active checks to bring ejected backends back and to cover quiet pools.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 300" role="img" aria-label="Step-through: four backends share traffic; app-3 fails health checks, is ejected so the others take a third each, then recovers and is re-added with slow start">
+<rect class="n ext" x="30" y="120" width="120" height="60" rx="8"/><text class="t b mid" x="90" y="146">Load balancer</text><text class="t xs mute mid" x="90" y="163">checks every 2 s</text>
+<rect class="n svc" x="320" y="30" width="130" height="44" rx="8"/><text class="t sm b mid" x="385" y="57">app-1</text>
+<rect class="n svc" x="320" y="95" width="130" height="44" rx="8"/><text class="t sm b mid" x="385" y="122">app-2</text>
+<rect class="n svc" x="320" y="225" width="130" height="44" rx="8"/><text class="t sm b mid" x="385" y="252">app-4</text>
+<g data-show="1 4"><rect class="n svc" x="320" y="160" width="130" height="44" rx="8"/><text class="t sm b mid" x="385" y="187">app-3</text></g>
+<g data-show="2"><rect class="n bad" x="320" y="160" width="130" height="44" rx="8"/><text class="t sm b mid" x="385" y="180">app-3</text><text class="t xs red mid" x="385" y="195">checks failing 2/3</text></g>
+<g data-show="3"><rect class="n ghost" x="320" y="160" width="130" height="44" rx="8"/><text class="t sm mute mid" x="385" y="180">app-3</text><text class="t xs mute mid" x="385" y="195">ejected</text></g>
+<path class="e" d="M150,140 C230,140 230,52 316,52"/>
+<path class="e" d="M150,146 C230,146 230,117 316,117"/>
+<path class="e" d="M150,160 C230,160 230,247 316,247"/>
+<g data-show="1"><path class="e" d="M150,153 C230,153 230,182 316,182"/></g>
+<g data-show="2"><path class="e red" d="M150,153 C230,153 230,182 316,182"/></g>
+<g data-show="4"><path class="e dash accent" d="M150,153 C230,153 230,182 316,182"/></g>
+<g data-show="1"><text class="t mono" x="462" y="56">25%</text><text class="t mono" x="462" y="121">25%</text><text class="t mono" x="462" y="186">25%</text><text class="t mono" x="462" y="251">25%</text></g>
+<g data-show="2"><text class="t mono" x="462" y="56">25%</text><text class="t mono" x="462" y="121">25%</text><text class="t mono red" x="462" y="186">25%</text><text class="t mono" x="462" y="251">25%</text></g>
+<g data-show="3"><text class="t mono" x="462" y="56">33%</text><text class="t mono" x="462" y="121">33%</text><text class="t mono mute" x="462" y="186">0%</text><text class="t mono" x="462" y="251">33%</text></g>
+<g data-show="4"><text class="t mono" x="462" y="56">31%</text><text class="t mono" x="462" y="121">31%</text><text class="t mono accent" x="462" y="186">7%</text><text class="t mono" x="462" y="251">31%</text></g>
+<rect class="n" x="510" y="30" width="196" height="239" rx="10"/>
+<g data-show="1"><text class="t sm b" x="524" y="56">Healthy pool</text>
+<text class="t sm" x="524" y="84">All four pass checks.</text>
+<text class="t sm" x="524" y="104">Each gets about a</text>
+<text class="t sm" x="524" y="124">quarter of requests.</text></g>
+<g data-show="2"><text class="t sm b" x="524" y="56">app-3 hangs</text>
+<text class="t sm" x="524" y="84">Probes time out, but</text>
+<text class="t sm" x="524" y="104">fall = 3 is not reached.</text>
+<text class="t sm" x="524" y="124">Its 25% share still</text>
+<text class="t sm" x="524" y="144">times out or must be</text>
+<text class="t sm" x="524" y="164">retried elsewhere.</text></g>
+<g data-show="3"><text class="t sm b" x="524" y="56">Ejected</text>
+<text class="t sm" x="524" y="84">Third failed probe, about</text>
+<text class="t sm" x="524" y="104">5 to 7 s after the hang.</text>
+<text class="t sm" x="524" y="124">Survivors take a third</text>
+<text class="t sm" x="524" y="144">each: plan headroom</text>
+<text class="t sm" x="524" y="164">for that 33% jump.</text></g>
+<g data-show="4"><text class="t sm b" x="524" y="56">Recovered</text>
+<text class="t sm" x="524" y="84">Two passing probes</text>
+<text class="t sm" x="524" y="104">(rise = 2) re-add it.</text>
+<text class="t sm" x="524" y="124">Slow start ramps its</text>
+<text class="t sm" x="524" y="144">weight up over ~30 s so</text>
+<text class="t sm" x="524" y="164">cold caches are not</text>
+<text class="t sm" x="524" y="184">flooded.</text></g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Healthy</button><button type="button" data-step="2" aria-pressed="false">app-3 hangs</button><button type="button" data-step="3" aria-pressed="false">Ejected</button><button type="button" data-step="4" aria-pressed="false">Recovered</button></div>
+</div>
+<figcaption><b>A backend failing and returning.</b> The gap between step 2 and step 3 is the detection window, when requests still go to a dead server. Passive checks and retries are what make that window harmless.</figcaption>
+</figure>
+
+<h3 id="what-to-check">What a health check should test</h3>
+<p>A <dfn>shallow</dfn> check (the process answers <code>/healthz</code> with 200) tells you the server is up. A <dfn>deep</dfn> check also queries the database and calls dependencies, and tells you the server can do useful work. Deep checks are tempting and dangerous. If the shared database has a 10 second hiccup, every backend's deep check fails at once, the balancer ejects the entire pool, and a partial slowdown becomes a total outage that lasts until checks pass again.</p>
+<p>The safe pattern is to check what is local to the instance (process alive, not overloaded, finished warming up, not shutting down) and let the application return errors for dependency problems, which <a href="fault-tolerance.html">circuit breakers</a> handle better than ejection does. Balancers also add a safety net: Envoy's <dfn>panic threshold</dfn> ignores health status and spreads traffic across all hosts once fewer than 50% are healthy, on the theory that mass failure is more likely a bad check than a dead fleet.</p>
+
+<h2 id="worked-example">Worked example: how many requests fail before ejection</h2>
+<p>An orders service handles 20,000 requests per second across 10 backends, 2,000 each. One backend hangs: it accepts connections but never answers. How many requests are hurt before the balancer stops sending it traffic?</p>
+<div class="calc">Active only, interval 2 s, timeout 1 s, fall 3
+  best case   hang just before a probe: probes at 0, 2, 4 s fail → down at 4 + 1 = <span class="r">5 s</span>
+  worst case  hang just after a probe:  probes at 2, 4, 6 s fail → down at 6 + 1 = <span class="r">7 s</span>
+  affected    2,000 req/s × 5..7 s     = <span class="r">10,000 to 14,000 requests</span>
+
+Active only, interval 10 s, timeout 2 s, fall 3
+  window      20 + 2 = 22 s  to  30 + 2 = 32 s
+  affected    2,000 req/s × 22..32 s   = <span class="r">44,000 to 64,000 requests</span>
+
+Passive, eject after 5 consecutive errors, request timeout 1 s
+  5 errors arrive within 5 / 2,000 req/s = 2.5 ms of the first timeout
+  window      ≈ 1 s (time for the first requests to time out)
+  affected    ≈ 2,000 requests, retried on healthy backends if idempotent</div>
+<p>Two lessons. First, a hang is far worse than a crash: a crashed process refuses connections instantly and a passive check catches it in milliseconds, while a hang has to wait for timeouts, so <strong>the request timeout sets the floor on detection time</strong>. Second, a short probe interval is cheap compared with tens of thousands of failed requests. Ten balancers probing 10 backends every 2 seconds is 50 probes per second, nothing next to 20,000 real requests.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Setting</th><th class="num">Detection window</th><th class="num">Requests affected</th><th>Cost</th></tr></thead>
+<tbody>
+<tr><th>Active, 10 s interval</th><td class="num">22-32 s</td><td class="num">44k-64k</td><td class="no">Cheap probes, long exposure</td></tr>
+<tr><th>Active, 2 s interval</th><td class="num">5-7 s</td><td class="num">10k-14k</td><td class="meh">50 probes/s across the tier</td></tr>
+<tr><th>Passive + 1 s timeout</th><td class="num">≈ 1 s</td><td class="num">≈ 2k</td><td class="yes">No extra traffic; needs active checks to re-admit</td></tr>
+<tr><th>Passive + retry elsewhere</th><td class="num">≈ 1 s</td><td class="num">≈ 0 failed, 2k slow</td><td class="yes">Only safe for idempotent requests (see <a href="idempotency.html">Idempotency</a>)</td></tr>
+</tbody></table></div>
+
+<h2 id="draining">Connection draining and slow start</h2>
+<p>Most backend removals are planned: a deploy, a scale-in, a kernel patch. Pulling a backend out of the pool instantly would cut off its in-flight requests. <dfn>Connection draining</dfn> (AWS calls it the <em>deregistration delay</em>, default 300 seconds) splits removal into two phases:</p>
+<ol class="steps">
+<li><strong>Stop new work.</strong> The balancer marks the backend as draining and sends it no new connections or requests.</li>
+<li><strong>Let old work finish.</strong> Existing connections continue until they complete or the drain timeout expires, then they are closed.</li>
+<li><strong>Tell clients to move.</strong> For keep-alive connections, the backend answers with <code>Connection: close</code> on HTTP/1.1 or sends an HTTP/2 <code>GOAWAY</code> frame, so clients open their next connection elsewhere instead of waiting to be cut off.</li>
+</ol>
+<p>In Kubernetes the same dance is a readiness probe that starts failing when the pod receives <code>SIGTERM</code>, a short <code>preStop</code> sleep so every balancer notices before the process stops accepting, and a <code>terminationGracePeriodSeconds</code> (default 30) long enough for in-flight requests. Long-lived connections such as WebSockets are the hard case: a drain timeout of minutes still cuts them, so clients must reconnect gracefully (see <a href="realtime.html">Polling, SSE &amp; WebSockets</a>).</p>
+<p>The reverse problem is a new backend that is cold: empty caches, an unwarmed JIT, empty connection pools. Least connections makes this worse, since an idle new server looks like the best choice and gets flooded. <dfn>Slow start</dfn> ramps its weight from near zero to full over a configured window, typically 30 to 60 seconds.</p>
+
+<h2 id="ha">Keeping the load balancer itself available</h2>
+<p>A load balancer removes single points of failure from the backend tier and then becomes one itself. There are three standard ways out, and large systems layer them.</p>
+
+<h3 id="active-passive">Active-passive with a floating IP</h3>
+<p>Two balancer machines share one VIP. The active one owns it and answers ARP for it, while the standby listens. They speak <dfn>VRRP</dfn> (Virtual Router Redundancy Protocol), usually through <code>keepalived</code>: the active node multicasts an advertisement every second, and if the standby misses about three in a row it claims the VIP and sends a <dfn>gratuitous ARP</dfn> so the network switch starts delivering the VIP's packets to it.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 300" role="img" aria-label="Step-through of an active-passive load balancer pair: LB-A holds the VIP; LB-A fails and VRRP adverts stop; LB-B takes over the VIP and traffic flows through it">
+<rect class="n client" x="20" y="120" width="110" height="56" rx="8"/><text class="t b mid" x="75" y="144">Internet</text><text class="t xs mono mute mid" x="75" y="162">→ 203.0.113.10</text>
+<g data-show="1"><rect class="n ext" x="320" y="30" width="150" height="62" rx="8"/><text class="t b mid" x="395" y="55">LB-A: active</text><text class="t xs mono accent mid" x="395" y="74">holds VIP</text></g>
+<g data-show="2"><rect class="n bad" x="320" y="30" width="150" height="62" rx="8"/><text class="t b mid" x="395" y="55">LB-A: failed</text><text class="t xs red mid" x="395" y="74">kernel panic</text></g>
+<g data-show="3"><rect class="n bad" x="320" y="30" width="150" height="62" rx="8"/><text class="t b mid" x="395" y="55">LB-A: failed</text><text class="t xs mute mid" x="395" y="74">VIP released</text></g>
+<g data-show="1 2"><rect class="n ext" x="320" y="204" width="150" height="62" rx="8"/><text class="t b mid" x="395" y="229">LB-B: standby</text><text class="t xs mute mid" x="395" y="248">listening for adverts</text></g>
+<g data-show="3"><rect class="n good" x="320" y="204" width="150" height="62" rx="8"/><text class="t b mid" x="395" y="229">LB-B: active</text><text class="t xs mono accent mid" x="395" y="248">holds VIP</text></g>
+<rect class="zone" x="560" y="90" width="140" height="120" rx="10"/>
+<text class="t sm b mid" x="630" y="116">Backend pool</text>
+<rect class="n svc" x="576" y="128" width="50" height="30" rx="6"/><rect class="n svc" x="634" y="128" width="50" height="30" rx="6"/>
+<rect class="n svc" x="576" y="166" width="50" height="30" rx="6"/><rect class="n svc" x="634" y="166" width="50" height="30" rx="6"/>
+<path class="line faint" d="M395,92 V204" style="stroke-dasharray:3 4"/>
+<g data-show="1"><path class="e dash accent" d="M395,96 V200"/><text class="t xs accent" x="405" y="146">VRRP advert</text><text class="t xs accent" x="405" y="160">every 1 s</text></g>
+<g data-show="2"><text class="t xs red" x="405" y="146">adverts stop</text><text class="t xs red" x="405" y="160">3 missed ≈ 3 s</text></g>
+<g data-show="3"><text class="t xs" x="405" y="146">gratuitous ARP:</text><text class="t xs" x="405" y="160">VIP is now at B</text></g>
+<g data-show="1"><path class="e" d="M130,140 C220,140 220,61 316,61"/><path class="e" d="M470,61 C520,61 520,140 556,140"/>
+<path class="flow" d="M130,140 C220,140 220,61 316,61"/><path class="flow" d="M470,61 C520,61 520,140 556,140"/></g>
+<g data-show="2"><path class="e red dash" d="M130,140 C220,140 220,61 316,61"/><text class="t xs red" x="150" y="96">packets lost</text></g>
+<g data-show="3"><path class="e" d="M130,156 C220,156 220,235 316,235"/><path class="e" d="M470,235 C520,235 520,160 556,160"/>
+<path class="flow" d="M130,156 C220,156 220,235 316,235"/><path class="flow" d="M470,235 C520,235 520,160 556,160"/></g>
+<text class="t sm mute mid" x="360" y="290" data-show="1">Normal: all traffic flows through the node that owns the VIP.</text>
+<text class="t sm mute mid" x="360" y="290" data-show="2">For about 3 seconds, packets to the VIP go nowhere.</text>
+<text class="t sm mute mid" x="360" y="290" data-show="3">Same IP, new machine. Clients reconnect; nothing changes in DNS.</text>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Normal</button><button type="button" data-step="2" aria-pressed="false">LB-A fails</button><button type="button" data-step="3" aria-pressed="false">LB-B takes over</button></div>
+</div>
+<figcaption><b>Active-passive failover.</b> The VIP moves between machines at layer 2, so clients and DNS never change. Connections open on LB-A are lost unless the pair synchronises its connection table (conntrackd, HAProxy peers).</figcaption>
+</figure>
+<p>This is simple, but half the hardware idles, the pair must share a layer 2 segment, and one machine's capacity caps the site. Managed cloud balancers (AWS ALB and NLB, Google Cloud Load Balancing) hide this layer behind a DNS name or static IP.</p>
+
+<h3 id="active-active">Active-active: DNS, ECMP and anycast</h3>
+<ul>
+<li><strong>Multiple balancers behind DNS.</strong> Publish several balancer IPs for one name. Clients spread across them, and health-checked DNS removes a dead one. Failover is limited by how long resolvers and clients cache the old answer; the <a href="dns.html">DNS</a> chapter has the TTL arithmetic.</li>
+<li><strong>ECMP.</strong> The upstream router announces the VIP towards several balancer machines with <dfn>equal-cost multi-path</dfn> routing and hashes each flow's 5-tuple to one of them. All machines are active. When one dies, the router rehashes, and flows that move to a new balancer arrive mid-connection. The fix is for every balancer to choose backends with the same consistent hash, so a flow lands on the same backend whichever balancer receives it. This is exactly Maglev's design.</li>
+<li><strong>Anycast.</strong> The same VIP is announced over BGP from many sites, and the internet routes each client to the nearest one. A site that fails withdraws its route and traffic shifts elsewhere within seconds to a minute. Cloudflare and Google's global front ends work this way; see <a href="cdn.html">Content Delivery Networks</a>.</li>
+</ul>
+
+<h2 id="global-vs-local">Global vs local load balancing</h2>
+<p>Balancing happens at two scales, and interviews often blur them.</p>
+<div class="defs">
+<div><h4>Global (GSLB)</h4><p>Chooses a <em>region or data center</em>: Frankfurt or Virginia. Inputs are client location, region health and region capacity. Implemented with geo or latency-based DNS, or with anycast. Decisions change on the order of seconds to minutes.</p></div>
+<div><h4>Local</h4><p>Chooses a <em>server inside a region</em>: app-3 or app-7. Inputs are per-backend health and load. Implemented with L4 and L7 balancers. Decisions are made per connection or per request.</p></div>
+</div>
+<p>A typical request goes through both: DNS or anycast picks the nearest healthy region, an L4 tier spreads packets across L7 proxies, and the proxies route each request to an instance. When a region fails, the other regions need the headroom to absorb its traffic, which is a capacity decision, not a balancing one.</p>
+
+<h2 id="client-side">Client-side load balancing</h2>
+<p>Inside a data center there is a third option: no balancer box at all. Each client gets the list of healthy instances from a registry and picks one itself, using round robin or P2C. This is <dfn>client-side load balancing</dfn>, used by gRPC clients, Netflix's Ribbon library and Twitter's Finagle.</p>
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Dedicated balancer (server-side)</th><th>Client-side</th></tr></thead>
+<tbody>
+<tr><th>Extra network hop</th><td class="no">Yes</td><td class="yes">No: client connects directly</td></tr>
+<tr><th>Single point of failure</th><td class="meh">Must be made HA</td><td class="yes">None in the data path</td></tr>
+<tr><th>Client complexity</th><td class="yes">Clients know one address</td><td class="no">Every client needs discovery, health and balancing logic</td></tr>
+<tr><th>Polyglot fleets</th><td class="yes">Works for any language</td><td class="no">A library per language, kept in sync</td></tr>
+<tr><th>Load knowledge</th><td class="meh">Global view per balancer</td><td class="meh">Each client sees only its own requests: P2C helps</td></tr>
+</tbody></table></div>
+<p>A service mesh resolves the trade-off by moving the client-side balancer into a sidecar proxy next to each service, so the logic is shared without a central hop. Discovery is covered in <a href="service-discovery.html">Service Discovery</a> and sidecars in <a href="proxies-gateways.html">Proxies &amp; API Gateways</a>.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+<li><strong>NGINX</strong>: an L7 (and L4 <code>stream</code>) proxy. Default is weighted round robin, with <code>least_conn</code>, <code>ip_hash</code>, <code>hash ... consistent</code> and <code>random two least_conn</code>. Open-source NGINX has passive health checks only (<code>max_fails</code>, <code>fail_timeout</code>); active checks are in the commercial NGINX Plus.</li>
+<li><strong>HAProxy</strong>: L4 and L7, known for performance and detailed stats. Algorithms include <code>roundrobin</code>, <code>leastconn</code>, <code>source</code>, <code>uri</code> and <code>random</code> with configurable draws. Active checks default to a 2 s interval with <code>rise 2</code> and <code>fall 3</code>, and <code>slowstart</code> ramps returning servers.</li>
+<li><strong>Envoy</strong>: the L7 proxy behind most service meshes. Its least-request policy uses power of two choices, it supports ring hash and Maglev, and it combines active health checking with outlier detection and a 50% panic threshold.</li>
+<li><strong>AWS ALB and NLB</strong>: ALB is a managed L7 balancer with host and path routing, round robin or least outstanding requests, and cookie stickiness. NLB is L4, gives one static IP per availability zone, preserves client source IPs, and handles very high connection rates.</li>
+<li><strong>Google Maglev</strong>: Google's software L4 balancer, in production since 2008. Routers spread packets across Maglev machines with ECMP, each machine picks backends with Maglev consistent hashing so any machine makes the same choice, and responses return directly from backends. The NSDI 2016 paper reports one machine saturating a 10 Gbps link with small packets.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>In almost every design, as one box in front of each stateless tier. Say what kind: "an L7 balancer in front of the API servers, least outstanding requests, active and passive health checks; the balancers themselves are a managed, multi-AZ service." Go deeper when the interviewer asks about failure, long-lived connections, or multi-region traffic.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>L4 or L7 here, and why? (What does the routing decision need to see? Is TLS terminated here?)</li>
+<li>Your load balancer dies. What happens? (Active-passive with VRRP, ECMP or anycast active-active, managed multi-AZ service.)</li>
+<li>How fast do you detect a dead backend, and what happens to requests meanwhile? (Interval × fall, passive checks, retries for idempotent requests.)</li>
+<li>Why might least connections perform badly with many balancer instances? (Stale counts cause herding; power of two choices fixes it.)</li>
+<li>How do you deploy without dropping requests? (Draining, readiness probes, <code>GOAWAY</code>, slow start.)</li>
+<li>Users lose their session when a server dies. Why, and how do you fix it? (Sticky sessions with in-memory state; move state to a shared store.)</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>Drawing one load balancer box with no answer for its own failure.</li>
+<li>Deep health checks on a shared dependency, which can eject the whole pool at once.</li>
+<li>Putting long-lived HTTP/2 or gRPC connections behind an L4 balancer and expecting per-request balance.</li>
+<li>Reaching for sticky sessions by default instead of stateless services.</li>
+<li>Treating DNS round robin as instant failover.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://www.usenix.org/conference/nsdi16/technical-sessions/presentation/eisenbud" target="_blank" rel="noopener">Maglev: A Fast and Reliable Software Network Load Balancer</a><span>Eisenbud et al., NSDI 2016. ECMP, consistent hashing and connection tracking in Google's L4 balancer.</span></li>
+<li><a href="https://www.eecs.harvard.edu/~michaelm/postscripts/tpds2001.pdf" target="_blank" rel="noopener">The Power of Two Choices in Randomized Load Balancing</a><span>Mitzenmacher, IEEE TPDS 2001. The analysis behind P2C: an exponential drop in maximum load from one extra random sample.</span></li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc5798" target="_blank" rel="noopener">RFC 5798: Virtual Router Redundancy Protocol (VRRP) Version 3</a><span>The protocol behind floating-IP failover between balancer pairs.</span></li>
+<li><a href="https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/load_balancers" target="_blank" rel="noopener">Envoy: supported load balancers</a><span>Clear descriptions of weighted least request (P2C), ring hash and Maglev as implemented in a production proxy.</span></li>
+<li><a href="https://nginx.org/en/docs/http/ngx_http_upstream_module.html" target="_blank" rel="noopener">NGINX upstream module</a><span>Reference for weights, <code>least_conn</code>, <code>hash</code>, <code>random two</code> and passive failure handling.</span></li>
+</ul>

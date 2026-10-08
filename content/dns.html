@@ -1,0 +1,406 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">Every request your users send starts with a question your servers never see: <em>what IP address is <code>api.shop.example.com</code>?</em> The Domain Name System answers it, usually in under a millisecond from a cache, sometimes in 200 ms after a walk across three continents. If DNS is slow, every first request is slow. If DNS is down, your perfectly healthy service is unreachable.</p>
+<p>DNS is also more than a phone book. Because the answer can differ by who is asking and when, it is the first traffic steering layer in most architectures: it picks the region a user lands in, shifts load during a deploy, and moves everyone away from a failed data center. Each of those uses runs into the same constraint, which is the theme of this chapter: <strong>an answer, once handed out, is cached in places you do not control, for at least as long as you said it could be.</strong></p>
+
+<h2 id="resolution">How a name gets resolved</h2>
+<p>DNS is a distributed, hierarchical database. The name <code>api.shop.example.com.</code> is read right to left: the trailing dot is the <dfn>root</dfn>, then the <dfn>top-level domain</dfn> (TLD) <code>com</code>, then <code>example.com</code>, which someone registered and whose records live on servers they chose. Each level only knows who is responsible for the level below it. That split is what lets the system hold hundreds of millions of domains with no central server holding them all.</p>
+
+<h3 id="players">The four kinds of server</h3>
+<div class="defs">
+<div><h4>Stub resolver</h4><p>The small client library in the operating system (<code>getaddrinfo</code> on Linux, mDNSResponder on macOS). It sends one question to a configured resolver and waits for a final answer. It never walks the hierarchy itself.</p></div>
+<div><h4>Recursive resolver</h4><p>Does the actual work: walks from the root down, follows referrals, caches everything it learns. Run by your ISP, your cloud VPC, or a public service such as <code>8.8.8.8</code> or <code>1.1.1.1</code>. One resolver serves thousands to millions of users.</p></div>
+<div><h4>Root and TLD servers</h4><p>The <dfn>root servers</dfn> (13 named identities, <code>a</code> to <code>m.root-servers.net</code>, each replicated to many sites) know only who runs each TLD. The <code>com</code> servers know only which name servers each <code>.com</code> domain uses.</p></div>
+<div><h4>Authoritative server</h4><p>Holds the actual records for a zone and is the source of truth for them. This is what you configure in Route 53, Cloudflare DNS or a BIND zone file. It answers only for its own zones and never recurses.</p></div>
+</div>
+
+<p>The stub sends a <dfn>recursive query</dfn> ("give me the final answer"). The resolver then sends <dfn>iterative queries</dfn>: each server either answers or replies with a <dfn>referral</dfn>, "I do not know, but these servers are responsible for the next level down". Step through the four cases below. The first is rare in practice; most lookups end in the third or fourth.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 390" role="img" aria-label="Sequence diagram of DNS resolution: stub resolver, recursive resolver, root server, com TLD server and authoritative server, shown for a cold cache, cached name server records, a resolver cache hit and an operating system cache hit">
+<rect class="n client" x="15" y="14" width="110" height="44" rx="7"/><text class="t sm b mid" x="70" y="33">Stub resolver</text><text class="t xs mute mid" x="70" y="49">in the OS</text>
+<rect class="n svc" x="185" y="14" width="130" height="44" rx="7"/><text class="t sm b mid" x="250" y="33">Recursive resolver</text><text class="t xs mute mid" x="250" y="49">ISP / 1.1.1.1</text>
+<rect class="n ext" x="360" y="14" width="100" height="44" rx="7"/><text class="t sm b mid" x="410" y="33">Root server</text><text class="t xs mute mid" x="410" y="49">13 identities</text>
+<rect class="n ext" x="480" y="14" width="110" height="44" rx="7"/><text class="t sm b mid" x="535" y="33">.com TLD</text><text class="t xs mute mid" x="535" y="49">gtld-servers.net</text>
+<rect class="n db" x="605" y="14" width="110" height="44" rx="7"/><text class="t sm b mid" x="660" y="33">Authoritative</text><text class="t xs mute mid" x="660" y="49">ns1.example.com</text>
+<path class="line faint" d="M70,58 V335 M250,58 V335 M410,58 V335 M535,58 V335 M660,58 V335" style="stroke-dasharray:3 4"/>
+
+<g data-show="1 2 3"><path class="e" d="M70,92 H246"/><text class="t mono mid" x="160" y="85">A? api.shop.example.com</text></g>
+
+<g data-show="1">
+<path class="e" d="M250,124 H406"/><text class="t sm mid" x="330" y="117">who serves com?</text>
+<path class="e dash" d="M410,152 H254"/><text class="t sm mid" x="330" y="145">referral: com NS + glue</text>
+<path class="e" d="M250,184 H531"/><text class="t sm mid" x="392" y="177">who serves example.com?</text>
+<path class="e dash" d="M535,212 H254"/><text class="t sm mid" x="392" y="205">referral: example.com NS + glue</text>
+<path class="e" d="M250,244 H656"/><text class="t mono mid" x="455" y="237">A? api.shop.example.com</text>
+<path class="e dash green" d="M660,272 H254"/><text class="t mono mid" x="455" y="265">A 203.0.113.10  TTL 300</text>
+<path class="e green" d="M250,304 H74"/><text class="t mono mid" x="160" y="297">203.0.113.10</text>
+<text class="t sm mid" x="360" y="365">Cold cache: two referrals, then the answer. Three round trips from the resolver.</text>
+</g>
+
+<g data-show="2">
+<path class="e" d="M250,124 H656"/><text class="t mono mid" x="455" y="117">A? api.shop.example.com</text>
+<path class="e dash green" d="M660,152 H254"/><text class="t mono mid" x="455" y="145">A 203.0.113.10  TTL 300</text>
+<path class="e green" d="M250,184 H74"/><text class="t mono mid" x="160" y="177">203.0.113.10</text>
+<text class="t xs mute mid" x="472" y="236">root and com referrals already cached</text>
+<text class="t xs mute mid" x="472" y="251">(their NS records live up to 2 days)</text>
+<text class="t sm mid" x="360" y="365">Typical miss: only the authoritative server is asked. One round trip.</text>
+</g>
+
+<g data-show="3">
+<path class="e" d="M254,112 H300 V134 H254"/><text class="t sm" x="308" y="127">cache hit, 180 s of TTL left</text>
+<path class="e green" d="M250,166 H74"/><text class="t mono mid" x="160" y="159">203.0.113.10  TTL 180</text>
+<text class="t sm mid" x="360" y="365">Resolver hit: answered from memory. The TTL it hands out keeps counting down.</text>
+</g>
+
+<g data-show="4">
+<path class="e" d="M74,84 H120 V106 H74"/><text class="t sm" x="128" y="99">OS cache hit, no packet sent</text>
+<text class="t sm mid" x="360" y="365">Stub hit: the answer never leaves the machine. Sub-millisecond.</text>
+</g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Cold cache</button><button type="button" data-step="2" aria-pressed="false">NS cached</button><button type="button" data-step="3" aria-pressed="false">Resolver hit</button><button type="button" data-step="4" aria-pressed="false">OS cache hit</button></div>
+</div>
+<figcaption><b>The resolution path.</b> Solid arrows are queries, dashed arrows are responses. A cold walk is three round trips from the resolver, often 50 to 200 ms in total. Because referrals for <code>com</code> are cached for days, real misses almost always skip straight to the authoritative server.</figcaption>
+</figure>
+
+<h3 id="referrals-glue">Referrals and glue</h3>
+<p>A referral contains <code>NS</code> records naming the next servers, for example <code>example.com. NS ns1.example.com.</code>. That creates a chicken-and-egg problem: to find <code>ns1.example.com</code>, you would have to ask the servers for <code>example.com</code>, which is <code>ns1.example.com</code>. The parent zone breaks the loop by including the name server's address in the referral. These extra address records are called <dfn>glue</dfn>. When you change DNS providers at your registrar, you are changing the NS records and glue in the TLD zone, which is why that change is slow to take effect: the old NS records are cached for up to two days.</p>
+<p>Modern resolvers also use <dfn>QNAME minimisation</dfn> (RFC 9156): they ask the root only about <code>com</code> and the TLD only about <code>example.com</code>, instead of sending the full name to every server. It leaks less about what users are looking up and changes nothing about the answer.</p>
+
+<h3 id="transport">UDP, TCP and response size</h3>
+<p>Queries normally travel over UDP port 53: one packet out, one packet back, no handshake. Classic DNS limited UDP responses to 512 bytes; the EDNS(0) extension lets the client advertise a larger buffer, and since DNS Flag Day 2020 the common default is 1,232 bytes, small enough to avoid IP fragmentation. If an answer does not fit, the server sets the truncated (<code>TC</code>) bit and the client retries over TCP. That matters to you when a name has many records (a round-robin set of 30 IPs, or a long TXT record): responses that silently switch to TCP are slower, and a firewall that blocks TCP 53 turns them into failures. The transport details of UDP and TCP are in <a href="network-protocols.html">TCP, UDP &amp; HTTP</a>.</p>
+
+<h2 id="caching">Caching and TTLs</h2>
+<p>Without caching, the root servers would receive every lookup on the internet. With it, they see a tiny fraction. Every record carries a <dfn>TTL</dfn> (time to live), in seconds, set by the zone owner. Any server that caches the record may reuse it for at most that long, and when it hands the record on it passes the <em>remaining</em> TTL, not the original.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 180" role="img" aria-label="Four cache layers: app or browser, OS stub, recursive resolver, authoritative. Queries go right, answers come back left with remaining TTL 300 then 180 then 180">
+<rect class="n client" x="20" y="34" width="125" height="56" rx="8"/><text class="t sm b mid" x="82.5" y="58">App / browser</text><text class="t xs mute mid" x="82.5" y="75">own cache</text>
+<rect class="n client" x="200" y="34" width="125" height="56" rx="8"/><text class="t sm b mid" x="262.5" y="58">OS stub</text><text class="t xs mute mid" x="262.5" y="75">systemd-resolved</text>
+<rect class="n svc" x="380" y="34" width="125" height="56" rx="8"/><text class="t sm b mid" x="442.5" y="58">Recursive resolver</text><text class="t xs mute mid" x="442.5" y="75">shared by many users</text>
+<rect class="n db" x="560" y="34" width="125" height="56" rx="8"/><text class="t sm b mid" x="622.5" y="58">Authoritative</text><text class="t xs mute mid" x="622.5" y="75">source of truth</text>
+<path class="e" d="M145,46 H196"/><path class="e" d="M325,46 H376"/><path class="e" d="M505,46 H556"/>
+<path class="e dash" d="M200,80 H149"/><path class="e dash" d="M380,80 H329"/><path class="e dash" d="M560,80 H509"/>
+<text class="t xs mid" x="172.5" y="67">TTL 180</text><text class="t xs mid" x="352.5" y="67">TTL 180</text><text class="t xs accent mid" x="532.5" y="67">TTL 300</text>
+<text class="t xs mute mid" x="82.5" y="114">Browsers, JVM, Go, curl:</text><text class="t xs mute mid" x="82.5" y="128">each has its own rules.</text><text class="t xs mute mid" x="82.5" y="142">Some cap TTLs, some</text><text class="t xs mute mid" x="82.5" y="156">ignore them.</text>
+<text class="t xs mute mid" x="262.5" y="114">mDNSResponder, nscd,</text><text class="t xs mute mid" x="262.5" y="128">systemd-resolved.</text><text class="t xs mute mid" x="262.5" y="142">Plain glibc caches</text><text class="t xs mute mid" x="262.5" y="156">nothing.</text>
+<text class="t xs mute mid" x="442.5" y="114">ISP, VPC, 8.8.8.8, 1.1.1.1.</text><text class="t xs mute mid" x="442.5" y="128">One cached copy serves</text><text class="t xs mute mid" x="442.5" y="142">thousands of users. May</text><text class="t xs mute mid" x="442.5" y="156">clamp very low or high TTLs.</text>
+<text class="t xs mute mid" x="622.5" y="114">Route 53, Cloudflare,</text><text class="t xs mute mid" x="622.5" y="128">NS1, BIND. A change here</text><text class="t xs mute mid" x="622.5" y="142">is seen only as copies</text><text class="t xs mute mid" x="622.5" y="156">downstream expire.</text>
+</svg>
+</div>
+<figcaption><b>Caches all the way down.</b> The authoritative server says TTL 300. The resolver cached it 120 seconds ago, so it hands out 180, and every layer below inherits that remaining time. There is no way to recall an answer once it has left the authoritative server.</figcaption>
+</figure>
+
+<p>Three consequences shape every DNS decision:</p>
+<ul>
+<li><strong>Changes are eventually visible, never instantly.</strong> After you edit a record, the worst-case time until every well-behaved cache sees it is the old TTL. "DNS propagation" is just caches expiring; nothing is pushed.</li>
+<li><strong>The resolver is the unit of caching.</strong> Ten thousand users behind one ISP resolver generate one query per TTL, not ten thousand. That is why DNS scales, and also why DNS-based decisions are made per resolver, not per user.</li>
+<li><strong>Not everyone obeys.</strong> Some resolvers enforce a minimum TTL (often 30 to 60 seconds) or a maximum (Unbound defaults to one day). Some applications cache on their own terms: a JVM running with a security manager historically cached successful lookups forever. Worse, a long-lived connection never re-resolves at all. An HTTP keep-alive or gRPC connection opened yesterday still points at yesterday's IP.</li>
+</ul>
+
+<h3 id="negative-caching">Negative caching</h3>
+<p>"This name does not exist" (<code>NXDOMAIN</code>) is cached too, so that typos and bots do not hammer authoritative servers. RFC 2308 sets its lifetime from the zone's <code>SOA</code> record: the smaller of the SOA record's own TTL and its <code>MINIMUM</code> field. The classic trap: a deploy script queries <code>new-api.shop.example.com</code> a few seconds before the record is created, the resolver caches the <code>NXDOMAIN</code> for an hour, and the new service is "missing" for some users long after the record exists. Keep the negative TTL short (a few minutes) on zones where you create names programmatically.</p>
+
+<h3 id="choosing-ttl">Choosing a TTL</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Record</th><th class="num">Typical TTL</th><th>Reasoning</th></tr></thead>
+<tbody>
+<tr><th>NS and glue</th><td class="num">1 to 2 days</td><td>Rarely change. Long TTLs let resolvers keep finding your servers even if the TLD has trouble.</td></tr>
+<tr><th>A/AAAA behind failover</th><td class="num">30 to 60 s</td><td>Recovery time is bounded by the TTL. AWS load balancer names use 60 s because their IPs change as they scale.</td></tr>
+<tr><th>A/AAAA, stable endpoint</th><td class="num">300 to 3,600 s</td><td>Fewer queries, better hit rates, more resilience if the authoritative provider has an outage.</td></tr>
+<tr><th>MX, TXT, CAA</th><td class="num">1 hour to 1 day</td><td>Change rarely and nobody needs them to fail over in seconds.</td></tr>
+<tr><th>Before a planned migration</th><td class="num">60 s</td><td>Lower it at least one old TTL before the cutover, so the long-lived copies have expired by the time you switch.</td></tr>
+</tbody></table></div>
+
+<h2 id="records">Record types</h2>
+<p>A zone is a set of <dfn>resource records</dfn>, each a name, a TTL, a class (always <code>IN</code> in practice), a type and data. These are the types that come up in system design:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Type</th><th>Maps a name to</th><th>Example</th><th>Used for</th></tr></thead>
+<tbody>
+<tr><th>A</th><td>IPv4 address</td><td><code>api.shop.example.com. 300 A 203.0.113.10</code></td><td>The basic lookup. Several A records on one name give round robin.</td></tr>
+<tr><th>AAAA</th><td>IPv6 address</td><td><code>api.shop.example.com. 300 AAAA 2001:db8::10</code></td><td>Dual-stack. Clients race v6 and v4 (Happy Eyeballs, RFC 8305).</td></tr>
+<tr><th>CNAME</th><td>Another name</td><td><code>www.shop.example.com. CNAME shop.cdn-provider.net.</code></td><td>Pointing at a CDN or SaaS host whose IPs you do not control.</td></tr>
+<tr><th>MX</th><td>Mail servers, with priority</td><td><code>shop.example.com. MX 10 mx1.example.com.</code></td><td>Where to deliver email; lower number is tried first.</td></tr>
+<tr><th>TXT</th><td>Free-form text</td><td><code>"v=spf1 include:_spf.example.net ~all"</code></td><td>SPF, DKIM, domain ownership proofs for certificate and SaaS providers.</td></tr>
+<tr><th>NS</th><td>Name servers for a zone</td><td><code>example.com. NS ns1.example.com.</code></td><td>Delegation from parent to child zone.</td></tr>
+<tr><th>SOA</th><td>Zone metadata</td><td>serial, refresh, retry, expire, minimum</td><td>Secondary server sync and the negative-caching TTL.</td></tr>
+<tr><th>SRV</th><td>Host and port, with priority and weight</td><td><code>_sip._tcp.example.com. SRV 10 60 5060 sip1.example.com.</code></td><td>Service discovery that includes a port: SIP, XMPP, Consul, Kubernetes headless services.</td></tr>
+<tr><th>CAA</th><td>Allowed certificate authorities</td><td><code>example.com. CAA 0 issue "letsencrypt.org"</code></td><td>Stops other CAs issuing certificates for your domain.</td></tr>
+<tr><th>PTR</th><td>IP back to a name</td><td><code>10.113.0.203.in-addr.arpa. PTR api.shop.example.com.</code></td><td>Reverse lookups, mail server reputation, logs.</td></tr>
+</tbody></table></div>
+
+<h3 id="cname-apex">CNAME at the apex, and ALIAS records</h3>
+<p>A <code>CNAME</code> says "this name is really that other name", so RFC 1034 forbids any other record at a name that has one. The <dfn>zone apex</dfn> (the bare <code>example.com</code>) must have <code>SOA</code> and <code>NS</code> records. Therefore <code>example.com</code> cannot be a CNAME, which is awkward when your site lives on a CDN or a load balancer that only gives you a hostname like <code>my-alb-1234.us-east-1.elb.amazonaws.com</code>.</p>
+<p>DNS providers solve this with a non-standard <dfn>ALIAS</dfn> record (also called ANAME, Route 53 "alias", or Cloudflare "CNAME flattening"). The authoritative server resolves the target itself and returns the resulting A and AAAA records, so to the outside world the apex holds plain addresses. Two caveats are worth naming:</p>
+<ul>
+<li>It only works inside one provider: the authoritative server must do the lookup at query time, so you cannot use it with a secondary DNS provider that does not support the same feature.</li>
+<li>The target is resolved from the DNS provider's location, not the user's. If the target is a geo-aware CDN hostname, users may be sent to the PoP nearest the DNS provider unless the provider forwards client location.</li>
+</ul>
+<p>The standards-track fix is the <code>HTTPS</code>/<code>SVCB</code> record (RFC 9460), which can alias at the apex and also advertise supported protocols (<code>alpn=h3,h2</code>) so a browser can try HTTP/3 without a first HTTP/2 round trip. Browser support is growing but not universal, so apex ALIAS records remain the common answer.</p>
+<p>CNAMEs also cost lookups. <code>www.shop.example.com → shop.cdn-provider.net → edge-7.cdn-provider.net</code> may need a separate resolution for each hop on a cold cache. Keep chains short.</p>
+
+<h2 id="dns-load-balancing">DNS as a load balancer</h2>
+<p>An authoritative server is free to give different answers to different resolvers. Managed DNS services turn that into routing policies, often called <dfn>GSLB</dfn> (global server load balancing). DNS decides <em>which region or cluster</em> a client goes to; a <a href="load-balancing.html">load balancer</a> inside that region then decides which server.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 320" role="img" aria-label="Three resolvers in Frankfurt, Virginia and Mumbai are answered by one authoritative server with three policies: round robin sends them to distant regions, latency routing sends each to its nearest region, failover sends Frankfurt to us-east when eu-west is unhealthy">
+<rect class="n db" x="270" y="16" width="180" height="50" rx="8"/><text class="t sm b mid" x="360" y="37">Authoritative DNS</text>
+<text class="t xs mute mid" x="360" y="54" data-show="1">policy: round robin</text>
+<text class="t xs mute mid" x="360" y="54" data-show="2">policy: latency / geo</text>
+<text class="t xs mute mid" x="360" y="54" data-show="3">policy: latency + health checks</text>
+<path class="e dash" d="M266,41 C170,41 105,50 105,96"/>
+
+<rect class="n svc" x="20" y="100" width="170" height="48" rx="8"/><text class="t sm b mid" x="105" y="120">Resolver, Frankfurt</text>
+<rect class="n svc" x="20" y="175" width="170" height="48" rx="8"/><text class="t sm b mid" x="105" y="195">Resolver, Virginia</text>
+<rect class="n svc" x="20" y="250" width="170" height="48" rx="8"/><text class="t sm b mid" x="105" y="270">Resolver, Mumbai</text>
+<g data-show="1"><text class="t mono mute mid" x="105" y="138">gets 203.0.113.10</text><text class="t mono mute mid" x="105" y="213">gets 192.0.2.10</text><text class="t mono mute mid" x="105" y="288">gets 198.51.100.10</text></g>
+<g data-show="2"><text class="t mono mute mid" x="105" y="138">gets 198.51.100.10</text><text class="t mono mute mid" x="105" y="213">gets 203.0.113.10</text><text class="t mono mute mid" x="105" y="288">gets 192.0.2.10</text></g>
+<g data-show="3"><text class="t mono red mid" x="105" y="138">gets 203.0.113.10</text><text class="t mono mute mid" x="105" y="213">gets 203.0.113.10</text><text class="t mono mute mid" x="105" y="288">gets 192.0.2.10</text></g>
+
+<rect class="n ext" x="530" y="100" width="170" height="48" rx="8"/><text class="t sm b mid" x="615" y="120" data-show="1 2">eu-west</text>
+<rect data-show="3" class="n bad" x="530" y="100" width="170" height="48" rx="8"/><text data-show="3" class="t sm b mid" x="615" y="120">eu-west</text>
+<text class="t mono mute mid" x="615" y="138" data-show="1 2">198.51.100.10</text><text class="t xs red mid" x="615" y="138" data-show="3">health checks failing</text>
+<rect class="n ext" x="530" y="175" width="170" height="48" rx="8"/><text class="t sm b mid" x="615" y="195">us-east</text><text class="t mono mute mid" x="615" y="213">203.0.113.10</text>
+<rect class="n ext" x="530" y="250" width="170" height="48" rx="8"/><text class="t sm b mid" x="615" y="270">ap-south</text><text class="t mono mute mid" x="615" y="288">192.0.2.10</text>
+
+<g data-show="1">
+<path class="e" d="M190,124 C360,124 360,192 526,192"/>
+<path class="e" d="M190,199 C360,199 360,267 526,267"/>
+<path class="e red" d="M190,274 C340,274 380,132 526,132"/>
+<text class="t xs mute mid" x="360" y="315">rotation spreads load but ignores distance: Mumbai users cross to Europe</text>
+</g>
+<g data-show="2">
+<path class="e" d="M190,124 H526"/><path class="e" d="M190,199 H526"/><path class="e" d="M190,274 H526"/>
+<path class="flow" d="M190,124 H526"/><path class="flow" d="M190,199 H526"/><path class="flow" d="M190,274 H526"/>
+<text class="t xs mute mid" x="360" y="315">each resolver gets its lowest-latency region</text>
+</g>
+<g data-show="3">
+<text class="t xs" x="200" y="114">failover: next-nearest healthy region</text>
+<path class="e" d="M190,124 C360,124 360,188 526,188"/>
+<path class="e" d="M190,208 H526"/><path class="e" d="M190,274 H526"/>
+<path class="flow" d="M190,124 C360,124 360,188 526,188"/>
+<text class="t xs mute mid" x="360" y="315">new lookups move at once; cached answers keep failing until their TTL runs out</text>
+</g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Round robin</button><button type="button" data-step="2" aria-pressed="false">Latency / geo</button><button type="button" data-step="3" aria-pressed="false">Health-checked failover</button></div>
+</div>
+<figcaption><b>One name, different answers.</b> The authoritative server decides per resolver. Policies can be combined: route by latency, but only among endpoints whose health checks pass.</figcaption>
+</figure>
+
+<h3 id="policies">Routing policies</h3>
+<ul>
+<li><strong>Round robin.</strong> Publish several A records; the server rotates their order on each response, and most clients use the first. Spreads load roughly evenly across resolvers, with no notion of distance or health.</li>
+<li><strong>Weighted.</strong> Return endpoint A for 90% of queries and B for 10%. Useful for canarying a new region or shifting traffic gradually during a migration.</li>
+<li><strong>Latency-based.</strong> The provider measures latency from resolver networks to each region and answers with the fastest one. Route 53 builds this from its own measurements between networks and AWS regions.</li>
+<li><strong>Geo DNS.</strong> Answer by the resolver's country or continent. Used for data residency ("EU users stay in the EU") as much as for speed.</li>
+<li><strong>Health-checked failover.</strong> The DNS provider probes each endpoint (HTTP every 10 or 30 seconds from several locations) and stops returning endpoints that fail. Combined with any of the above, this is how most multi-region systems fail over a region.</li>
+</ul>
+
+<h3 id="dns-lb-limits">Where DNS load balancing falls short</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Limit</th><th>Why it happens</th><th>Mitigation</th></tr></thead>
+<tbody>
+<tr><th>Slow reaction</th><td>Every change waits for cached copies to expire, plus clients that ignore the TTL and connections that never re-resolve</td><td>Short TTLs on steering records; connection max-age so clients reconnect; anycast for fast failover</td></tr>
+<tr><th>Coarse granularity</th><td>Decisions are per resolver. A public resolver can represent millions of users in many cities</td><td>EDNS Client Subnet (RFC 7871) passes a truncated client prefix to the authoritative server, at the cost of privacy and lower cache hit rates</td></tr>
+<tr><th>No view of load</th><td>The DNS server does not see connections or CPU. Equal answers per resolver are not equal load, because resolvers serve very different user counts</td><td>Use DNS to pick a region, and a real load balancer to pick a server</td></tr>
+<tr><th>Client choice</th><td>Clients re-sort addresses (RFC 6724 prefers some address ranges over others) and often stick to the first one that works</td><td>Do not rely on record order for balancing; expect uneven spread</td></tr>
+<tr><th>Wrong location</th><td>Users on a corporate VPN or a distant public resolver look like they are somewhere else</td><td>ECS, or anycast which routes on the client's actual network path</td></tr>
+</tbody></table></div>
+
+<h2 id="anycast">Anycast</h2>
+<p><dfn>Anycast</dfn> takes a different route to the same goal. Instead of handing out different addresses, many sites announce <em>the same</em> IP prefix over BGP, and the internet's routing delivers each packet to the nearest site in network terms (usually, but not always, the geographically closest). It is how all 13 root server identities are served from well over a thousand machines, how <code>1.1.1.1</code> and <code>8.8.8.8</code> are fast everywhere, and how most CDNs and large DNS providers run their edges (see <a href="cdn.html">Content Delivery Networks</a>).</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 270" role="img" aria-label="Three sites in Frankfurt, Ashburn and Singapore announce the same IP over BGP; users go to the nearest; when Frankfurt withdraws its route, Paris and Warsaw users are routed to Ashburn">
+<text class="t sm mid" x="360" y="24">All three sites announce 192.0.2.0/24 over BGP</text>
+<rect class="n svc" x="45" y="56" width="150" height="56" rx="8"/><text class="t sm b mid" x="120" y="80" data-show="1">Frankfurt site</text><text class="t mono mute mid" x="120" y="98" data-show="1">192.0.2.53</text>
+<rect data-show="2" class="n bad" x="45" y="56" width="150" height="56" rx="8"/><text data-show="2" class="t sm b mid" x="120" y="80">Frankfurt site</text><text data-show="2" class="t xs red mid" x="120" y="98">route withdrawn</text>
+<rect class="n svc" x="285" y="56" width="150" height="56" rx="8"/><text class="t sm b mid" x="360" y="80">Ashburn site</text><text class="t mono mute mid" x="360" y="98">192.0.2.53</text>
+<rect class="n svc" x="525" y="56" width="150" height="56" rx="8"/><text class="t sm b mid" x="600" y="80">Singapore site</text><text class="t mono mute mid" x="600" y="98">192.0.2.53</text>
+
+<circle class="n client" cx="80" cy="196" r="13"/><text class="t xs mute mid" x="80" y="226">Paris</text>
+<circle class="n client" cx="160" cy="196" r="13"/><text class="t xs mute mid" x="160" y="226">Warsaw</text>
+<circle class="n client" cx="380" cy="196" r="13"/><text class="t xs mute mid" x="380" y="226">Toronto</text>
+<circle class="n client" cx="450" cy="196" r="13"/><text class="t xs mute mid" x="450" y="226">Atlanta</text>
+<circle class="n client" cx="570" cy="196" r="13"/><text class="t xs mute mid" x="570" y="226">Jakarta</text>
+<circle class="n client" cx="640" cy="196" r="13"/><text class="t xs mute mid" x="640" y="226">Sydney</text>
+
+<path class="e" d="M376,182 L366,116"/><path class="e" d="M444,183 L405,116"/>
+<path class="e" d="M572,182 L585,116"/><path class="e" d="M636,183 L620,116"/>
+<g data-show="1">
+<path class="e" d="M84,182 L100,116"/><path class="e" d="M156,183 L140,116"/>
+<path class="flow" d="M84,182 L100,116"/><path class="flow" d="M156,183 L140,116"/>
+<text class="t sm mid" x="360" y="256">Each user reaches the nearest site. One address, many places.</text>
+</g>
+<g data-show="2">
+<path class="e accent" d="M84,182 C110,140 250,150 298,116"/><path class="e accent" d="M162,182 C190,150 290,150 318,116"/>
+<path class="flow" d="M84,182 C110,140 250,150 298,116"/><path class="flow" d="M162,182 C190,150 290,150 318,116"/>
+<text class="t sm mid" x="360" y="256">Frankfurt withdraws its route. Within seconds Europe lands on Ashburn, with no DNS change.</text>
+</g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">All sites up</button><button type="button" data-step="2" aria-pressed="false">Frankfurt fails</button></div>
+</div>
+<figcaption><b>Anycast failover.</b> The address never changes, so no cache has to expire. Routers converge on the remaining announcements within seconds to a minute. The cost: users far from Frankfurt's replacement now see higher latency, and the surviving site absorbs the extra load.</figcaption>
+</figure>
+
+<p>Anycast suits short, stateless exchanges like a DNS query over UDP, where it does not matter if the next packet lands on a different site. For long TCP connections, a routing change mid-connection would send packets to a site with no state for that connection, so anycast TCP needs stable routing and, at scale, load balancers that share connection state or use consistent hashing (Google's Maglev and Cloudflare's edge both do this). In practice, DNS steering and anycast are combined: anycast gets the DNS query to a nearby DNS server fast, and that server's answer steers the user to a region.</p>
+
+<h2 id="worked-example">Worked example: failover with TTL 60 s vs 3,600 s</h2>
+<p>An API at <code>api.shop.example.com</code> runs active-passive across two regions. It serves 10,000 requests per second, arriving through about 5,000 distinct recursive resolvers. The primary region dies at <code>t = 0</code>. The DNS provider health-checks every 10 seconds and marks an endpoint down after 3 consecutive failures, and it takes about 10 more seconds for every authoritative server to return the standby's IP.</p>
+<div class="calc">Detection    3 checks × 10 s                  = 30 s
+Publish      all authoritative servers updated = +10 s  →  fixed at <span class="r">t = 40 s</span>
+Cache drain  copies expire spread over one TTL after t = 40 s
+             (a copy expiring before 40 s re-fetches the dead IP)
+Mean outage  per resolver = 40 + TTL/2
+TTL 60       70 s × 10,000 req/s    ≈ <span class="r">0.7M failed</span>, clear at 100 s
+TTL 3,600    1,840 s × 10,000 req/s ≈ <span class="r">18.4M failed</span>, clear at ~61 min
+Query cost   5,000 / 60 s ≈ 83 q/s   vs   5,000 / 3,600 s ≈ 1.4 q/s</div>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 290" role="img" aria-label="Line chart of share of requests failing over 600 seconds after a region fails. All fail until 40 seconds. TTL 60 reaches zero at 100 seconds, TTL 300 at 340 seconds, TTL 3600 is still at 84 percent at 600 seconds">
+<text class="t xs mute" x="20" y="16">share of requests failing</text>
+<path class="line" d="M80,30 V240 H690"/>
+<path class="line faint" d="M80.0,240 v5"/><text class="t xs mute mid" x="80.0" y="258">0</text>
+<path class="line faint" d="M180.0,240 v5"/><text class="t xs mute mid" x="180.0" y="258">100</text>
+<path class="line faint" d="M280.0,240 v5"/><text class="t xs mute mid" x="280.0" y="258">200</text>
+<path class="line faint" d="M380.0,240 v5"/><text class="t xs mute mid" x="380.0" y="258">300</text>
+<path class="line faint" d="M480.0,240 v5"/><text class="t xs mute mid" x="480.0" y="258">400</text>
+<path class="line faint" d="M580.0,240 v5"/><text class="t xs mute mid" x="580.0" y="258">500</text>
+<path class="line faint" d="M680.0,240 v5"/><text class="t xs mute mid" x="680.0" y="258">600</text>
+<text class="t xs mute mid" x="380" y="282">seconds after the primary region fails</text>
+<text class="t xs mute end" x="72" y="244.0">0%</text>
+<text class="t xs mute end" x="72" y="144.0">50%</text>
+<path class="line faint" d="M80,140.0 H680" style="stroke-dasharray:2 4"/>
+<text class="t xs mute end" x="72" y="44.0">100%</text>
+<path class="line faint" d="M80,40.0 H680" style="stroke-dasharray:2 4"/>
+<path class="line" d="M120.0,30 V240" style="stroke-dasharray:4 4"/>
+<text class="t xs mute" x="126" y="30">new IP live, t = 40 s</text>
+<path d="M80.0,40.0 H120.0 L180.0,240.0" style="fill:none;stroke:var(--d-green);stroke-width:2.5"/>
+<path d="M120.0,40.0 L420.0,240.0" style="fill:none;stroke:var(--d-cache-s);stroke-width:2.5"/>
+<path d="M120.0,40.0 L680.0,71.1" style="fill:none;stroke:var(--d-red);stroke-width:2.5"/>
+<text class="t xs green" x="186" y="226">TTL 60: clear at 100 s</text>
+<text class="t xs" x="428" y="226" style="fill:var(--d-cache-s)">TTL 300: clear at 340 s</text>
+<text class="t xs red end" x="680" y="94">TTL 3,600: 84% still failing at 600 s</text>
+</svg>
+</div>
+<figcaption><b>Recovery is a ramp, not a switch.</b> After the new answer is published, the share of failing traffic falls linearly as resolver caches expire. With a one-hour TTL the failover has barely started ten minutes in. Drawn to scale from the formula in the calculation above.</figcaption>
+</figure>
+
+<p>The simulation below reproduces those numbers to within sampling noise by modelling each resolver's cache expiry, including the subtle case where a cache expires during the detection window and re-fetches the dead IP for another full TTL:</p>
+<pre><code class="language-python">import random
+
+RPS = 10_000                 # requests per second to api.shop.example.com
+RESOLVERS = 5_000            # distinct recursive resolvers sending that traffic
+CHECK_EVERY, FAILS = 10, 3   # health check every 10 s, 3 misses marks the region down
+PUBLISH = 10                 # seconds until every authoritative server returns the new IP
+
+
+def outage(ttl, seed=7):
+    rng = random.Random(seed)
+    fixed_at = CHECK_EVERY * FAILS + PUBLISH       # new answer is live at t = 40 s
+    recovered = []
+    for _ in range(RESOLVERS):
+        expiry = rng.uniform(0, ttl)               # cached copy expires somewhere in the next TTL
+        while expiry &lt; fixed_at:                   # expired too early: re-fetches the OLD answer
+            expiry += ttl                          # ...and caches the dead IP for another full TTL
+        recovered.append(expiry)
+    failed = sum(recovered) * RPS / RESOLVERS      # each resolver carries an equal share of traffic
+    return failed, max(recovered)
+
+
+for ttl in (60, 300, 3600):
+    failed, last = outage(ttl)
+    print(f"TTL {ttl:&gt;4}s: {failed / 1e6:5.2f}M failed requests, last resolver recovers at {last:6.0f}s")
+
+# TTL   60s:  0.70M failed requests, last resolver recovers at    100s
+# TTL  300s:  1.89M failed requests, last resolver recovers at    340s
+# TTL 3600s: 18.24M failed requests, last resolver recovers at   3639s</code></pre>
+
+<div class="table-wrap"><table>
+<thead><tr><th></th><th class="num">TTL 60 s</th><th class="num">TTL 300 s</th><th class="num">TTL 3,600 s</th></tr></thead>
+<tbody>
+<tr><th>Mean time a user is stuck on the dead region</th><td class="num">70 s</td><td class="num">190 s</td><td class="num">1,840 s</td></tr>
+<tr><th>Failed requests at 10k/s</th><td class="num yes">~0.7M</td><td class="num meh">~1.9M</td><td class="num no">~18.4M</td></tr>
+<tr><th>Last well-behaved resolver recovers</th><td class="num">100 s</td><td class="num">340 s</td><td class="num">~61 min</td></tr>
+<tr><th>Queries/s to authoritative (5,000 resolvers)</th><td class="num">~83</td><td class="num">~17</td><td class="num">~1.4</td></tr>
+</tbody></table></div>
+<p>Three lessons. First, the short TTL is cheap: 83 queries per second is nothing for a managed DNS provider. The real cost of a short TTL is resilience to the DNS provider itself, because a resolver with a 60-second copy runs out of answers 60 seconds into a provider outage. Second, below about 60 seconds the TTL stops being the bottleneck: detection and publishing already take 40 seconds, so tighten health checks before shaving the TTL further. Third, this is the <em>best</em> case. Clients holding keep-alive connections to the dead region, or runtimes caching beyond the TTL, recover only when their connections error out and they re-resolve, which is why clients also need sensible <a href="fault-tolerance.html">timeouts and retries</a>.</p>
+
+<h2 id="dependency">DNS as a dependency and a failure source</h2>
+<p>DNS sits in front of everything, so its failures look like total outages, and its incidents are some of the best-known on the internet:</p>
+<ul>
+<li><strong>Dyn, October 2016.</strong> The Mirai botnet, built from hacked cameras and home routers, flooded Dyn's authoritative DNS with traffic. Sites that used Dyn as their only DNS provider, including Twitter, GitHub, Netflix and Reddit, were unreachable for many users for hours, although their own servers were fine.</li>
+<li><strong>Facebook, October 2021.</strong> A maintenance command cut Facebook's backbone. Its authoritative DNS servers, detecting they could not reach the data centers, withdrew their BGP anycast routes as designed. With the name servers gone from the internet, <code>facebook.com</code> stopped resolving everywhere for about six hours, and the internal tools engineers needed to fix it depended on the same DNS.</li>
+<li><strong>AWS us-east-1, October 2025.</strong> An automation race left the regional DynamoDB endpoint's DNS record empty. Services that could not resolve the endpoint failed, and the failures cascaded through other AWS services that depend on DynamoDB.</li>
+</ul>
+<p>The patterns that reduce the blast radius:</p>
+<ol class="steps">
+<li><strong>Two authoritative providers.</strong> List name servers from two independent providers in your NS set and keep the zones in sync (zone transfers or tooling such as octoDNS). Resolvers retry the other provider if one fails. Provider-specific features like ALIAS and latency routing make this harder, which is the trade-off.</li>
+<li><strong>Serve stale.</strong> Resolvers that implement RFC 8767 keep answering with expired records when the authoritative servers are unreachable. Enable it on resolvers you run.</li>
+<li><strong>Cache close to the app.</strong> Run a local caching resolver on each host or node (systemd-resolved, NodeLocal DNSCache in Kubernetes), so a resolver blip does not fail every outbound call.</li>
+<li><strong>Keep the control plane independent.</strong> The tools you use to fix DNS (consoles, VPN, runbooks) should not depend on the DNS you are fixing.</li>
+<li><strong>Watch internal DNS volume.</strong> In Kubernetes, pods default to <code>ndots:5</code> with several search domains, so a lookup for <code>api.stripe.com</code> first tries <code>api.stripe.com.default.svc.cluster.local</code> and two more suffixes before the real name. One outbound call can become four or more lookups, doubled for A and AAAA. Use fully qualified names with a trailing dot, or lower <code>ndots</code>, for hot external calls.</li>
+</ol>
+
+<h2 id="security">DNSSEC and encrypted DNS</h2>
+<h3 id="dnssec">DNSSEC: is this answer authentic?</h3>
+<p>Plain DNS has no integrity protection. An attacker who can race a resolver with a forged response can poison its cache and send all its users to a fake <code>bank.example.com</code>; Dan Kaminsky's 2008 attack made this practical until resolvers randomised source ports. <dfn>DNSSEC</dfn> adds signatures: each zone signs its record sets (<code>RRSIG</code>) with a key published in a <code>DNSKEY</code> record, and the parent zone vouches for that key with a <code>DS</code> record, forming a chain of trust up to the root's key. A validating resolver rejects anything that does not verify.</p>
+<p>DNSSEC proves the answer is authentic; it does not encrypt it, and it does not protect the last hop from resolver to stub. It also adds an operational failure mode: an expired signature or a botched key rollover makes your domain fail to resolve for every validating resolver, which is exactly what happened to Slack for many users in September 2021 when an attempted DNSSEC rollout went wrong. Adopt it with automated signing and key rollover, or through a provider that manages both.</p>
+
+<h3 id="encrypted-dns">DoT and DoH: who can see the question?</h3>
+<p>Classic queries travel in clear text, so anyone on the path (a cafe Wi-Fi operator, an ISP) can see and alter which names you look up. <dfn>DNS over TLS</dfn> (DoT, RFC 7858, port 853) and <dfn>DNS over HTTPS</dfn> (DoH, RFC 8484, port 443) encrypt the stub-to-resolver hop. DoH looks like ordinary HTTPS traffic, which makes it hard to block and is why browsers adopted it, sometimes sending queries to a public resolver instead of the one the network configured. For a system designer the consequences are practical: split-horizon DNS (internal names that only the corporate resolver knows) can break when a browser bypasses that resolver, and network-level DNS filtering stops seeing traffic. The resolver itself still sees every query, so encryption moves trust rather than removing it.</p>
+
+<h2 id="comparison">Where to steer traffic</h2>
+<p>DNS is one of several layers that can direct a request. They compose, and a typical global service uses three of them at once.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Layer</th><th>Decides per</th><th>Reaction time</th><th>Sees server load</th><th>Best for</th></tr></thead>
+<tbody>
+<tr><th>DNS steering</th><td class="meh">Resolver</td><td class="no">TTL + detection: tens of seconds to an hour</td><td class="no">No</td><td>Choosing a region; gradual migrations</td></tr>
+<tr><th>Anycast</th><td class="meh">Network path</td><td class="yes">Seconds to a minute (BGP convergence)</td><td class="no">No</td><td>Edge entry points, DNS servers, CDNs</td></tr>
+<tr><th>L4/L7 load balancer</th><td class="yes">Connection or request</td><td class="yes">Seconds (health checks)</td><td class="yes">Yes</td><td>Choosing a server inside a region; see <a href="load-balancing.html">Load Balancing</a></td></tr>
+<tr><th>Client-side / service discovery</th><td class="yes">Request</td><td class="yes">As fast as the registry updates</td><td class="meh">With feedback</td><td>Service-to-service calls; see <a href="service-discovery.html">Service Discovery</a></td></tr>
+</tbody></table></div>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+<li><strong>Amazon Route 53</strong> offers simple, weighted, latency, failover, geolocation, geoproximity, IP-based and multivalue routing policies, plus health checks and alias records at the apex. Note its fail-open rule: when every record in a health-checked group is unhealthy, Route 53 treats them all as healthy and returns them anyway, on the theory that some answer beats none.</li>
+<li><strong>AWS Elastic Load Balancing</strong> gives each load balancer a DNS name with a 60-second TTL, because its IPs change as it scales. Clients that cache DNS forever eventually connect to IPs that no longer belong to them.</li>
+<li><strong>Cloudflare</strong> runs both its authoritative DNS and the <code>1.1.1.1</code> resolver over anycast from its whole edge network, and pioneered CNAME flattening for apex records.</li>
+<li><strong>Google Public DNS</strong> (<code>8.8.8.8</code>) is anycast, supports DoT and DoH, and sends EDNS Client Subnet to authoritative servers that support it, so CDNs can still map users to nearby PoPs.</li>
+<li><strong>Kubernetes</strong> uses CoreDNS for in-cluster service discovery: <code>orders.shop.svc.cluster.local</code> resolves to a service IP, and headless services return one A record per pod plus SRV records with ports.</li>
+<li><strong>Netflix</strong> runs active-active across AWS regions and evacuates a region by changing DNS so users resolve to the healthy regions, which is why it treats DNS TTLs as part of its failover budget.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>In any multi-region design, and whenever you draw the first box labelled "users". One or two sentences usually suffice: "GeoDNS with health checks and a 60-second TTL sends users to the nearest healthy region; inside the region an L7 load balancer spreads requests." Go deeper if the interviewer asks how failover works or how fast it is.</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>Walk through what happens when I type the URL. Name stub, recursive, root, TLD and authoritative, and say where caching cuts the walk short.</li>
+<li>How quickly can you fail over a region with DNS? Detection plus publish plus TTL, and the stragglers that ignore the TTL or hold connections open.</li>
+<li>Why not set the TTL to 1 second? Resolvers clamp it, query volume rises, and you lose resilience if the DNS provider has an outage.</li>
+<li>Why can't the apex be a CNAME? RFC 1034 forbids other data next to a CNAME and the apex needs SOA and NS. ALIAS records or HTTPS records solve it.</li>
+<li>Your DNS provider is DDoSed. What now? Second provider in the NS set, long TTLs on NS records, serve-stale.</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>Treating DNS round robin as a real load balancer that knows about server health and load.</li>
+<li>Promising instant failover through DNS changes, or forgetting that existing connections never re-resolve.</li>
+<li>A single DNS provider for a system with a 99.99% availability target.</li>
+<li>Confusing DNSSEC (authenticity) with DoH (privacy).</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://www.rfc-editor.org/rfc/rfc1034" target="_blank" rel="noopener">RFC 1034: Domain Names, Concepts and Facilities</a><span>Mockapetris, 1987. The architecture: zones, delegation, resolvers, caching and the CNAME rules.</span></li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc1035" target="_blank" rel="noopener">RFC 1035: Domain Names, Implementation and Specification</a><span>Mockapetris, 1987. The wire format, record types and the original 512-byte UDP limit.</span></li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc2308" target="_blank" rel="noopener">RFC 2308: Negative Caching of DNS Queries</a><span>How NXDOMAIN answers are cached and where their TTL comes from.</span></li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc8767" target="_blank" rel="noopener">RFC 8767: Serving Stale Data to Improve DNS Resiliency</a><span>Lets resolvers answer from expired cache when authoritative servers are unreachable.</span></li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc8484" target="_blank" rel="noopener">RFC 8484: DNS Queries over HTTPS (DoH)</a><span>Encrypted DNS over ordinary HTTPS, and the reason browsers may bypass your network's resolver.</span></li>
+</ul>

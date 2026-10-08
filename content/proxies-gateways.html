@@ -1,0 +1,454 @@
+<h2 id="why">Why it matters</h2>
+<p class="lead">Every production request passes through software that is neither the client nor your service: something that terminates TLS, checks a token, picks a backend and writes an access log. Put that work in the right box and forty services stay small and focused. Put it in the wrong box, or let one box swallow everything, and you get a slow, fragile choke point that every team has to queue behind.</p>
+<p>A <dfn>proxy</dfn> is a server that sits in the middle of a connection and speaks the protocol on both sides: it accepts a request from one party, makes its own request to another, and relays the answer. RFC 9110 names three kinds of HTTP intermediary: a proxy chosen by the client, a <dfn>gateway</dfn> (also called a reverse proxy) that acts as the origin for whoever calls it, and a tunnel that blindly relays bytes. The practical questions for a system design are simpler: <strong>whose side is the proxy on, and which cross-cutting jobs belong in it?</strong></p>
+<p>This chapter covers forward and reverse proxies, what a reverse proxy actually does for a backend, the API gateway and its pipeline, the backend-for-frontend pattern, and how a service mesh moves the same ideas inside the cluster. Spreading load across backends has its own chapter, <a href="load-balancing.html">Load Balancing</a>; edge caching is in <a href="cdn.html">Content Delivery Networks</a>.</p>
+
+<h2 id="forward-vs-reverse">Forward vs reverse proxy</h2>
+<p>Both are the same kind of program. The difference is who deploys it, who knows it exists, and who it hides.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 290" role="img" aria-label="Left: laptops in an office network reach external sites through a forward proxy, which blocks one site. Right: internet clients reach a reverse proxy inside the data centre, which forwards to three private app servers">
+<text class="t b" x="20" y="24">Forward proxy</text><text class="t xs mute" x="20" y="40">works for the clients</text>
+<rect class="zone" x="10" y="52" width="205" height="200" rx="10"/><text class="t xs mute" x="20" y="68">office network</text>
+<rect class="n client" x="24" y="84" width="76" height="34" rx="6"/><text class="t sm mid" x="62" y="105">Laptop</text>
+<rect class="n client" x="24" y="144" width="76" height="34" rx="6"/><text class="t sm mid" x="62" y="165">Laptop</text>
+<rect class="n client" x="24" y="204" width="76" height="34" rx="6"/><text class="t sm mid" x="62" y="225">CI runner</text>
+<rect class="n ext" x="125" y="134" width="80" height="54" rx="8"/><text class="t sm b mid" x="165" y="157">Forward</text><text class="t sm b mid" x="165" y="173">proxy</text>
+<path class="e" d="M100,101 C112,101 112,150 121,150"/>
+<path class="e" d="M100,161 H121"/>
+<path class="e" d="M100,221 C112,221 112,172 121,172"/>
+<rect class="n" x="245" y="74" width="100" height="40" rx="6"/><text class="t sm mid" x="295" y="98">github.com</text>
+<rect class="n" x="245" y="141" width="100" height="40" rx="6"/><text class="t sm mid" x="295" y="165">pypi.org</text>
+<rect class="n ghost" x="245" y="208" width="100" height="40" rx="6"/><text class="t sm mid" x="295" y="225">evil.example</text><text class="t xs red mid" x="295" y="240">blocked by policy</text>
+<path class="e" d="M205,150 C225,150 225,94 241,94"/>
+<path class="e" d="M205,161 H241"/>
+<path class="e red dash" d="M205,172 C225,172 225,228 241,228"/>
+<text class="t xs mute" x="20" y="276">Sites see the proxy's IP, never the laptop's.</text>
+
+<path class="line faint" d="M362,16 V270" style="stroke-dasharray:4 4"/>
+
+<text class="t b" x="380" y="24">Reverse proxy</text><text class="t xs mute" x="380" y="40">works for the servers</text>
+<rect class="n client" x="380" y="74" width="86" height="40" rx="6"/><text class="t sm mid" x="423" y="98">Browser</text>
+<rect class="n client" x="380" y="141" width="86" height="40" rx="6"/><text class="t sm mid" x="423" y="165">Mobile app</text>
+<rect class="n client" x="380" y="208" width="86" height="40" rx="6"/><text class="t sm mid" x="423" y="232">Partner</text>
+<rect class="zone" x="490" y="52" width="220" height="200" rx="10"/><text class="t xs mute" x="500" y="68">your data centre</text>
+<rect class="n ext" x="502" y="134" width="80" height="54" rx="8"/><text class="t sm b mid" x="542" y="157">Reverse</text><text class="t sm b mid" x="542" y="173">proxy</text>
+<rect class="n svc" x="612" y="74" width="86" height="40" rx="6"/><text class="t sm mid" x="655" y="98">app-1</text>
+<rect class="n svc" x="612" y="141" width="86" height="40" rx="6"/><text class="t sm mid" x="655" y="165">app-2</text>
+<rect class="n svc" x="612" y="208" width="86" height="40" rx="6"/><text class="t sm mid" x="655" y="232">app-3</text>
+<path class="e" d="M466,94 C484,94 484,150 498,150"/>
+<path class="e" d="M466,161 H498"/>
+<path class="e" d="M466,228 C484,228 484,172 498,172"/>
+<path class="e" d="M582,150 C598,150 598,94 608,94"/>
+<path class="e" d="M582,161 H608"/>
+<path class="e" d="M582,172 C598,172 598,228 608,228"/>
+<text class="t xs mute" x="380" y="276">Clients see one hostname; backends stay private.</text>
+</svg>
+</div>
+<figcaption><b>Same software, opposite sides.</b> A forward proxy is configured by the clients and stands in for them on the internet. A reverse proxy is deployed by the site owner and stands in for the servers; clients usually have no idea it is there.</figcaption>
+</figure>
+
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Forward proxy</th><th>Reverse proxy</th></tr></thead>
+<tbody>
+<tr><th>Deployed by</th><td>The client side: a company, a school, an ISP, a server fleet's egress</td><td>The server side: whoever owns the hostname</td></tr>
+<tr><th>Client aware of it?</th><td>Usually yes (browser or <code>HTTPS_PROXY</code> setting), or intercepted transparently</td><td>No. DNS points at the proxy, which looks like the origin</td></tr>
+<tr><th>Hides</th><td>The client's identity and address</td><td>The servers' number, addresses and software</td></tr>
+<tr><th>Typical jobs</th><td>Egress filtering, audit logging, shared caching, fixed outbound IP</td><td>TLS termination, routing, load balancing, caching, compression, rate limiting</td></tr>
+<tr><th>Examples</th><td>Squid, corporate secure web gateways, Stripe's Smokescreen</td><td>NGINX, HAProxy, Envoy, a CDN edge, an API gateway</td></tr>
+</tbody></table></div>
+
+<h3 id="forward-proxy-mechanics">How a forward proxy handles HTTPS</h3>
+<p>For plain HTTP the client sends the full URL to the proxy (<code>GET http://example.com/a HTTP/1.1</code>) and the proxy fetches it. For HTTPS the client sends <code>CONNECT github.com:443</code>; the proxy opens a TCP connection to that host and from then on relays encrypted bytes it cannot read. It sees the hostname, and can allow or deny it, but not the paths or bodies. Inspecting HTTPS content requires the proxy to terminate TLS with its own certificate authority installed on every client, which is what corporate "TLS inspection" products do.</p>
+<p>Forward proxies are not only for offices. Server fleets use them as an <dfn>egress proxy</dfn>: every outbound call from your services leaves through one controlled point. That gives partners a fixed set of source IPs to allowlist, and it blocks <dfn>server-side request forgery</dfn> (SSRF), where an attacker tricks your webhook sender into calling <code>http://169.254.169.254/</code> or an internal admin API. Stripe open-sourced its egress proxy, Smokescreen, for exactly this.</p>
+
+<h2 id="reverse-proxy">What a reverse proxy does for a backend</h2>
+<p>A reverse proxy earns its place by doing work that is identical for every service and expensive to get right in each one. The list below is roughly the order in which a request meets each job.</p>
+
+<h3 id="tls-termination">TLS termination</h3>
+<p>The proxy holds the certificates and performs the TLS handshake (see <a href="network-protocols.html">TCP, UDP &amp; HTTP</a> for the round trips). Backends receive plain HTTP, or a re-encrypted connection on a long-lived internal link. Centralising this means one place to rotate certificates, enforce TLS 1.2+, enable HTTP/2 and HTTP/3 to clients, and automate certificate renewal. Whether the hop from proxy to backend stays encrypted is a security decision, not a performance one: in a zero-trust network it is re-encrypted, often with mutual TLS (see <a href="security.html">Security Fundamentals</a>).</p>
+
+<h3 id="buffering">Buffering slow clients</h3>
+<p>This is the least obvious job and often the most valuable. Many application servers handle one request per worker (gunicorn sync workers, Unicorn, PHP-FPM). A worker that writes a response directly to a phone on a weak connection is stuck until the last byte leaves.</p>
+<div class="calc">Response            400 KB  = 3,200 kbit
+Client link         1 Mbps   → 3.2 s to deliver
+App work per request         20 ms
+Pool of 200 workers, no proxy buffering
+  each request holds a worker 3.2 s   → 200 / 3.2   ≈ <span class="r">62 req/s</span>
+With a buffering proxy in front
+  worker hands 400 KB to the proxy over the LAN in ~1 ms and is free
+  each request holds a worker ~20 ms  → 200 / 0.02  = <span class="r">10,000 req/s</span></div>
+<p>The proxy, built on an event loop, holds thousands of slow connections cheaply, each costing a few kilobytes of buffer rather than a whole worker process. NGINX does this in both directions by default: <code>proxy_request_buffering</code> reads the whole request body before contacting the backend, and <code>proxy_buffering</code> reads the backend's response as fast as the backend can send it. The same property protects against <dfn>Slowloris</dfn>, an attack that opens many connections and sends headers one byte at a time to exhaust worker pools. Buffering is the wrong choice for streaming responses (server-sent events, large downloads, gRPC streams), which is why it can be switched off per route; see <a href="realtime.html">Polling, SSE &amp; WebSockets</a>.</p>
+
+<h3 id="compression-caching">Compression and caching</h3>
+<p>The proxy can gzip or Brotli-compress text responses based on the client's <code>Accept-Encoding</code>, which often shrinks JSON and HTML several times over and spends proxy CPU instead of application CPU. It can also cache. Even a one-second <dfn>microcache</dfn> on a hot, public endpoint changes the load picture: if a product page gets 5,000 requests per second through each proxy, the backend sees about one request per second per proxy for that URL, provided the proxy collapses concurrent misses into one upstream fetch (NGINX <code>proxy_cache_lock</code>). Cache keys, <code>Cache-Control</code> and invalidation are covered in <a href="cdn.html">Content Delivery Networks</a> and <a href="caching.html">Caching</a>.</p>
+
+<h3 id="connection-management">Connection management and headers</h3>
+<ul>
+<li><strong>Connection reuse.</strong> Clients open short-lived connections; the proxy keeps a warm pool of keep-alive connections to each backend, so the backend never pays for TCP and TLS setup per client.</li>
+<li><strong>Protocol translation.</strong> HTTP/2 or HTTP/3 to the browser, HTTP/1.1 or gRPC to the backend.</li>
+<li><strong>Client identity.</strong> The backend now sees the proxy's IP as the source. The proxy passes the original in <code>X-Forwarded-For</code> and <code>X-Forwarded-Proto</code>, or the standard <code>Forwarded: for=203.0.113.7;proto=https</code> header from RFC 7239. Backends must only trust these headers when the request came from a known proxy, otherwise any client can claim any IP.</li>
+<li><strong>Routing and load balancing.</strong> Choosing a backend pool by host and path, and a server within the pool. The <a href="load-balancing.html">Load Balancing</a> chapter covers algorithms and health checks.</li>
+</ul>
+
+<h2 id="api-gateway">API gateways</h2>
+<p>An <dfn>API gateway</dfn> is a reverse proxy specialised for APIs: it understands identities, API keys, quotas, routes and versions, not just hosts and paths. It is the single entry point between external clients and a fleet of services, and its job is to do the cross-cutting work once so the services behind it do not each reimplement it.</p>
+<div class="defs">
+<div><h4>Authentication</h4><p>Validate the API key, session cookie or JWT signature and expiry. Forward a trusted identity header such as <code>X-User-Id</code>. Fine-grained authorisation ("may this user cancel this order?") stays in the service that owns the order.</p></div>
+<div><h4>Rate limiting and quotas</h4><p>Per key, per user or per IP limits, plus monthly quotas for paid plans. Rejects with <code>429</code> before any backend work happens. Algorithms are in <a href="rate-limiting.html">Rate Limiting</a>.</p></div>
+<div><h4>Routing</h4><p>Map <code>/v2/orders/*</code> to <code>orders-svc</code>, split 5% of traffic to a canary, route by header or tenant. Backend addresses come from <a href="service-discovery.html">service discovery</a>.</p></div>
+<div><h4>Transformation</h4><p>Rename fields, add or strip headers, translate REST and JSON to gRPC, keep a deprecated <code>v1</code> shape alive by mapping it onto <code>v2</code>.</p></div>
+<div><h4>Aggregation</h4><p>Answer one client call by calling several services and merging the results. Useful in small doses; in large doses it becomes a BFF (below).</p></div>
+<div><h4>Observability</h4><p>Assign a request ID, start the trace, emit an access log and per-route latency and error metrics. See <a href="observability.html">Observability</a>.</p></div>
+</div>
+
+<h3 id="gateway-pipeline">The request pipeline</h3>
+<p>Internally a gateway is a chain of filters (Envoy calls them HTTP filters, Kong calls them plugins, Spring Cloud Gateway calls them filters too). Each stage can pass the request on, modify it, or end it with a response. Order matters: put the <strong>cheapest rejection first</strong> so abusive or invalid traffic costs as little as possible.</p>
+
+<figure class="fig" data-steps data-step="1">
+<div class="fig-frame">
+<svg viewBox="0 0 720 260" role="img" aria-label="Gateway pipeline of five stages: TLS, auth, rate limit, route, transform, then orders service. Steps show a valid request, a rejected token, a rate-limited request and an upstream timeout">
+<rect class="n client" x="10" y="40" width="70" height="44" rx="8"/><text class="t sm b mid" x="45" y="66">Client</text>
+<rect class="n ext" x="100" y="40" width="77" height="44" rx="8"/><text class="t sm b mid" x="138.5" y="59">TLS</text><text class="t xs mute mid" x="138.5" y="74">terminate</text>
+<rect class="n ext" x="197" y="40" width="77" height="44" rx="8"/><text class="t sm b mid" x="235.5" y="59">Auth</text><text class="t xs mute mid" x="235.5" y="74">verify JWT</text>
+<rect class="n ext" x="294" y="40" width="77" height="44" rx="8"/><text class="t sm b mid" x="332.5" y="59">Rate limit</text><text class="t xs mute mid" x="332.5" y="74">per key</text>
+<rect class="n ext" x="391" y="40" width="77" height="44" rx="8"/><text class="t sm b mid" x="429.5" y="59">Route</text><text class="t xs mute mid" x="429.5" y="74">path → svc</text>
+<rect class="n ext" x="488" y="40" width="77" height="44" rx="8"/><text class="t sm b mid" x="526.5" y="59">Transform</text><text class="t xs mute mid" x="526.5" y="74">headers</text>
+<rect class="n svc" x="600" y="40" width="100" height="44" rx="8"/><text class="t sm b mid" x="650" y="59">orders-svc</text><text class="t xs mute mid" x="650" y="74">upstream</text>
+<text class="t xs mute mid" x="332.5" y="22">gateway filter chain</text>
+
+<path class="e" d="M80,62 H96"/>
+<path class="e" d="M177,62 H193"/>
+<g data-show="1 3 4"><path class="e" d="M274,62 H290"/></g>
+<g data-show="1 4"><path class="e" d="M371,62 H387"/><path class="e" d="M468,62 H484"/><path class="e" d="M565,62 H596"/></g>
+
+<g data-show="1"><path class="e green" d="M650,88 V108 H45 V88"/><text class="t sm green mid" x="340" y="126">200 OK, response streamed back through the chain</text>
+<text class="t b" x="20" y="170">Valid request: every stage passes</text>
+<text class="t sm" x="20" y="192">The gateway verifies the token once and forwards</text>
+<text class="t sm" x="20" y="210">the identity as a trusted header. orders-svc never</text>
+<text class="t sm" x="20" y="228">parses tokens or counts requests.</text>
+<text class="t sm b" x="430" y="170">Added before forwarding</text>
+<text class="t mono" x="430" y="192">X-User-Id: u_8812</text>
+<text class="t mono" x="430" y="210">X-Request-Id: 7f3c9a1e</text>
+<text class="t mono" x="430" y="228">Forwarded: for=203.0.113.7</text></g>
+
+<g data-show="2"><rect class="n bad" x="197" y="40" width="77" height="44" rx="8"/><text class="t sm b mid" x="235.5" y="59">Auth</text><text class="t xs red mid" x="235.5" y="74">token expired</text>
+<path class="e red" d="M235.5,88 V108 H45 V88"/><text class="t sm red mid" x="140" y="126">401 Unauthorized</text>
+<text class="t b" x="20" y="170">Expired token: rejected at stage 2</text>
+<text class="t sm" x="20" y="192">No rate-limit budget, routing work or upstream</text>
+<text class="t sm" x="20" y="210">capacity is spent on a request that will fail.</text>
+<text class="t sm b" x="430" y="170">Response</text>
+<text class="t mono" x="430" y="192">401 Unauthorized</text>
+<text class="t mono" x="430" y="210">WWW-Authenticate: Bearer</text></g>
+
+<g data-show="3"><rect class="n bad" x="294" y="40" width="77" height="44" rx="8"/><text class="t sm b mid" x="332.5" y="59">Rate limit</text><text class="t xs red mid" x="332.5" y="74">over quota</text>
+<path class="e red" d="M332.5,88 V108 H45 V88"/><text class="t sm red mid" x="190" y="126">429 Too Many Requests</text>
+<text class="t b" x="20" y="170">Over quota: rejected at stage 3</text>
+<text class="t sm" x="20" y="192">The limiter keys on the identity from stage 2,</text>
+<text class="t sm" x="20" y="210">so one tenant cannot spend another's budget.</text>
+<text class="t sm b" x="430" y="170">Response</text>
+<text class="t mono" x="430" y="192">429 Too Many Requests</text>
+<text class="t mono" x="430" y="210">Retry-After: 30</text></g>
+
+<g data-show="4"><rect class="n bad" x="600" y="40" width="100" height="44" rx="8"/><text class="t sm b mid" x="650" y="59">orders-svc</text><text class="t xs red mid" x="650" y="74">no reply in 3 s</text>
+<path class="e red" d="M650,88 V108 H45 V88"/><text class="t sm red mid" x="340" y="126">504 Gateway Timeout</text>
+<text class="t b" x="20" y="170">Slow upstream: the gateway gives up at 3 s</text>
+<text class="t sm" x="20" y="192">The client gets a clean 504 instead of a hung</text>
+<text class="t sm" x="20" y="210">connection. Retry here only for idempotent</text>
+<text class="t sm" x="20" y="228">requests, and only within a retry budget.</text>
+<text class="t sm b" x="430" y="170">Per-route policy</text>
+<text class="t mono" x="430" y="192">timeout: 3s</text>
+<text class="t mono" x="430" y="210">retries: 1 (GET only)</text></g>
+</svg>
+<div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Valid request</button><button type="button" data-step="2" aria-pressed="false">Bad token</button><button type="button" data-step="3" aria-pressed="false">Over limit</button><button type="button" data-step="4" aria-pressed="false">Slow upstream</button></div>
+</div>
+<figcaption><b>A gateway is a filter chain.</b> Each stage either passes the request on or ends it with a response. Rejections happen as early and as cheaply as possible, and failures upstream turn into well-formed errors instead of hanging connections.</figcaption>
+</figure>
+
+<p>Two ordering details come up in practice. A coarse <strong>per-IP limit</strong> usually runs <em>before</em> authentication, because verifying signatures and looking up API keys costs CPU and an attacker can send unlimited garbage tokens. The fine-grained <strong>per-identity limit</strong> runs after, since it needs to know who is calling. The diagram shows only the per-identity limiter. Second, timeouts and retries at the gateway must be shorter than the client's own timeout and coordinated with the services' retries, or a single slow dependency multiplies into a retry storm. <a href="fault-tolerance.html">Timeouts, Retries &amp; Circuit Breakers</a> covers retry budgets.</p>
+
+<div class="callout warn">
+<div class="callout-title">Common mistake</div>
+<p>Trusting <code>X-User-Id</code> on the service side without making sure only the gateway can reach the service. If a pod is reachable directly, anyone inside the network can set that header and become any user. Lock services down with network policy or mutual TLS so the gateway is the only caller that can assert identity, or pass a signed token instead of a bare header.</p>
+</div>
+
+<h2 id="bff">Backend for frontend</h2>
+<p>A single general-purpose gateway serves every client the same API. Real clients differ. A web page on fibre can afford a 200 KB response and five calls; a phone on a congested cell link cannot, and wants one call returning exactly the fields its screen shows. A TV app needs yet another shape. When one API tries to serve all of them it either grows a parameter for every client's whim or forces every client to over-fetch and stitch.</p>
+<p>The <dfn>backend for frontend</dfn> (BFF) pattern, popularised by Sam Newman, gives each kind of client its own thin server-side API, owned by the team that builds that client. The BFF calls shared domain services, fans out in parallel inside the data centre, and returns one response shaped for one screen.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 336" role="img" aria-label="Backend for frontend: web, mobile and partner clients each call their own BFF, which calls shared domain services">
+<text class="t sm b mute mid" x="70" y="22">Clients</text>
+<text class="t sm b mute mid" x="270" y="22">Experience layer</text>
+<text class="t sm b mute mid" x="510" y="22">Domain services</text>
+<rect class="n client" x="20" y="45" width="100" height="50" rx="8"/><text class="t sm b mid" x="70" y="67">Web app</text><text class="t xs mute mid" x="70" y="82">React SPA</text>
+<rect class="n client" x="20" y="140" width="100" height="50" rx="8"/><text class="t sm b mid" x="70" y="162">iOS / Android</text><text class="t xs mute mid" x="70" y="177">metered links</text>
+<rect class="n client" x="20" y="235" width="100" height="50" rx="8"/><text class="t sm b mid" x="70" y="257">Partner</text><text class="t xs mute mid" x="70" y="272">server-to-server</text>
+<rect class="n svc" x="205" y="45" width="130" height="50" rx="8"/><text class="t sm b mid" x="270" y="67">Web BFF</text><text class="t xs mute mid" x="270" y="82">owned by web team</text>
+<rect class="n svc" x="205" y="140" width="130" height="50" rx="8"/><text class="t sm b mid" x="270" y="162">Mobile BFF</text><text class="t xs mute mid" x="270" y="177">owned by app team</text>
+<rect class="n svc" x="205" y="235" width="130" height="50" rx="8"/><text class="t sm b mid" x="270" y="257">Public API</text><text class="t xs mute mid" x="270" y="272">stable, versioned</text>
+<rect class="n db" x="440" y="40" width="140" height="44" rx="8"/><text class="t sm b mid" x="510" y="66">Users</text>
+<rect class="n db" x="440" y="100" width="140" height="44" rx="8"/><text class="t sm b mid" x="510" y="126">Catalog</text>
+<rect class="n db" x="440" y="160" width="140" height="44" rx="8"/><text class="t sm b mid" x="510" y="186">Orders</text>
+<rect class="n db" x="440" y="220" width="140" height="44" rx="8"/><text class="t sm b mid" x="510" y="246">Recommendations</text>
+<rect class="n db" x="440" y="280" width="140" height="44" rx="8"/><text class="t sm b mid" x="510" y="306">Payments</text>
+<path class="e" d="M120,70 H201"/>
+<path class="e" d="M120,165 H201"/>
+<path class="e" d="M120,260 H201"/>
+<path class="e" d="M335,70 C385,70 390,62 436,62" style="opacity:.75"/>
+<path class="e" d="M335,70 C385,70 390,122 436,122" style="opacity:.75"/>
+<path class="e" d="M335,70 C385,70 390,182 436,182" style="opacity:.75"/>
+<path class="e" d="M335,70 C385,70 390,242 436,242" style="opacity:.75"/>
+<path class="e" d="M335,165 C385,165 390,62 436,62" style="opacity:.75"/>
+<path class="e" d="M335,165 C385,165 390,122 436,122" style="opacity:.75"/>
+<path class="e" d="M335,165 C385,165 390,182 436,182" style="opacity:.75"/>
+<path class="e" d="M335,165 C385,165 390,242 436,242" style="opacity:.75"/>
+<path class="e" d="M335,165 C385,165 390,302 436,302" style="opacity:.75"/>
+<path class="e" d="M335,260 C385,260 390,122 436,122" style="opacity:.75"/>
+<path class="e" d="M335,260 C385,260 390,182 436,182" style="opacity:.75"/>
+<text class="t xs mute" x="596" y="98">one service per</text><text class="t xs mute" x="596" y="112">business capability,</text><text class="t xs mute" x="596" y="126">shared by every BFF</text>
+<text class="t xs mute" x="596" y="210">BFFs fan out, trim</text><text class="t xs mute" x="596" y="224">and reshape; they</text><text class="t xs mute" x="596" y="238">own no data</text>
+</svg>
+</div>
+<figcaption><b>One BFF per experience.</b> The mobile team can change its home-screen endpoint the same day it ships a new app version, without negotiating with the web team. Domain services stay shared and client-agnostic; the BFFs hold presentation logic only.</figcaption>
+</figure>
+
+<ul>
+<li><strong>Ownership is the point.</strong> A BFF is owned by the client team. If a central platform team owns all the BFFs, they become one shared gateway again, with a queue of feature requests in front of it.</li>
+<li><strong>Keep it thin.</strong> A BFF composes, trims, formats and caches. It owns no database tables and makes no business decisions. If a rule ("orders over $500 need review") appears in two BFFs, it belongs in a domain service.</li>
+<li><strong>Edge concerns stay at the edge.</strong> TLS, authentication and coarse rate limits usually still run in a shared gateway in front of the BFFs, so each BFF does not reimplement them.</li>
+<li><strong>GraphQL is the main alternative.</strong> One flexible endpoint lets each client ask for exactly the fields it needs, which removes much of the reason for per-client BFFs, at the cost of query-cost control and caching complexity. See <a href="api-design.html">API Design</a>.</li>
+</ul>
+
+<h2 id="worked-example">Worked example: a mobile home screen through a BFF</h2>
+<p>A shopping app's home screen needs data from five services. The phone is on a mobile network with a 100 ms round-trip time to the data centre, and connections are already warm (no TCP or TLS setup). The gateway adds 2 ms. Two calls depend on the profile, because the feed and recommendations are personalised by the user's segment.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Call</th><th class="num">Server time</th><th>Depends on</th><th class="num">Full response</th><th class="num">Fields the screen uses</th></tr></thead>
+<tbody>
+<tr><th>profile</th><td class="num">20 ms</td><td>-</td><td class="num">30 KB</td><td class="num">2 KB</td></tr>
+<tr><th>notifications count</th><td class="num">10 ms</td><td>-</td><td class="num">15 KB</td><td class="num">1 KB</td></tr>
+<tr><th>cart</th><td class="num">15 ms</td><td>-</td><td class="num">25 KB</td><td class="num">3 KB</td></tr>
+<tr><th>feed</th><td class="num">45 ms</td><td>profile</td><td class="num">60 KB</td><td class="num">10 KB</td></tr>
+<tr><th>recommendations</th><td class="num">70 ms</td><td>profile</td><td class="num">50 KB</td><td class="num">8 KB</td></tr>
+<tr><th>Total</th><td class="num">160 ms</td><td></td><td class="num">180 KB</td><td class="num">24 KB</td></tr>
+</tbody></table></div>
+
+<div class="calc">A  Five sequential calls from the phone
+   5 × (100 ms RTT + 2 ms gateway) + 160 ms server     = 510 + 160  = <span class="r">670 ms</span>
+B  Phone parallelises in two waves (HTTP/2, one connection)
+   wave 1: profile, notifications, cart  102 + max(20, 10, 15) = 122 ms
+   wave 2: feed, recommendations         102 + max(45, 70)     = 172 ms
+                                                                   = <span class="r">294 ms</span>
+C  One call to a mobile BFF, which fans out inside the data centre (1 ms per hop)
+   100 RTT + 2 gateway + (1 + 20 profile) + (1 + 70 recs) + 3 assemble = <span class="r">197 ms</span>
+
+Payload over a 2 Mbps effective link
+   A and B  180 KB × 8 = 1,440 kbit / 2,000 kbps = <span class="r">720 ms</span>
+   C         24 KB × 8 =   192 kbit / 2,000 kbps ≈ <span class="r">96 ms</span></div>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 300" role="img" aria-label="Timeline drawn to scale: five sequential calls take 670 ms, two parallel waves take 294 ms, one call to a mobile BFF takes 197 ms">
+<path class="line" d="M160.0,36 V42"/><text class="t xs mute mid" x="160.0" y="30">0</text>
+<path class="line" d="M232.0,36 V42"/><text class="t xs mute mid" x="232.0" y="30">100</text>
+<path class="line" d="M304.0,36 V42"/><text class="t xs mute mid" x="304.0" y="30">200</text>
+<path class="line" d="M376.0,36 V42"/><text class="t xs mute mid" x="376.0" y="30">300</text>
+<path class="line" d="M448.0,36 V42"/><text class="t xs mute mid" x="448.0" y="30">400</text>
+<path class="line" d="M520.0,36 V42"/><text class="t xs mute mid" x="520.0" y="30">500</text>
+<path class="line" d="M592.0,36 V42"/><text class="t xs mute mid" x="592.0" y="30">600</text>
+<path class="line" d="M664.0,36 V42"/><text class="t xs mute mid" x="664.0" y="30">700</text>
+<path class="line faint" d="M160.0,42 H664.0"/><text class="t xs mute end" x="148.0" y="30">time, ms</text>
+<text class="t sm b" x="10" y="68">Sequential calls</text><text class="t xs mute" x="10" y="82">5 round trips</text>
+<text class="t sm b" x="10" y="134">Parallel waves</text><text class="t xs mute" x="10" y="148">2 round trips</text>
+<text class="t sm b" x="10" y="200">Mobile BFF</text><text class="t xs mute" x="10" y="214">1 round trip</text>
+<rect x="160.0" y="56" width="36.0" height="26" style="fill:none;stroke:var(--d-ext-s);stroke-dasharray:3 3"/>
+<rect x="196.0" y="56" width="15.8" height="26" style="fill:var(--d-svc-s);fill-opacity:.55;stroke:var(--d-svc-s)"/>
+<rect x="211.8" y="56" width="36.0" height="26" style="fill:none;stroke:var(--d-ext-s);stroke-dasharray:3 3"/>
+<text class="t xs mute mid" x="203.9" y="96">profile</text>
+<rect x="247.8" y="56" width="36.0" height="26" style="fill:none;stroke:var(--d-ext-s);stroke-dasharray:3 3"/>
+<rect x="283.8" y="56" width="33.8" height="26" style="fill:var(--d-svc-s);fill-opacity:.55;stroke:var(--d-svc-s)"/>
+<rect x="317.7" y="56" width="36.0" height="26" style="fill:none;stroke:var(--d-ext-s);stroke-dasharray:3 3"/>
+<text class="t xs mute mid" x="300.8" y="96">feed</text>
+<rect x="353.7" y="56" width="36.0" height="26" style="fill:none;stroke:var(--d-ext-s);stroke-dasharray:3 3"/>
+<rect x="389.7" y="56" width="51.8" height="26" style="fill:var(--d-svc-s);fill-opacity:.55;stroke:var(--d-svc-s)"/>
+<rect x="441.5" y="56" width="36.0" height="26" style="fill:none;stroke:var(--d-ext-s);stroke-dasharray:3 3"/>
+<text class="t xs mute mid" x="415.6" y="96">recs</text>
+<rect x="477.5" y="56" width="36.0" height="26" style="fill:none;stroke:var(--d-ext-s);stroke-dasharray:3 3"/>
+<rect x="513.5" y="56" width="8.6" height="26" style="fill:var(--d-svc-s);fill-opacity:.55;stroke:var(--d-svc-s)"/>
+<rect x="522.2" y="56" width="36.0" height="26" style="fill:none;stroke:var(--d-ext-s);stroke-dasharray:3 3"/>
+<text class="t xs mute mid" x="517.8" y="96">notifs</text>
+<rect x="558.2" y="56" width="36.0" height="26" style="fill:none;stroke:var(--d-ext-s);stroke-dasharray:3 3"/>
+<rect x="594.2" y="56" width="12.2" height="26" style="fill:var(--d-svc-s);fill-opacity:.55;stroke:var(--d-svc-s)"/>
+<rect x="606.4" y="56" width="36.0" height="26" style="fill:none;stroke:var(--d-ext-s);stroke-dasharray:3 3"/>
+<text class="t xs mute mid" x="600.3" y="96">cart</text>
+<text class="t sm b" x="648.4" y="74">670 ms</text>
+<rect x="160.0" y="122" width="36.0" height="26" style="fill:none;stroke:var(--d-ext-s);stroke-dasharray:3 3"/>
+<rect x="196.0" y="122" width="15.8" height="26" style="fill:var(--d-svc-s);fill-opacity:.55;stroke:var(--d-svc-s)"/>
+<rect x="211.8" y="122" width="36.0" height="26" style="fill:none;stroke:var(--d-ext-s);stroke-dasharray:3 3"/>
+<text class="t xs mute mid" x="203.9" y="162">wave 1</text>
+<rect x="247.8" y="122" width="36.0" height="26" style="fill:none;stroke:var(--d-ext-s);stroke-dasharray:3 3"/>
+<rect x="283.8" y="122" width="51.8" height="26" style="fill:var(--d-svc-s);fill-opacity:.55;stroke:var(--d-svc-s)"/>
+<rect x="335.7" y="122" width="36.0" height="26" style="fill:none;stroke:var(--d-ext-s);stroke-dasharray:3 3"/>
+<text class="t xs mute mid" x="309.8" y="162">wave 2</text>
+<text class="t sm b" x="377.7" y="140">294 ms</text>
+<rect x="160.0" y="188" width="36.0" height="26" style="fill:none;stroke:var(--d-ext-s);stroke-dasharray:3 3"/>
+<rect x="196.0" y="188" width="69.8" height="26" style="fill:var(--d-svc-s);fill-opacity:.55;stroke:var(--d-svc-s)"/>
+<rect x="265.8" y="188" width="36.0" height="26" style="fill:none;stroke:var(--d-ext-s);stroke-dasharray:3 3"/>
+<text class="t xs mute mid" x="230.9" y="228">BFF fans out in the data centre</text>
+<text class="t sm b accent" x="307.8" y="206">197 ms</text>
+<rect x="160" y="262" width="22" height="14" style="fill:none;stroke:var(--d-ext-s);stroke-dasharray:3 3"/><text class="t xs mute" x="190" y="273">mobile network, half an RTT each way</text>
+<rect x="420" y="262" width="22" height="14" style="fill:var(--d-svc-s);fill-opacity:.55;stroke:var(--d-svc-s)"/><text class="t xs mute" x="450" y="273">server time: gateway, BFF, services</text>
+</svg>
+</div>
+<figcaption><b>Where the time goes, drawn to scale.</b> Dashed segments are mobile network time, solid segments are server time. The BFF wins by paying the expensive mobile round trip once and doing the dependent calls over a 1 ms data-centre network instead.</figcaption>
+</figure>
+
+<p>Three lessons come out of the numbers. First, <strong>round trips over the slow link dominate</strong>: server time (90 to 160 ms) is small next to the round trips; the difference is how many 100 ms trips the phone makes. A careful client (option B) gets most of the way, but the dependency between profile and feed forces a second trip that only a server-side composer can remove. Second, <strong>payload matters as much as latency on mobile</strong>: trimming 180 KB to 24 KB saves more time than the fan-out does, plus battery and the user's data plan. Third, the BFF's own latency is set by its <strong>slowest dependency chain</strong>, profile then recommendations at 92 ms of the 95 ms server time. Speeding up the feed would change nothing.</p>
+
+<h3 id="fan-out-tails">Fan-out amplifies tail latency</h3>
+<p>The BFF's speed comes from calling services in parallel, and parallel fan-out has a cost: the response is only as fast as the slowest call. If each dependency has a 1% chance of a slow response, a request that waits on several of them hits at least one slow call far more often than 1%.</p>
+<pre><code class="language-python">import random
+
+random.seed(7)
+
+
+def call_latency_ms():
+    # 99% of calls take 8-12 ms; 1% hit a slow path (GC pause, cold cache) of 200 ms
+    return 200 if random.random() &lt; 0.01 else random.uniform(8, 12)
+
+
+def median(samples):
+    return sorted(samples)[len(samples) // 2]
+
+
+for fanout in (1, 5, 20, 100):
+    # a fan-out request finishes when its slowest parallel call finishes
+    trials = [max(call_latency_ms() for _ in range(fanout)) for _ in range(20_000)]
+    slow = sum(t &gt;= 200 for t in trials) / len(trials)
+    print(f"fan-out {fanout:&gt;3}: {slow:6.1%} slow (theory {1 - 0.99 ** fanout:6.1%}), median {median(trials):.0f} ms")
+
+# fan-out   1:   1.0% slow (theory   1.0%), median 10 ms
+# fan-out   5:   4.8% slow (theory   4.9%), median 12 ms
+# fan-out  20:  18.5% slow (theory  18.2%), median 12 ms
+# fan-out 100:  63.2% slow (theory  63.4%), median 200 ms</code></pre>
+<p>The formula is <code>1 - 0.99^n</code>: the home screen above, waiting on five calls, sees one dependency's p99 on about 5% of requests, so its own p95 is roughly its dependencies' p99. At a fan-out of 100 the slow path becomes the median. Keep BFF fan-out small, give each call a tight timeout with a fallback (render the screen without recommendations rather than wait), and for idempotent reads consider <dfn>hedged requests</dfn>: send a second copy to another replica if the first has not answered by the p95 time.</p>
+
+<h2 id="service-mesh">Gateway vs service mesh</h2>
+<p>A gateway handles <dfn>north-south traffic</dfn>: requests entering or leaving the system. Most traffic in a microservice system is <dfn>east-west</dfn>: service to service inside the cluster. That traffic needs many of the same things (encryption, retries, timeouts, load balancing, metrics), and putting a central gateway in the middle of every internal call would add a hop and a bottleneck to all of it.</p>
+<p>A <dfn>service mesh</dfn> solves this by giving every service instance its own proxy, a <dfn>sidecar</dfn>, deployed in the same pod. The application talks plain HTTP to <code>localhost</code>; its sidecar intercepts the traffic, finds a healthy instance of the destination, opens a mutual-TLS connection to the destination's sidecar, applies timeouts and retries, and records metrics and trace spans. The sidecars form the <dfn>data plane</dfn>. A <dfn>control plane</dfn> (Istio's istiod, for example) pushes routes, policies and certificates to them.</p>
+
+<figure class="fig">
+<div class="fig-frame">
+<svg viewBox="0 0 720 360" role="img" aria-label="A client calls an ingress gateway, which forwards to the Envoy sidecar in the orders pod; the orders app calls payments through its sidecar, which talks mTLS to the payments sidecar; a control plane pushes config to both sidecars">
+<text class="t sm" x="262" y="40">The app speaks plain HTTP to localhost. Its sidecar adds</text>
+<text class="t sm" x="262" y="58">mTLS, retries, timeouts, load balancing and metrics.</text>
+<rect class="n client" x="10" y="210" width="85" height="46" rx="8"/><text class="t sm b mid" x="52.5" y="237">Client</text>
+<rect class="n ext" x="120" y="210" width="112" height="46" rx="8"/><text class="t sm b mid" x="176" y="229">Ingress</text><text class="t sm b mid" x="176" y="245">gateway</text>
+<text class="t xs mute mid" x="176" y="274">north-south</text>
+
+<rect class="zone" x="262" y="100" width="180" height="176" rx="10"/><text class="t xs mute" x="274" y="118">pod: orders</text>
+<rect class="n svc" x="277" y="130" width="150" height="46" rx="8"/><text class="t sm b mid" x="352" y="151">orders</text><text class="t xs mute mid" x="352" y="166">app container</text>
+<rect class="n ext" x="277" y="210" width="150" height="46" rx="8"/><text class="t sm b mid" x="352" y="231">Envoy sidecar</text><text class="t xs mute mid" x="352" y="246">inbound + outbound</text>
+
+<rect class="zone" x="512" y="100" width="180" height="176" rx="10"/><text class="t xs mute" x="524" y="118">pod: payments</text>
+<rect class="n svc" x="527" y="130" width="150" height="46" rx="8"/><text class="t sm b mid" x="602" y="151">payments</text><text class="t xs mute mid" x="602" y="166">app container</text>
+<rect class="n ext" x="527" y="210" width="150" height="46" rx="8"/><text class="t sm b mid" x="602" y="231">Envoy sidecar</text><text class="t xs mute mid" x="602" y="246">inbound + outbound</text>
+
+<path class="e" d="M95,233 H116"/>
+<path class="e" d="M232,233 H273"/>
+<path class="e" d="M330,210 V180"/><text class="t xs mute end" x="324" y="198">in</text>
+<path class="e" d="M374,176 V206"/><text class="t xs mute" x="380" y="198">out</text>
+<path class="e" d="M427,233 H523"/><text class="t xs accent mid" x="475" y="226">mTLS</text><text class="t xs mute mid" x="475" y="250">east-west</text>
+<path class="e" d="M602,210 V180"/>
+
+<path class="flow" d="M95,233 H116"/>
+<path class="flow" d="M232,233 H273"/>
+<path class="flow" d="M330,210 V180"/>
+<path class="flow" d="M374,176 V206"/>
+<path class="flow" d="M427,233 H523"/>
+<path class="flow" d="M602,210 V180"/>
+
+<rect class="n queue" x="300" y="306" width="340" height="44" rx="8"/><text class="t sm b mid" x="470" y="325">Control plane (istiod)</text><text class="t xs mute mid" x="470" y="340">routes, retry policy, certificates</text>
+<path class="e dash" d="M352,302 V260"/><text class="t xs mute" x="358" y="285">xDS</text>
+<path class="e dash" d="M602,302 V260"/><text class="t xs mute" x="608" y="285">xDS</text>
+</svg>
+</div>
+<figcaption><b>Gateway at the edge, sidecars inside.</b> The animated path is one request: through the ingress gateway, into the orders pod via its sidecar, then out again through the same sidecar to payments. Neither application contains TLS, retry or discovery code; the control plane configures the proxies.</figcaption>
+</figure>
+
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>API gateway</th><th>Service mesh</th></tr></thead>
+<tbody>
+<tr><th>Traffic</th><td>North-south: external clients to services</td><td>East-west: service to service</td></tr>
+<tr><th>Deployment</th><td>A shared fleet of proxies at the edge</td><td>One proxy per service instance, or per node</td></tr>
+<tr><th>Who calls it</th><td>Untrusted clients on the internet</td><td>Your own services, already authenticated by mTLS</td></tr>
+<tr><th>Typical concerns</th><td>API keys, end-user auth, quotas, public versioning, request transformation</td><td>mTLS identity, retries, timeouts, circuit breaking, traffic shifting, telemetry</td></tr>
+<tr><th>Product knowledge</th><td>Knows about API products, plans and consumers</td><td>Knows about services and endpoints only</td></tr>
+<tr><th>Examples</th><td>Kong, AWS API Gateway, Apigee, Envoy Gateway</td><td>Istio, Linkerd, Consul service mesh</td></tr>
+</tbody></table></div>
+<p>The two overlap heavily in mechanism (Istio's ingress gateway is just Envoy at the edge) and they are complements, not rivals: a common shape is a gateway at the edge and a mesh inside. The mesh's costs are real: two extra proxy hops on every internal call, each typically adding well under a millisecond to a few milliseconds; a proxy's memory and CPU multiplied by every pod; and a control plane that is now critical infrastructure. These costs pushed the newer <strong>sidecarless</strong> designs, where a shared per-node proxy handles encryption and a smaller set of proxies handles HTTP features (Istio's ambient mode), or where the kernel does part of the work with eBPF (Cilium). How services find each other with or without a mesh is in <a href="service-discovery.html">Service Discovery</a>.</p>
+
+<h2 id="risks">Risks and how to contain them</h2>
+
+<h3 id="spof">Single point of failure</h3>
+<p>Every external request crosses the gateway, so its availability caps the whole product's availability. Run it as a stateless, horizontally scaled fleet across zones, behind an L4 load balancer or anycast address (see <a href="load-balancing.html">Load Balancing</a>). Keep its hot path free of synchronous calls to anything less available than itself: validate JWTs locally with cached signing keys rather than calling the identity service on each request, and make the rate limiter fail open if its counter store is unreachable. The most dangerous failure is not a crashed instance but a <strong>bad configuration push</strong>, which breaks every instance at once. Roll gateway config out like code: validated, canaried on a slice of traffic, and quick to revert.</p>
+
+<h3 id="added-latency">Added latency</h3>
+<p>Each proxy hop costs a little: parsing, filter execution, and an extra network hop, usually around a millisecond inside one data centre with warm connections. That is negligible against a 100 ms mobile round trip, but it adds up when a request crosses a CDN, a load balancer, a gateway, a BFF and two sidecars per internal call. Count hops on the critical path, keep connection pools warm at every hop, and watch for filters that do I/O (an external auth call or a remote rate-limit check adds its own network round trip).</p>
+
+<h3 id="gateway-monolith">The gateway becoming a monolith</h3>
+<p>Because every request passes through it, the gateway is a tempting place to put "just one more rule": a special case for one customer, a field mapping for one screen, a check that really belongs to the orders domain. After a few years it holds business logic from every team, deploys need sign-off from all of them, and it has become the enterprise service bus that microservices were meant to replace. The rule of thumb is <strong>smart endpoints, dumb pipes</strong>: the gateway does generic, policy-driven work that is the same for every service; anything that needs domain knowledge lives in a service or a BFF owned by the team that has that knowledge.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Layout</th><th>Good for</th><th>Watch out for</th></tr></thead>
+<tbody>
+<tr><th>Clients call services directly</th><td class="meh">A couple of services, internal tools</td><td class="no">Auth, TLS and limits duplicated in every service; internal topology exposed to clients</td></tr>
+<tr><th>One reverse proxy (NGINX, HAProxy)</th><td class="yes">A monolith or a few services</td><td class="meh">Limited API-level features: keys, quotas, transformations</td></tr>
+<tr><th>Shared API gateway</th><td class="yes">Many services, one public API, partner keys and plans</td><td class="meh">Central team becomes a bottleneck; logic creep</td></tr>
+<tr><th>Gateway + BFFs</th><td class="yes">Several distinct client types (web, mobile, TV)</td><td class="meh">Duplicated composition code across BFFs</td></tr>
+<tr><th>Gateway + service mesh</th><td class="yes">Large fleets needing mTLS and uniform traffic policy</td><td class="no">Operational complexity, per-pod overhead, control plane as a new dependency</td></tr>
+</tbody></table></div>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+<li><strong>NGINX</strong> began as a web server built to solve the "C10k" problem with an event loop, which is exactly why it is good at buffering slow clients in front of process-per-request application servers. It remains the default reverse proxy in front of countless Rails, Django and PHP apps.</li>
+<li><strong>HAProxy</strong> is a high-performance TCP and HTTP proxy, best known as a load balancer, used at the edge of high-traffic sites such as Stack Overflow.</li>
+<li><strong>Envoy</strong>, built at Lyft, is designed to be configured dynamically by a control plane through its xDS APIs. It is the data plane of Istio, the engine of Envoy Gateway, and the base of many commercial gateways.</li>
+<li><strong>Kong</strong> is an API gateway built on NGINX and OpenResty, with authentication, rate limiting and transformation shipped as plugins.</li>
+<li><strong>AWS API Gateway</strong> is a managed gateway: Lambda or Cognito authorisers for auth, usage plans with API keys for quotas, and request mapping templates for transformation. You give up some control and pay per request in exchange for running no proxy fleet.</li>
+<li><strong>Netflix Zuul</strong> is the edge gateway in front of Netflix's streaming API, and Netflix's earlier API platform let device teams deploy their own adapter scripts on the server, an early form of backend for frontend.</li>
+<li><strong>Linkerd</strong> runs a purpose-built Rust micro-proxy as its sidecar instead of Envoy, trading features for a smaller footprint per pod.</li>
+</ul>
+
+<div class="callout interview">
+<div class="callout-title">Interview angle</div>
+<h4>When to bring it up</h4>
+<p>In nearly every design, as one box on the diagram: "Clients reach us through an API gateway that terminates TLS, authenticates, rate limits and routes to services." Spend more time on it when the prompt has several client types (propose a BFF), a public developer API (keys, quotas, versioning), or many internal services (mention a mesh for mTLS and retries, and its cost).</p>
+<h4>Follow-ups to expect</h4>
+<ul>
+<li>What is the difference between a forward and a reverse proxy? Who deploys each and what each hides.</li>
+<li>Why put NGINX in front of an application server at all? Buffering slow clients, TLS, compression, connection reuse.</li>
+<li>Is the gateway a single point of failure? Stateless fleet across zones, local JWT validation, fail-open limiter, canaried config.</li>
+<li>Where does authorisation live? Authentication at the gateway; resource-level authorisation in the owning service.</li>
+<li>Gateway or service mesh? North-south vs east-west, and usually both.</li>
+<li>Your BFF calls eight services. What happens to p99? Tail amplification, timeouts with partial responses, hedging.</li>
+</ul>
+<h4>Red flags</h4>
+<ul>
+<li>Putting business rules or data in the gateway.</li>
+<li>A gateway that calls an auth service synchronously on every request with no caching.</li>
+<li>Services that trust identity headers while being reachable without going through the gateway.</li>
+<li>Adding a service mesh to a five-service system without naming the problem it solves.</li>
+</ul>
+</div>
+
+<h2 id="references">References</h2>
+<ul class="refs">
+<li><a href="https://www.rfc-editor.org/rfc/rfc9110#name-intermediaries" target="_blank" rel="noopener">RFC 9110: HTTP Semantics, Intermediaries</a><span>The standard definitions of proxy, gateway and tunnel, plus the <code>Via</code> header and CONNECT.</span></li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc7239" target="_blank" rel="noopener">RFC 7239: Forwarded HTTP Extension</a><span>The standard header for passing the original client address and protocol through proxies.</span></li>
+<li><a href="https://nginx.org/en/docs/http/ngx_http_proxy_module.html" target="_blank" rel="noopener">NGINX ngx_http_proxy_module</a><span>Reference for request and response buffering, proxy caching and cache locks.</span></li>
+<li><a href="https://samnewman.io/patterns/architectural/bff/" target="_blank" rel="noopener">Pattern: Backends For Frontends</a><span>Sam Newman. The canonical write-up of the BFF pattern, including ownership and when not to use it.</span></li>
+<li><a href="https://www.envoyproxy.io/docs/envoy/latest/intro/what_is_envoy" target="_blank" rel="noopener">What is Envoy</a><span>Envoy documentation. Filter chains, dynamic configuration, and how one proxy serves as edge gateway and sidecar.</span></li>
+</ul>
