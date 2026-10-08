@@ -34,7 +34,7 @@ def check(slug: str, run_snippets: bool) -> list[str]:
         if href not in SLUGS and href != "index":
             errs.append(f"broken link: {href}.html")
     for lang, code in re.findall(r'<pre><code class="language-(\w+)">([\s\S]*?)</code></pre>', body):
-        if re.search(r"<[a-zA-Z/]", code):
+        if "<" in code:
             errs.append(f"unescaped tag in {lang} code block")
         if run_snippets and lang == "python":
             with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
