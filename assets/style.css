@@ -215,6 +215,7 @@ kbd {
 .copy-btn:hover { color: var(--fg); border-color: var(--line-strong); }
 pre { margin: 0; padding: 14px 16px; overflow-x: auto; font: 13.5px/1.65 var(--mono); color: var(--code-fg); tab-size: 4; }
 pre code { font: inherit; }
+pre, code, .calc { font-variant-ligatures: none; } /* show != and <= as typed, not as ≠ ≤ */
 .tk-kw { color: var(--tk-kw); } .tk-str { color: var(--tk-str); } .tk-com { color: var(--tk-com); font-style: italic; }
 .tk-num { color: var(--tk-num); } .tk-fn { color: var(--tk-fn); } .tk-bi { color: var(--tk-bi); }
 
