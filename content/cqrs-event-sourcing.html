@@ -295,7 +295,7 @@ rejected: acc-42: expected v1002, found v1003</code></pre>
 </tbody></table></div>
 <figure class="fig" data-steps data-step="1">
 <div class="fig-frame">
-<svg viewBox="0 0 720 215" role="img" aria-label="Crypto-shredding: personal fields in events are encrypted with a per-customer key; deleting the key makes every copy unreadable while the events stay immutable">
+<svg viewBox="0 0 720 225" role="img" aria-label="Crypto-shredding: personal fields in events are encrypted with a per-customer key; deleting the key makes every copy unreadable while the events stay immutable">
 <text class="t xs mute" x="20" y="18">event stream (immutable)</text>
 <rect class="n queue" x="20" y="28" width="250" height="42" rx="6"/><text class="t xs mono" x="32" y="45">CustomerRegistered · cust-4411</text><text class="t xs mono mute" x="32" y="61">name: 8f3a91c2e7 (enc)</text>
 <rect class="n queue" x="20" y="80" width="250" height="42" rx="6"/><text class="t xs mono" x="32" y="97">AddressChanged · cust-4411</text><text class="t xs mono mute" x="32" y="113">street: 0b77d4e1aa (enc)</text>
@@ -310,7 +310,7 @@ rejected: acc-42: expected v1002, found v1003</code></pre>
 <g data-show="2"><rect class="n bad" x="570" y="72" width="140" height="58" rx="8"/><text class="t b mid" x="640" y="95">Key store</text><text class="t xs mono red mid" x="640" y="113">cust-4411: deleted</text>
 <path class="e dash red" d="M566,101 H524"/></g>
 <text class="t sm mid" x="360" y="204" data-show="1">Personal fields are encrypted with a per-customer key. Readers fetch the key to decrypt.</text>
-<text class="t sm mid" x="360" y="204" data-show="2">Erasure deletes one key. Every event, backup and replica copy becomes unreadable at once, provided the key store's own backups also expire the key.</text>
+<g data-show="2"><text class="t sm mid" x="360" y="196">Erasure deletes one key. Every event, backup and replica copy becomes unreadable at once,</text><text class="t sm mid" x="360" y="214">provided the key store's own backups also expire the key.</text></g>
 </svg>
 
 <div class="fig-controls"><button type="button" data-step="1" aria-pressed="true">Normal read</button><button type="button" data-step="2" aria-pressed="false">Key deleted</button></div>
